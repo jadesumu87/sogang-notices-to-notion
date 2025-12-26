@@ -2,13 +2,15 @@ name: scholarship-crawler
 
 on:
   schedule:
-    - cron: "0 * * * *"   # 매 시간 정각(UTC) 실행
+    - cron: "*/5 * * * *"   # 5분마다(UTC; KST도 동일 주기)
   workflow_dispatch:       # 수동 실행 버튼도 같이 제공
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      TZ: Asia/Seoul
 
     concurrency:
       group: scholarship-crawler
