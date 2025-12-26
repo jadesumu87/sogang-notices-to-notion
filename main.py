@@ -461,6 +461,23 @@ def build_image_block(url: str) -> dict:
     }
 
 
+def build_callout_container_block() -> dict:
+    return {
+        "object": "block",
+        "type": "callout",
+        "callout": {
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {"content": " "},
+                    "annotations": dict(DEFAULT_ANNOTATIONS),
+                }
+            ],
+            "color": "default",
+        },
+    }
+
+
 class TiptapBlockParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -1399,6 +1416,17 @@ def notion_request(
                 backoff = min(backoff * 2, 8.0)
                 continue
             raise RuntimeError(f"Notion API error: HTTP {exc.code}: {body}") from exc
+        except TimeoutError as exc:
+            if attempt < max_retries:
+                LOGGER.info(
+                    "Notion API 재시도(%s/%s): timeout",
+                    attempt + 1,
+                    max_retries,
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 8.0)
+                continue
+            raise RuntimeError("Notion API error: timeout") from exc
         except urllib.error.URLError as exc:
             if attempt < max_retries:
                 LOGGER.info(
@@ -1642,9 +1670,21 @@ def sync_page_body_blocks(token: str, page_id: str, blocks: list[dict]) -> None:
     for block in children:
         block_id = block.get("id")
         if block_id:
-            delete_block(token, block_id)
+            try:
+                delete_block(token, block_id)
+            except RuntimeError as exc:
+                LOGGER.info("블록 삭제 실패: %s (%s)", block_id, exc)
+    callout_payload = build_callout_container_block()
+    response = append_block_children(token, page_id, [callout_payload])
+    callout_id = None
+    results = response.get("results", []) if isinstance(response, dict) else []
+    if results:
+        callout_id = results[0].get("id")
+    if not callout_id:
+        LOGGER.info("콜아웃 생성 실패: %s", page_id)
+        return
     for chunk in chunks(blocks, 80):
-        append_block_children(token, page_id, chunk)
+        append_block_children(token, callout_id, chunk)
 
 
 def build_properties(
