@@ -2,7 +2,7 @@ name: scholarship-crawler
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다(UTC; KST도 동일 주기)
+    - cron: "0 * * * *"    # 1시간마다(UTC; KST도 동일 주기)
   workflow_dispatch:       # 수동 실행 버튼도 같이 제공
 
 jobs:

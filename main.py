@@ -23,6 +23,7 @@ DATE_PROPERTY = "작성일"
 TOP_PROPERTY = "TOP"
 URL_PROPERTY = "URL"
 VIEWS_PROPERTY = "조회수"
+TYPE_PROPERTY = "유형"
 LOGGER = logging.getLogger("scholarship-crawler")
 BASE_SITE = "https://www.sogang.ac.kr"
 DATE_PATTERN = re.compile(
@@ -32,6 +33,17 @@ DATE_TIME_PATTERN = re.compile(r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2
 DATE_TIME_JS_PATTERN = r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2})?"
 DETAIL_PATH_PATTERN = re.compile(r"/detail/\d+")
 LIST_ROW_SELECTOR = "tr[data-v-6debbb14], table tbody tr"
+TYPE_TAGS = (
+    "교내/국가",
+    "교외",
+    "국가근로",
+    "학자금대출",
+    "대청교",
+    "발전기금",
+    "동문회",
+    "주거지원",
+)
+FALLBACK_TYPE = "공통"
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -670,6 +682,17 @@ def ensure_url_property(token: str, database_id: str, database: dict) -> dict:
     return update_database(token, database_id, {URL_PROPERTY: {"url": {}}})
 
 
+def ensure_type_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(TYPE_PROPERTY)
+    if prop:
+        if prop.get("type") != "select":
+            raise RuntimeError(f"Notion 속성 타입 불일치: {TYPE_PROPERTY} (select 아님)")
+        return database
+    LOGGER.info("Notion 속성 추가: %s", TYPE_PROPERTY)
+    options = [{"name": name} for name in (*TYPE_TAGS, FALLBACK_TYPE)]
+    return update_database(token, database_id, {TYPE_PROPERTY: {"select": {"options": options}}})
+
+
 def require_property_type(database: dict, property_name: str, expected_type: str) -> None:
     prop = database.get("properties", {}).get(property_name)
     if not prop:
@@ -689,6 +712,16 @@ def validate_required_properties(database: dict) -> None:
     require_property_type(database, DATE_PROPERTY, "date")
     require_property_type(database, AUTHOR_PROPERTY, "select")
     require_property_type(database, URL_PROPERTY, "url")
+    require_property_type(database, TYPE_PROPERTY, "select")
+
+
+def extract_type_from_title(title: str) -> str:
+    match = re.match(r"\s*\[([^\]]+)\]", title)
+    if match:
+        label = match.group(1).strip()
+        if label in TYPE_TAGS:
+            return label
+    return FALLBACK_TYPE
 
 
 def validate_optional_property_type(
@@ -795,6 +828,8 @@ def build_properties(item: dict, has_views_property: bool) -> dict:
         props[DATE_PROPERTY] = {"date": {"start": item["date"]}}
     if item.get("author"):
         props[AUTHOR_PROPERTY] = {"select": {"name": item["author"]}}
+    if item.get("type"):
+        props[TYPE_PROPERTY] = {"select": {"name": item["type"]}}
     if has_views_property and item.get("views") is not None:
         props[VIEWS_PROPERTY] = {"number": item["views"]}
     if item.get("url"):
@@ -970,8 +1005,10 @@ def main() -> None:
 
     database = fetch_database(notion_token, database_id)
     database = ensure_url_property(notion_token, database_id, database)
+    database = ensure_type_property(notion_token, database_id, database)
     validate_required_properties(database)
     author_options = get_select_options(database, AUTHOR_PROPERTY)
+    type_options = get_select_options(database, TYPE_PROPERTY)
     has_views_property = validate_optional_property_type(database, VIEWS_PROPERTY, "number")
 
     created = 0
@@ -985,6 +1022,7 @@ def main() -> None:
             if normalized_url:
                 item["url"] = normalized_url
                 current_top_urls.add(normalized_url)
+        item["type"] = extract_type_from_title(item["title"])
         label = f"{item['title']} ({item.get('date') or '날짜없음'})"
         date_key = normalize_date_key(item.get("date"))
         current_top_dates.setdefault(item["title"], set()).add(date_key)
@@ -997,6 +1035,13 @@ def main() -> None:
                 item["author"],
                 author_options,
             )
+        type_options = ensure_select_option(
+            notion_token,
+            database_id,
+            TYPE_PROPERTY,
+            item["type"],
+            type_options,
+        )
         properties = build_properties(item, has_views_property)
         page_id = find_existing_page(
             notion_token,
