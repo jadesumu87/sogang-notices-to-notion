@@ -31,6 +31,7 @@ DATE_PATTERN = re.compile(
 DATE_TIME_PATTERN = re.compile(r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2})?")
 DATE_TIME_JS_PATTERN = r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2})?"
 DETAIL_PATH_PATTERN = re.compile(r"/detail/\d+")
+LIST_ROW_SELECTOR = "tr[data-v-6debbb14], table tbody tr"
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -236,7 +237,7 @@ def get_browser_launcher(playwright, browser: str):
 
 
 def extract_list_rows(page) -> list[dict]:
-    rows = page.locator("tr[data-v-6debbb14]")
+    rows = page.locator(LIST_ROW_SELECTOR)
     count = rows.count()
     items = []
 
@@ -291,10 +292,10 @@ def return_to_list_page(page, list_url: str) -> None:
 
     try:
         page.go_back()
-        page.wait_for_selector("tr[data-v-6debbb14]", timeout=30000)
+        page.wait_for_selector(LIST_ROW_SELECTOR, timeout=30000)
     except PlaywrightTimeoutError:
-        page.goto(list_url, wait_until="networkidle", timeout=30000)
-        page.wait_for_selector("tr[data-v-6debbb14]", timeout=30000)
+        if not goto_list_page(page, list_url):
+            LOGGER.info("목록 복귀 실패: %s", list_url)
 
 
 def wait_for_written_at(page, timeout_ms: int = 30000) -> bool:
@@ -409,7 +410,7 @@ def fetch_detail_for_row(
         written_at = fetch_written_at_via_playwright(page, list_url, detail_url)
         return written_at, detail_url
 
-    rows = page.locator("tr[data-v-6debbb14]")
+    rows = page.locator(LIST_ROW_SELECTOR)
     if row_index >= rows.count():
         return None, None
 
@@ -441,6 +442,24 @@ def fetch_detail_for_row(
     return written_at, normalized_detail_url
 
 
+def goto_list_page(page, url: str) -> bool:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    try:
+        response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    except PlaywrightTimeoutError:
+        LOGGER.info("페이지 로드 타임아웃: %s", url)
+        return False
+    if response is not None and response.status >= 400:
+        LOGGER.info("페이지 응답 코드: %s (%s)", response.status, url)
+    try:
+        page.wait_for_selector(LIST_ROW_SELECTOR, timeout=30000)
+    except PlaywrightTimeoutError:
+        LOGGER.info("목록 셀렉터 미검출: %s", url)
+        return False
+    return True
+
+
 def crawl_top_items() -> list[dict]:
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -465,14 +484,15 @@ def crawl_top_items() -> list[dict]:
         page = context.new_page()
 
         page_number = 1
+        fallback_to_http = False
         while True:
             url = build_list_url(page_number)
             LOGGER.info("페이지 로드 시작: %s", url)
-            try:
-                page.goto(url, wait_until="networkidle", timeout=30000)
-                page.wait_for_selector("tr[data-v-6debbb14]", timeout=30000)
-            except PlaywrightTimeoutError:
+            if not goto_list_page(page, url):
                 LOGGER.info("페이지 %s 로드 실패", page_number)
+                if page_number == 1:
+                    LOGGER.info("Playwright 페이지 로드 실패: HTTP 모드로 전환")
+                    fallback_to_http = True
                 break
 
             page_items = extract_list_rows(page)
@@ -509,6 +529,8 @@ def crawl_top_items() -> list[dict]:
 
         browser.close()
 
+    if fallback_to_http:
+        return crawl_top_items_http()
     return items
 
 
