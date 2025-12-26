@@ -461,18 +461,12 @@ def build_image_block(url: str) -> dict:
     }
 
 
-def build_callout_container_block() -> dict:
+def build_container_block(rich_text: Optional[list[dict]] = None) -> dict:
     return {
         "object": "block",
-        "type": "callout",
-        "callout": {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {"content": " "},
-                    "annotations": dict(DEFAULT_ANNOTATIONS),
-                }
-            ],
+        "type": "quote",
+        "quote": {
+            "rich_text": rich_text or [],
             "color": "default",
         },
     }
@@ -1663,9 +1657,29 @@ def delete_block(token: str, block_id: str) -> None:
     notion_request("DELETE", url, token)
 
 
+def is_empty_paragraph_block(block: dict) -> bool:
+    if block.get("type") != "paragraph":
+        return False
+    rich_text = block.get("paragraph", {}).get("rich_text", [])
+    if not rich_text:
+        return True
+    content = "".join(
+        item.get("text", {}).get("content", "") for item in rich_text
+    )
+    return content.replace("\u00a0", "").strip() == ""
+
+
 def sync_page_body_blocks(token: str, page_id: str, blocks: list[dict]) -> None:
     if not blocks:
         return
+    idx = 0
+    while idx < len(blocks) and is_empty_paragraph_block(blocks[idx]):
+        idx += 1
+    container_rich_text: list[dict] = []
+    if idx < len(blocks) and blocks[idx].get("type") == "paragraph":
+        container_rich_text = blocks[idx].get("paragraph", {}).get("rich_text", [])
+        idx += 1
+    remaining_blocks = blocks[idx:]
     children = list_block_children(token, page_id)
     for block in children:
         block_id = block.get("id")
@@ -1674,17 +1688,17 @@ def sync_page_body_blocks(token: str, page_id: str, blocks: list[dict]) -> None:
                 delete_block(token, block_id)
             except RuntimeError as exc:
                 LOGGER.info("블록 삭제 실패: %s (%s)", block_id, exc)
-    callout_payload = build_callout_container_block()
-    response = append_block_children(token, page_id, [callout_payload])
-    callout_id = None
+    container_payload = build_container_block(container_rich_text)
+    response = append_block_children(token, page_id, [container_payload])
+    container_id = None
     results = response.get("results", []) if isinstance(response, dict) else []
     if results:
-        callout_id = results[0].get("id")
-    if not callout_id:
-        LOGGER.info("콜아웃 생성 실패: %s", page_id)
+        container_id = results[0].get("id")
+    if not container_id:
+        LOGGER.info("컨테이너 생성 실패: %s", page_id)
         return
-    for chunk in chunks(blocks, 80):
-        append_block_children(token, callout_id, chunk)
+    for chunk in chunks(remaining_blocks, 80):
+        append_block_children(token, container_id, chunk)
 
 
 def build_properties(

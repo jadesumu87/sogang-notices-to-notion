@@ -1,4 +1,6 @@
+html/
+
 .env
 inspect_notion_db.py
-html
-.venv/
+notion_formula.txt
+test.*
