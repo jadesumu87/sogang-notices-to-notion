@@ -10,7 +10,7 @@ from html import unescape
 import importlib.util
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
+from urllib.parse import urlencode, urlparse, parse_qs, urlunparse, urljoin
 
 NOTION_API_VERSION = "2022-06-28"
 BASE_URL = "https://www.sogang.ac.kr/ko/scholarship-notice"
@@ -23,6 +23,7 @@ DATE_PROPERTY = "작성일"
 TOP_PROPERTY = "TOP"
 URL_PROPERTY = "URL"
 VIEWS_PROPERTY = "조회수"
+ATTACHMENT_PROPERTY = "첨부파일"
 TYPE_PROPERTY = "유형"
 LOGGER = logging.getLogger("scholarship-crawler")
 BASE_SITE = "https://www.sogang.ac.kr"
@@ -33,6 +34,21 @@ DATE_TIME_PATTERN = re.compile(r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2
 DATE_TIME_JS_PATTERN = r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2})?"
 DETAIL_PATH_PATTERN = re.compile(r"/detail/\d+")
 LIST_ROW_SELECTOR = "tr[data-v-6debbb14], table tbody tr"
+ATTACHMENT_EXT_PATTERN = re.compile(
+    r"\.(pdf|hwp|hwpx|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|jpg|jpeg|png|gif|bmp)(?:$|\\?)",
+    re.IGNORECASE,
+)
+ATTACHMENT_HINTS = (
+    "download",
+    "filedown",
+    "filedownload",
+    "fileid",
+    "fileno",
+    "bbsfile",
+    "attach",
+    "file-fe-prd/board",
+    "sg=",
+)
 TYPE_TAGS = (
     "교내/국가",
     "교외",
@@ -136,6 +152,49 @@ def normalize_detail_url(raw_url: Optional[str]) -> Optional[str]:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", new_query, ""))
 
 
+def normalize_file_url(raw_url: Optional[str]) -> Optional[str]:
+    if not raw_url:
+        return None
+    raw_url = raw_url.strip()
+    lowered = raw_url.lower()
+    if lowered in {"#", "#/", "javascript:void(0)", "javascript:void(0);"}:
+        return None
+    if lowered.startswith(("javascript:", "mailto:", "tel:", "data:")):
+        return None
+    if raw_url.startswith("//"):
+        raw_url = "https:" + raw_url
+    absolute = urljoin(BASE_SITE, raw_url)
+    parsed = urlparse(absolute)
+    if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
+        return None
+    return urlunparse(parsed._replace(fragment=""))
+
+
+def is_attachment_candidate(url: str, text: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if host and not host.endswith("sogang.ac.kr"):
+        return False
+    if ATTACHMENT_EXT_PATTERN.search(url) or ATTACHMENT_EXT_PATTERN.search(text):
+        return True
+    lowered_url = url.lower()
+    if any(hint in lowered_url for hint in ATTACHMENT_HINTS):
+        return True
+    if "/file-fe-prd/board/" in parsed.path:
+        return True
+    return False
+
+
+def log_attachments(label: str, attachments: list[dict]) -> None:
+    if not attachments:
+        return
+    LOGGER.info("첨부파일 추출: %s (총 %s개)", label, len(attachments))
+    for attachment in attachments:
+        url = attachment.get("external", {}).get("url") or ""
+        name = attachment.get("name") or ""
+        LOGGER.info("첨부파일 링크: %s (%s)", url, name)
+
+
 def is_detail_url(url: str) -> bool:
     if not url:
         return False
@@ -145,6 +204,14 @@ def is_detail_url(url: str) -> bool:
         return True
     qs = parse_qs(parsed.query)
     return "bbsConfigFk" in qs
+
+
+def is_detail_path_url(url: str) -> bool:
+    if not url:
+        return False
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    return bool(DETAIL_PATH_PATTERN.search(path))
 
 
 def get_bbs_config_fk() -> str:
@@ -219,6 +286,152 @@ def extract_written_at_from_detail(html_text: str) -> Optional[str]:
     return parse_datetime(matches[0][1])
 
 
+def extract_attachments_from_detail(html_text: str) -> list[dict]:
+    attachments: list[dict] = []
+    seen_urls: set[str] = set()
+
+    def add_attachment(href: str, text: str) -> None:
+        url = normalize_file_url(href)
+        if not url or url in seen_urls:
+            return
+        if not is_attachment_candidate(url, text):
+            return
+        seen_urls.add(url)
+        if text:
+            name = text
+        else:
+            params = parse_qs(urlparse(url).query)
+            name = params.get("sg", [""])[0]
+        if not name:
+            name = Path(urlparse(url).path).name or "첨부파일"
+        attachments.append({"name": name, "type": "external", "external": {"url": url}})
+
+    def extract_from_chunk(chunk: str, strict: bool) -> None:
+        for match in re.finditer(
+            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            chunk,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            href = unescape(match.group(1)).strip()
+            if not href:
+                continue
+            text = clean_text(match.group(2))
+            if not strict:
+                snippet = chunk[max(0, match.start() - 200) : match.end() + 200]
+                lowered_href = href.lower()
+                if (
+                    "첨부" not in text
+                    and "첨부" not in snippet
+                    and "다운로드" not in text
+                    and "다운로드" not in snippet
+                    and not ATTACHMENT_EXT_PATTERN.search(href)
+                    and not ATTACHMENT_EXT_PATTERN.search(text)
+                    and not any(hint in lowered_href for hint in ATTACHMENT_HINTS)
+                ):
+                    continue
+            add_attachment(href, text)
+
+    label_matches = list(re.finditer(r"첨부파일", html_text))
+    if label_matches:
+        for match in label_matches:
+            start = max(0, match.start() - 800)
+            end = min(len(html_text), match.end() + 6000)
+            extract_from_chunk(html_text[start:end], strict=True)
+    if not attachments:
+        extract_from_chunk(html_text, strict=False)
+
+    return attachments
+
+
+def extract_attachments_from_page(page) -> list[dict]:
+    result = page.evaluate(
+        """
+        () => {
+            const results = [];
+            const seen = new Set();
+            let labelCount = 0;
+            let labelLinkCount = 0;
+            const labels = Array.from(document.querySelectorAll("body *"))
+                .filter(el => el.textContent && el.textContent.includes("첨부파일"));
+            labelCount = labels.length;
+            const collectLinks = (root) => {
+                const links = root.querySelectorAll("a[href]");
+                links.forEach(a => {
+                    const href = a.getAttribute("href") || "";
+                    const text = (a.textContent || "").trim();
+                    if (!href) return;
+                    const key = href + "|" + text;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    results.push({href, text});
+                });
+                return links.length;
+            };
+            for (const label of labels) {
+                let node = label;
+                for (let i = 0; i < 6 && node; i += 1) {
+                    const count = collectLinks(node);
+                    if (count) {
+                        labelLinkCount += count;
+                        break;
+                    }
+                    node = node.parentElement;
+                }
+            }
+            if (!results.length) {
+                const links = document.querySelectorAll("a[href]");
+                links.forEach(a => {
+                    const href = a.getAttribute("href") || "";
+                    const text = (a.textContent || "").trim();
+                    if (!href) return;
+                    const key = href + "|" + text;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    results.push({href, text});
+                });
+            }
+            return {links: results, labelCount, labelLinkCount};
+        }
+        """
+    )
+    candidates = result.get("links", []) if isinstance(result, dict) else []
+    label_count = result.get("labelCount", 0) if isinstance(result, dict) else 0
+    label_link_count = result.get("labelLinkCount", 0) if isinstance(result, dict) else 0
+    attachments: list[dict] = []
+    seen_urls: set[str] = set()
+    for candidate in candidates:
+        href = candidate.get("href", "")
+        text = candidate.get("text", "")
+        url = normalize_file_url(href)
+        if not url or url in seen_urls:
+            continue
+        if not is_attachment_candidate(url, text):
+            continue
+        seen_urls.add(url)
+        name = text
+        if not name:
+            params = parse_qs(urlparse(url).query)
+            name = params.get("sg", [""])[0]
+        if not name:
+            name = Path(urlparse(url).path).name or "첨부파일"
+        attachments.append({"name": name, "type": "external", "external": {"url": url}})
+    if not attachments:
+        if not candidates:
+            LOGGER.info("첨부파일 후보 링크 없음 (라벨=%s)", label_count)
+        else:
+            sample = ", ".join(
+                f"{c.get('href','')}" for c in candidates[:3] if c.get("href")
+            )
+            LOGGER.info(
+                "첨부파일 필터링 결과 0개 (라벨=%s, 라벨링크=%s, 후보=%s, 샘플=%s)",
+                label_count,
+                label_link_count,
+                len(candidates),
+                sample or "없음",
+            )
+    return attachments
+
+
 def build_list_url(page: int) -> str:
     query = dict(DEFAULT_QUERY)
     query["page"] = str(page)
@@ -229,7 +442,7 @@ def extract_detail_url_from_row_html(row_html: str) -> Optional[str]:
     for match in re.finditer(r'href="([^"]+)"', row_html):
         href = unescape(match.group(1))
         candidate = normalize_detail_url(href)
-        if candidate and is_detail_url(candidate):
+        if candidate and is_detail_path_url(candidate):
             return candidate
     match = re.search(r"/detail/(\d+)", row_html)
     if match:
@@ -281,7 +494,7 @@ def extract_list_rows(page) -> list[dict]:
                 if not href:
                     continue
                 candidate = normalize_detail_url(href)
-                if candidate and is_detail_url(candidate):
+                if candidate and is_detail_path_url(candidate):
                     detail_url = candidate
                     break
         items.append(
@@ -316,7 +529,7 @@ def wait_for_written_at(page, timeout_ms: int = 30000) -> bool:
     try:
         page.wait_for_function(
             "pattern => new RegExp(pattern).test(document.body.innerText)",
-            DATE_TIME_JS_PATTERN,
+            arg=DATE_TIME_JS_PATTERN,
             timeout=timeout_ms,
         )
         return True
@@ -384,26 +597,44 @@ def extract_written_at_from_page(page) -> Optional[str]:
     return None
 
 
-def fetch_written_at_via_playwright(
+def fetch_detail_metadata_via_playwright(
     page,
     list_url: str,
     detail_url: str,
-) -> Optional[str]:
+) -> tuple[Optional[str], list[dict]]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     written_at = None
+    attachments: list[dict] = []
     try:
         page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
         if not wait_for_written_at(page):
             LOGGER.info("작성일 로드 대기 실패: %s", detail_url)
+        try:
+            page.wait_for_selector("text=첨부파일", timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+        label_visible = page.locator("text=첨부파일").count()
+        if not label_visible:
+            try:
+                label_visible = page.wait_for_selector(
+                    "text=첨부파일", timeout=10000, state="attached"
+                )
+                label_visible = 1 if label_visible else 0
+            except PlaywrightTimeoutError:
+                label_visible = 0
+        LOGGER.info("첨부파일 라벨 감지: %s (%s)", label_visible, detail_url)
         written_at = extract_written_at_from_page(page)
         if not written_at:
             written_at = extract_written_at_from_detail(page.content())
+        attachments = extract_attachments_from_page(page)
+        if not attachments:
+            attachments = extract_attachments_from_detail(page.content())
     except PlaywrightTimeoutError:
         LOGGER.info("상세 페이지 로드 실패: %s", detail_url)
     finally:
         return_to_list_page(page, list_url)
-    return written_at
+    return written_at, attachments
 
 
 def fetch_detail_for_row(
@@ -411,47 +642,69 @@ def fetch_detail_for_row(
     list_url: str,
     row_index: int,
     detail_url: Optional[str],
-) -> tuple[Optional[str], Optional[str]]:
+) -> tuple[Optional[str], Optional[str], list[dict]]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     if detail_url:
         detail_url = normalize_detail_url(detail_url) or detail_url
-        written_at = fetch_written_at_from_url(detail_url)
-        if written_at:
-            return written_at, detail_url
-        written_at = fetch_written_at_via_playwright(page, list_url, detail_url)
-        return written_at, detail_url
+        if detail_url and not is_detail_path_url(detail_url):
+            LOGGER.info("상세 URL 경로 아님: %s", detail_url)
+            detail_url = None
+    if detail_url:
+        written_at, attachments = fetch_detail_metadata_from_url(detail_url)
+        if not attachments:
+            pw_written_at, pw_attachments = fetch_detail_metadata_via_playwright(
+                page, list_url, detail_url
+            )
+            if not written_at and pw_written_at:
+                written_at = pw_written_at
+            if pw_attachments:
+                attachments = pw_attachments
+        return written_at, detail_url, attachments
 
     rows = page.locator(LIST_ROW_SELECTOR)
     if row_index >= rows.count():
-        return None, None
+        return None, None, []
 
     row = rows.nth(row_index)
     row.scroll_into_view_if_needed()
     detail_id = extract_detail_id_from_row(row)
     if detail_id:
         detail_url = normalize_detail_url(build_detail_url(detail_id))
-        written_at = fetch_written_at_from_url(detail_url)
-        if written_at:
-            return written_at, detail_url
+        written_at, attachments = fetch_detail_metadata_from_url(detail_url)
+        if not attachments:
+            pw_written_at, pw_attachments = fetch_detail_metadata_via_playwright(
+                page, list_url, detail_url
+            )
+            if not written_at and pw_written_at:
+                written_at = pw_written_at
+            if pw_attachments:
+                attachments = pw_attachments
+        if written_at or attachments:
+            return written_at, detail_url, attachments
     row.click()
 
     detail_url = wait_for_detail_url(page, list_url)
     if not detail_url:
         LOGGER.info("상세 URL 전환 실패: row %s", row_index)
         return_to_list_page(page, list_url)
-        return None, None
+        return None, None, []
 
     normalized_detail_url = normalize_detail_url(detail_url) or detail_url
-    written_at = fetch_written_at_from_url(normalized_detail_url)
+    written_at, attachments = fetch_detail_metadata_from_url(normalized_detail_url)
+    if not wait_for_written_at(page):
+        LOGGER.info("작성일 로드 대기 실패: %s", detail_url)
     if not written_at:
-        if not wait_for_written_at(page):
-            LOGGER.info("작성일 로드 대기 실패: %s", detail_url)
         written_at = extract_written_at_from_page(page)
         if not written_at:
             written_at = extract_written_at_from_detail(page.content())
+    page_attachments = extract_attachments_from_page(page)
+    if page_attachments:
+        attachments = page_attachments
+    elif not attachments:
+        attachments = extract_attachments_from_detail(page.content())
     return_to_list_page(page, list_url)
-    return written_at, normalized_detail_url
+    return written_at, normalized_detail_url, attachments
 
 
 def goto_list_page(page, url: str) -> bool:
@@ -516,7 +769,7 @@ def crawl_top_items() -> list[dict]:
             has_non_top = any(not item.get("top") for item in page_items)
             new_top = 0
             for item in top_items:
-                written_at, detail_url = fetch_detail_for_row(
+                written_at, detail_url, attachments = fetch_detail_for_row(
                     page,
                     url,
                     item["row_index"],
@@ -526,6 +779,9 @@ def crawl_top_items() -> list[dict]:
                     item["date"] = written_at
                 if detail_url:
                     item["url"] = normalize_detail_url(detail_url)
+                if attachments:
+                    item["attachments"] = attachments
+                    log_attachments(item["title"], attachments)
                 key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
                 if key in seen:
                     continue
@@ -568,9 +824,12 @@ def crawl_top_items_http() -> list[dict]:
         new_top = 0
         for item in top_items:
             if item.get("url"):
-                written_at = fetch_written_at_from_url(item["url"])
+                written_at, attachments = fetch_detail_metadata_from_url(item["url"])
                 if written_at:
                     item["date"] = written_at
+                if attachments:
+                    item["attachments"] = attachments
+                    log_attachments(item["title"], attachments)
             key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
             if key in seen:
                 continue
@@ -654,11 +913,15 @@ def fetch_html(url: str) -> Optional[str]:
     return None
 
 
-def fetch_written_at_from_url(detail_url: str) -> Optional[str]:
+def fetch_detail_metadata_from_url(detail_url: str) -> tuple[Optional[str], list[dict]]:
     html_text = fetch_html(detail_url)
     if not html_text:
-        return None
-    return extract_written_at_from_detail(html_text)
+        return None, []
+    if "첨부파일" in html_text:
+        LOGGER.info("첨부파일 HTML 감지: %s", detail_url)
+    written_at = extract_written_at_from_detail(html_text)
+    attachments = extract_attachments_from_detail(html_text)
+    return written_at, attachments
 
 
 def fetch_database(token: str, database_id: str) -> dict:
@@ -691,6 +954,18 @@ def ensure_type_property(token: str, database_id: str, database: dict) -> dict:
     LOGGER.info("Notion 속성 추가: %s", TYPE_PROPERTY)
     options = [{"name": name} for name in (*TYPE_TAGS, FALLBACK_TYPE)]
     return update_database(token, database_id, {TYPE_PROPERTY: {"select": {"options": options}}})
+
+
+def ensure_attachment_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(ATTACHMENT_PROPERTY)
+    if prop:
+        if prop.get("type") != "files":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {ATTACHMENT_PROPERTY} (files 아님)"
+            )
+        return database
+    LOGGER.info("Notion 속성 추가: %s", ATTACHMENT_PROPERTY)
+    return update_database(token, database_id, {ATTACHMENT_PROPERTY: {"files": {}}})
 
 
 def require_property_type(database: dict, property_name: str, expected_type: str) -> None:
@@ -818,9 +1093,16 @@ def query_database(token: str, database_id: str, filter_payload: dict) -> list[d
     return data.get("results", [])
 
 
-def build_properties(item: dict, has_views_property: bool) -> dict:
+def build_properties(
+    item: dict,
+    has_views_property: bool,
+    has_attachments_property: bool,
+) -> dict:
+    title_text = {"content": item["title"]}
+    if item.get("url"):
+        title_text["link"] = {"url": item["url"]}
     props = {
-        TITLE_PROPERTY: {"title": [{"text": {"content": item["title"]}}]},
+        TITLE_PROPERTY: {"title": [{"text": title_text}]},
         TOP_PROPERTY: {"checkbox": item["top"]},
     }
 
@@ -830,6 +1112,8 @@ def build_properties(item: dict, has_views_property: bool) -> dict:
         props[AUTHOR_PROPERTY] = {"select": {"name": item["author"]}}
     if item.get("type"):
         props[TYPE_PROPERTY] = {"select": {"name": item["type"]}}
+    if has_attachments_property and item.get("attachments"):
+        props[ATTACHMENT_PROPERTY] = {"files": item["attachments"]}
     if has_views_property and item.get("views") is not None:
         props[VIEWS_PROPERTY] = {"number": item["views"]}
     if item.get("url"):
@@ -1006,10 +1290,14 @@ def main() -> None:
     database = fetch_database(notion_token, database_id)
     database = ensure_url_property(notion_token, database_id, database)
     database = ensure_type_property(notion_token, database_id, database)
+    database = ensure_attachment_property(notion_token, database_id, database)
     validate_required_properties(database)
     author_options = get_select_options(database, AUTHOR_PROPERTY)
     type_options = get_select_options(database, TYPE_PROPERTY)
     has_views_property = validate_optional_property_type(database, VIEWS_PROPERTY, "number")
+    has_attachments_property = validate_optional_property_type(
+        database, ATTACHMENT_PROPERTY, "files"
+    )
 
     created = 0
     updated = 0
@@ -1042,7 +1330,7 @@ def main() -> None:
             item["type"],
             type_options,
         )
-        properties = build_properties(item, has_views_property)
+        properties = build_properties(item, has_views_property, has_attachments_property)
         page_id = find_existing_page(
             notion_token,
             database_id,
