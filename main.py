@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.request
 from html import unescape
+from html.parser import HTMLParser
 import importlib.util
 from pathlib import Path
 from typing import Optional
@@ -193,6 +194,503 @@ def log_attachments(label: str, attachments: list[dict]) -> None:
         url = attachment.get("external", {}).get("url") or ""
         name = attachment.get("name") or ""
         LOGGER.info("첨부파일 링크: %s (%s)", url, name)
+
+
+DEFAULT_ANNOTATIONS = {
+    "bold": False,
+    "italic": False,
+    "strikethrough": False,
+    "underline": False,
+    "code": False,
+    "color": "default",
+}
+
+CSS_COLOR_MAP = {
+    "black": (0, 0, 0),
+    "white": (255, 255, 255),
+    "red": (255, 0, 0),
+    "blue": (0, 0, 255),
+    "green": (0, 128, 0),
+    "yellow": (255, 255, 0),
+    "orange": (255, 165, 0),
+    "purple": (128, 0, 128),
+    "pink": (255, 192, 203),
+    "gray": (128, 128, 128),
+    "grey": (128, 128, 128),
+    "brown": (165, 42, 42),
+}
+URL_TEXT_PATTERN = re.compile(
+    r"(https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+|"
+    r"www\.[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)"
+)
+TRAILING_URL_PUNCTUATION = ").,;]"
+
+
+def parse_css_color(value: str) -> Optional[tuple[int, int, int]]:
+    if not value:
+        return None
+    raw = value.strip().lower()
+    if raw in {"inherit", "transparent", "currentcolor"}:
+        return None
+    if raw in CSS_COLOR_MAP:
+        return CSS_COLOR_MAP[raw]
+    if raw.startswith("#"):
+        hex_value = raw[1:]
+        if len(hex_value) == 3:
+            try:
+                r = int(hex_value[0] * 2, 16)
+                g = int(hex_value[1] * 2, 16)
+                b = int(hex_value[2] * 2, 16)
+                return r, g, b
+            except ValueError:
+                return None
+        if len(hex_value) == 6:
+            try:
+                r = int(hex_value[0:2], 16)
+                g = int(hex_value[2:4], 16)
+                b = int(hex_value[4:6], 16)
+                return r, g, b
+            except ValueError:
+                return None
+        return None
+    match = re.match(r"rgba?\(([^)]+)\)", raw)
+    if match:
+        parts = re.split(r"[,\\s/]+", match.group(1).strip())
+        if len(parts) >= 3:
+            rgb: list[int] = []
+            for part in parts[:3]:
+                if part.endswith("%"):
+                    try:
+                        rgb.append(int(float(part[:-1]) * 2.55))
+                    except ValueError:
+                        return None
+                else:
+                    try:
+                        rgb.append(int(float(part)))
+                    except ValueError:
+                        return None
+            return tuple(max(0, min(255, val)) for val in rgb)
+    return None
+
+
+def rgb_to_hsl(r: int, g: int, b: int) -> tuple[float, float, float]:
+    rf = r / 255.0
+    gf = g / 255.0
+    bf = b / 255.0
+    max_c = max(rf, gf, bf)
+    min_c = min(rf, gf, bf)
+    l = (max_c + min_c) / 2.0
+    if max_c == min_c:
+        return 0.0, 0.0, l
+    d = max_c - min_c
+    s = d / (2.0 - max_c - min_c) if l > 0.5 else d / (max_c + min_c)
+    if max_c == rf:
+        h = (gf - bf) / d + (6.0 if gf < bf else 0.0)
+    elif max_c == gf:
+        h = (bf - rf) / d + 2.0
+    else:
+        h = (rf - gf) / d + 4.0
+    h *= 60.0
+    return h, s, l
+
+
+def notion_color_from_rgb(rgb: tuple[int, int, int]) -> str:
+    r, g, b = rgb
+    h, s, l = rgb_to_hsl(r, g, b)
+    if s < 0.15:
+        if l < 0.35:
+            return "default"
+        return "gray"
+    if h < 20 or h >= 345:
+        return "red"
+    if h < 45:
+        return "orange"
+    if h < 65:
+        return "yellow"
+    if h < 150:
+        return "green"
+    if h < 250:
+        return "blue"
+    if h < 290:
+        return "purple"
+    return "pink"
+
+
+def extract_inline_color(style: str) -> Optional[str]:
+    if not style:
+        return None
+    found = False
+    color_value: Optional[str] = None
+    for chunk in style.split(";"):
+        if ":" not in chunk:
+            continue
+        prop, value = chunk.split(":", 1)
+        if prop.strip().lower() != "color":
+            continue
+        found = True
+        rgb = parse_css_color(value)
+        if not rgb:
+            color_value = None
+            continue
+        mapped = notion_color_from_rgb(rgb)
+        color_value = mapped if mapped != "default" else None
+    if not found:
+        return None
+    return color_value
+
+
+def normalize_inline_text(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def build_rich_text_from_segments(segments: list[dict]) -> list[dict]:
+    rich_text: list[dict] = []
+    for segment in segments:
+        text = segment.get("text", "")
+        if not text or (text.isspace() and "\u00a0" not in text):
+            continue
+        annotations = segment.get("annotations", DEFAULT_ANNOTATIONS)
+        link = segment.get("link")
+        remaining = text
+        while remaining:
+            chunk = remaining[:2000]
+            remaining = remaining[2000:]
+            text_payload = {"content": chunk}
+            if link:
+                text_payload["link"] = {"url": link}
+            rich_text.append(
+                {
+                    "type": "text",
+                    "text": text_payload,
+                    "annotations": annotations,
+                }
+            )
+    return rich_text
+
+
+def build_paragraph_block_from_rich_text(rich_text: list[dict]) -> Optional[dict]:
+    if not rich_text:
+        return None
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": rich_text},
+    }
+
+
+def build_bulleted_block_from_rich_text(rich_text: list[dict]) -> Optional[dict]:
+    if not rich_text:
+        return None
+    return {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {"rich_text": rich_text},
+    }
+
+
+def build_empty_paragraph_block() -> dict:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {"content": "\u00a0"},
+                    "annotations": dict(DEFAULT_ANNOTATIONS),
+                }
+            ]
+        },
+    }
+
+
+def normalize_content_url(raw_url: Optional[str]) -> Optional[str]:
+    if not raw_url:
+        return None
+    raw_url = raw_url.strip()
+    if raw_url.startswith("//"):
+        raw_url = "https:" + raw_url
+    parsed = urlparse(raw_url)
+    if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
+        return None
+    if not parsed.scheme:
+        return urljoin(BASE_SITE, raw_url)
+    return raw_url
+
+
+def normalize_link_url(raw_url: Optional[str]) -> Optional[str]:
+    if not raw_url:
+        return None
+    cleaned = raw_url.strip()
+    lowered = cleaned.lower()
+    if lowered.startswith(("mailto:", "tel:")):
+        return cleaned
+    return normalize_content_url(cleaned)
+
+
+def split_text_with_links(text: str) -> list[tuple[str, Optional[str]]]:
+    if not text:
+        return []
+    parts: list[tuple[str, Optional[str]]] = []
+    last_index = 0
+    for match in URL_TEXT_PATTERN.finditer(text):
+        start, end = match.span()
+        if start > last_index:
+            parts.append((text[last_index:start], None))
+        url_text = match.group(0)
+        trimmed = url_text.rstrip(TRAILING_URL_PUNCTUATION)
+        suffix = url_text[len(trimmed) :]
+        if trimmed:
+            link = trimmed
+            if link.lower().startswith("www."):
+                link = "https://" + link
+            parts.append((trimmed, link))
+        if suffix:
+            parts.append((suffix, None))
+        last_index = end
+    if last_index < len(text):
+        parts.append((text[last_index:], None))
+    return parts
+
+
+def build_image_block(url: str) -> dict:
+    return {
+        "object": "block",
+        "type": "image",
+        "image": {"type": "external", "external": {"url": url}},
+    }
+
+
+class TiptapBlockParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_tiptap = False
+        self.tiptap_depth = 0
+        self.in_list_item = False
+        self.current_block_type: Optional[str] = None
+        self.rich_text: list[dict] = []
+        self.bold_depth = 0
+        self.italic_depth = 0
+        self.underline_depth = 0
+        self.strike_depth = 0
+        self.code_depth = 0
+        self.link_stack: list[Optional[str]] = []
+        self.color_stack: list[str] = ["default"]
+        self.color_push_stack: list[bool] = []
+        self.blocks: list[dict] = []
+        self.void_tags = {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
+        }
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        attrs_dict = {key: value or "" for key, value in attrs}
+        if not self.in_tiptap and tag == "div":
+            classes = attrs_dict.get("class", "")
+            if "tiptap" in classes.split():
+                self.in_tiptap = True
+                self.tiptap_depth = 1
+                return
+        if not self.in_tiptap:
+            return
+        if tag not in self.void_tags:
+            self.tiptap_depth += 1
+            color = extract_inline_color(attrs_dict.get("style", ""))
+            if color:
+                self.color_stack.append(color)
+                self.color_push_stack.append(True)
+            else:
+                self.color_push_stack.append(False)
+        if tag == "li":
+            if not self.in_list_item:
+                self.flush_block()
+                self.in_list_item = True
+                self.current_block_type = "li"
+        elif tag == "p":
+            if not self.in_list_item and self.current_block_type != "p":
+                self.flush_block()
+                self.current_block_type = "p"
+        elif tag in {"strong", "b"}:
+            self.bold_depth += 1
+        elif tag in {"em", "i"}:
+            self.italic_depth += 1
+        elif tag == "u":
+            self.underline_depth += 1
+        elif tag in {"s", "del", "strike"}:
+            self.strike_depth += 1
+        elif tag == "code":
+            self.code_depth += 1
+        elif tag == "a":
+            href = attrs_dict.get("href") or ""
+            self.link_stack.append(normalize_link_url(href))
+        elif tag == "img":
+            src = attrs_dict.get("src") or ""
+            url = normalize_content_url(src)
+            if url:
+                self.flush_block()
+                self.blocks.append(build_image_block(url))
+        elif tag == "br":
+            self.append_line_break()
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.in_tiptap:
+            return
+        if tag not in self.void_tags and self.color_push_stack:
+            pushed = self.color_push_stack.pop()
+            if pushed and len(self.color_stack) > 1:
+                self.color_stack.pop()
+        if tag == "li" and self.in_list_item:
+            self.flush_block()
+            self.in_list_item = False
+            self.current_block_type = None
+        elif tag == "p" and not self.in_list_item and self.current_block_type == "p":
+            if self.rich_text:
+                self.flush_block()
+            else:
+                self.blocks.append(build_empty_paragraph_block())
+            self.current_block_type = None
+        elif tag in {"strong", "b"}:
+            self.bold_depth = max(0, self.bold_depth - 1)
+        elif tag in {"em", "i"}:
+            self.italic_depth = max(0, self.italic_depth - 1)
+        elif tag == "u":
+            self.underline_depth = max(0, self.underline_depth - 1)
+        elif tag in {"s", "del", "strike"}:
+            self.strike_depth = max(0, self.strike_depth - 1)
+        elif tag == "code":
+            self.code_depth = max(0, self.code_depth - 1)
+        elif tag == "a":
+            if self.link_stack:
+                self.link_stack.pop()
+        self.tiptap_depth -= 1
+        if self.tiptap_depth <= 0:
+            self.flush_block()
+            self.in_tiptap = False
+            self.tiptap_depth = 0
+            self.in_list_item = False
+            self.current_block_type = None
+            self.bold_depth = 0
+            self.italic_depth = 0
+            self.underline_depth = 0
+            self.strike_depth = 0
+            self.code_depth = 0
+            self.link_stack.clear()
+            self.color_stack = ["default"]
+            self.color_push_stack = []
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if not self.in_tiptap:
+            return
+        if tag == "br":
+            self.append_line_break()
+        elif tag == "img":
+            attrs_dict = {key: value or "" for key, value in attrs}
+            src = attrs_dict.get("src") or ""
+            url = normalize_content_url(src)
+            if url:
+                self.flush_block()
+                self.blocks.append(build_image_block(url))
+
+    def handle_data(self, data: str) -> None:
+        if not self.in_tiptap:
+            return
+        self.append_text(data)
+
+    def append_text(self, data: str) -> None:
+        text = normalize_inline_text(data)
+        if not text:
+            return
+        annotations = dict(DEFAULT_ANNOTATIONS)
+        annotations["bold"] = self.bold_depth > 0
+        annotations["italic"] = self.italic_depth > 0
+        annotations["underline"] = self.underline_depth > 0
+        annotations["strikethrough"] = self.strike_depth > 0
+        annotations["code"] = self.code_depth > 0
+        annotations["color"] = self.color_stack[-1] if self.color_stack else "default"
+        link = self.link_stack[-1] if self.link_stack else None
+        if link:
+            self.append_segment(text, annotations, link)
+            return
+        for segment_text, segment_link in split_text_with_links(text):
+            self.append_segment(segment_text, annotations, segment_link)
+
+    def append_segment(
+        self,
+        text: str,
+        annotations: dict,
+        link: Optional[str],
+    ) -> None:
+        if not text:
+            return
+        if text.isspace() and "\u00a0" not in text:
+            if not self.rich_text:
+                return
+            if not self.rich_text[-1]["text"].endswith((" ", "\n")):
+                self.rich_text[-1]["text"] += " "
+            return
+        if self.rich_text:
+            last = self.rich_text[-1]
+            if last.get("annotations") == annotations and last.get("link") == link:
+                last["text"] += text
+                return
+        self.rich_text.append(
+            {"text": text, "annotations": annotations, "link": link}
+        )
+
+    def append_line_break(self) -> None:
+        if self.current_block_type is None and not self.in_list_item:
+            self.current_block_type = "p"
+        annotations = dict(DEFAULT_ANNOTATIONS)
+        annotations["bold"] = self.bold_depth > 0
+        annotations["italic"] = self.italic_depth > 0
+        annotations["underline"] = self.underline_depth > 0
+        annotations["strikethrough"] = self.strike_depth > 0
+        annotations["code"] = self.code_depth > 0
+        annotations["color"] = self.color_stack[-1] if self.color_stack else "default"
+        link = self.link_stack[-1] if self.link_stack else None
+        if self.rich_text:
+            last = self.rich_text[-1]
+            if last.get("annotations") == annotations and last.get("link") == link:
+                last["text"] += "\n"
+                return
+        self.rich_text.append(
+            {"text": "\n", "annotations": annotations, "link": link}
+        )
+
+    def flush_block(self) -> None:
+        if not self.rich_text:
+            return
+        rich_text = build_rich_text_from_segments(self.rich_text)
+        self.rich_text = []
+        if self.in_list_item or self.current_block_type == "li":
+            block = build_bulleted_block_from_rich_text(rich_text)
+        else:
+            block = build_paragraph_block_from_rich_text(rich_text)
+        if block:
+            self.blocks.append(block)
+
+
+def extract_body_blocks_from_html(html_text: str) -> list[dict]:
+    parser = TiptapBlockParser()
+    parser.feed(html_text)
+    parser.close()
+    return parser.blocks
+
+
+def chunks(items: list[dict], size: int) -> list[list[dict]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 def is_detail_url(url: str) -> bool:
@@ -601,11 +1099,12 @@ def fetch_detail_metadata_via_playwright(
     page,
     list_url: str,
     detail_url: str,
-) -> tuple[Optional[str], list[dict]]:
+) -> tuple[Optional[str], list[dict], list[dict]]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     written_at = None
     attachments: list[dict] = []
+    body_blocks: list[dict] = []
     try:
         page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
         if not wait_for_written_at(page):
@@ -630,11 +1129,12 @@ def fetch_detail_metadata_via_playwright(
         attachments = extract_attachments_from_page(page)
         if not attachments:
             attachments = extract_attachments_from_detail(page.content())
+        body_blocks = extract_body_blocks_from_html(page.content())
     except PlaywrightTimeoutError:
         LOGGER.info("상세 페이지 로드 실패: %s", detail_url)
     finally:
         return_to_list_page(page, list_url)
-    return written_at, attachments
+    return written_at, attachments, body_blocks
 
 
 def fetch_detail_for_row(
@@ -642,7 +1142,7 @@ def fetch_detail_for_row(
     list_url: str,
     row_index: int,
     detail_url: Optional[str],
-) -> tuple[Optional[str], Optional[str], list[dict]]:
+) -> tuple[Optional[str], Optional[str], list[dict], list[dict]]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     if detail_url:
@@ -651,47 +1151,51 @@ def fetch_detail_for_row(
             LOGGER.info("상세 URL 경로 아님: %s", detail_url)
             detail_url = None
     if detail_url:
-        written_at, attachments = fetch_detail_metadata_from_url(detail_url)
-        if not attachments:
-            pw_written_at, pw_attachments = fetch_detail_metadata_via_playwright(
+        written_at, attachments, body_blocks = fetch_detail_metadata_from_url(detail_url)
+        if not attachments or not body_blocks:
+            pw_written_at, pw_attachments, pw_body_blocks = fetch_detail_metadata_via_playwright(
                 page, list_url, detail_url
             )
             if not written_at and pw_written_at:
                 written_at = pw_written_at
             if pw_attachments:
                 attachments = pw_attachments
-        return written_at, detail_url, attachments
+            if pw_body_blocks:
+                body_blocks = pw_body_blocks
+        return written_at, detail_url, attachments, body_blocks
 
     rows = page.locator(LIST_ROW_SELECTOR)
     if row_index >= rows.count():
-        return None, None, []
+        return None, None, [], []
 
     row = rows.nth(row_index)
     row.scroll_into_view_if_needed()
     detail_id = extract_detail_id_from_row(row)
     if detail_id:
         detail_url = normalize_detail_url(build_detail_url(detail_id))
-        written_at, attachments = fetch_detail_metadata_from_url(detail_url)
-        if not attachments:
-            pw_written_at, pw_attachments = fetch_detail_metadata_via_playwright(
+        written_at, attachments, body_blocks = fetch_detail_metadata_from_url(detail_url)
+        if not attachments or not body_blocks:
+            pw_written_at, pw_attachments, pw_body_blocks = fetch_detail_metadata_via_playwright(
                 page, list_url, detail_url
             )
             if not written_at and pw_written_at:
                 written_at = pw_written_at
             if pw_attachments:
                 attachments = pw_attachments
-        if written_at or attachments:
-            return written_at, detail_url, attachments
+            if pw_body_blocks:
+                body_blocks = pw_body_blocks
+        if written_at or attachments or body_blocks:
+            return written_at, detail_url, attachments, body_blocks
     row.click()
 
     detail_url = wait_for_detail_url(page, list_url)
     if not detail_url:
         LOGGER.info("상세 URL 전환 실패: row %s", row_index)
         return_to_list_page(page, list_url)
-        return None, None, []
+        return None, None, [], []
 
     normalized_detail_url = normalize_detail_url(detail_url) or detail_url
-    written_at, attachments = fetch_detail_metadata_from_url(normalized_detail_url)
+    written_at, attachments, body_blocks = fetch_detail_metadata_from_url(normalized_detail_url)
     if not wait_for_written_at(page):
         LOGGER.info("작성일 로드 대기 실패: %s", detail_url)
     if not written_at:
@@ -703,8 +1207,11 @@ def fetch_detail_for_row(
         attachments = page_attachments
     elif not attachments:
         attachments = extract_attachments_from_detail(page.content())
+    page_blocks = extract_body_blocks_from_html(page.content())
+    if page_blocks:
+        body_blocks = page_blocks
     return_to_list_page(page, list_url)
-    return written_at, normalized_detail_url, attachments
+    return written_at, normalized_detail_url, attachments, body_blocks
 
 
 def goto_list_page(page, url: str) -> bool:
@@ -769,7 +1276,7 @@ def crawl_top_items() -> list[dict]:
             has_non_top = any(not item.get("top") for item in page_items)
             new_top = 0
             for item in top_items:
-                written_at, detail_url, attachments = fetch_detail_for_row(
+                written_at, detail_url, attachments, body_blocks = fetch_detail_for_row(
                     page,
                     url,
                     item["row_index"],
@@ -782,6 +1289,8 @@ def crawl_top_items() -> list[dict]:
                 if attachments:
                     item["attachments"] = attachments
                     log_attachments(item["title"], attachments)
+                if body_blocks:
+                    item["body_blocks"] = body_blocks
                 key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
                 if key in seen:
                     continue
@@ -824,12 +1333,16 @@ def crawl_top_items_http() -> list[dict]:
         new_top = 0
         for item in top_items:
             if item.get("url"):
-                written_at, attachments = fetch_detail_metadata_from_url(item["url"])
+                written_at, attachments, body_blocks = fetch_detail_metadata_from_url(
+                    item["url"]
+                )
                 if written_at:
                     item["date"] = written_at
                 if attachments:
                     item["attachments"] = attachments
                     log_attachments(item["title"], attachments)
+                if body_blocks:
+                    item["body_blocks"] = body_blocks
             key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
             if key in seen:
                 continue
@@ -913,15 +1426,16 @@ def fetch_html(url: str) -> Optional[str]:
     return None
 
 
-def fetch_detail_metadata_from_url(detail_url: str) -> tuple[Optional[str], list[dict]]:
+def fetch_detail_metadata_from_url(detail_url: str) -> tuple[Optional[str], list[dict], list[dict]]:
     html_text = fetch_html(detail_url)
     if not html_text:
-        return None, []
+        return None, [], []
     if "첨부파일" in html_text:
         LOGGER.info("첨부파일 HTML 감지: %s", detail_url)
     written_at = extract_written_at_from_detail(html_text)
     attachments = extract_attachments_from_detail(html_text)
-    return written_at, attachments
+    body_blocks = extract_body_blocks_from_html(html_text)
+    return written_at, attachments, body_blocks
 
 
 def fetch_database(token: str, database_id: str) -> dict:
@@ -1093,6 +1607,46 @@ def query_database(token: str, database_id: str, filter_payload: dict) -> list[d
     return data.get("results", [])
 
 
+def append_block_children(token: str, block_id: str, children: list[dict]) -> dict:
+    url = f"https://api.notion.com/v1/blocks/{block_id}/children"
+    payload = {"children": children}
+    return notion_request("PATCH", url, token, payload)
+
+
+def list_block_children(token: str, block_id: str) -> list[dict]:
+    base_url = f"https://api.notion.com/v1/blocks/{block_id}/children"
+    results: list[dict] = []
+    cursor: Optional[str] = None
+    while True:
+        params = {"page_size": 100}
+        if cursor:
+            params["start_cursor"] = cursor
+        url = f"{base_url}?{urlencode(params)}"
+        data = notion_request("GET", url, token)
+        results.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return results
+
+
+def delete_block(token: str, block_id: str) -> None:
+    url = f"https://api.notion.com/v1/blocks/{block_id}"
+    notion_request("DELETE", url, token)
+
+
+def sync_page_body_blocks(token: str, page_id: str, blocks: list[dict]) -> None:
+    if not blocks:
+        return
+    children = list_block_children(token, page_id)
+    for block in children:
+        block_id = block.get("id")
+        if block_id:
+            delete_block(token, block_id)
+    for chunk in chunks(blocks, 80):
+        append_block_children(token, page_id, chunk)
+
+
 def build_properties(
     item: dict,
     has_views_property: bool,
@@ -1198,13 +1752,14 @@ def build_icon() -> dict:
     return {"type": "emoji", "emoji": PAGE_ICON_EMOJI}
 
 
-def create_page(token: str, database_id: str, properties: dict) -> None:
+def create_page(token: str, database_id: str, properties: dict) -> str:
     payload = {
         "parent": {"database_id": database_id},
         "properties": properties,
         "icon": build_icon(),
     }
-    notion_request("POST", "https://api.notion.com/v1/pages", token, payload)
+    data = notion_request("POST", "https://api.notion.com/v1/pages", token, payload)
+    return data.get("id")
 
 
 def update_page(token: str, page_id: str, properties: dict) -> None:
@@ -1343,9 +1898,12 @@ def main() -> None:
             updated += 1
             LOGGER.info("업데이트 완료: %s", label)
         else:
-            create_page(notion_token, database_id, properties)
+            page_id = create_page(notion_token, database_id, properties)
             created += 1
             LOGGER.info("생성 완료: %s", label)
+        body_blocks = item.get("body_blocks", [])
+        if page_id and body_blocks:
+            sync_page_body_blocks(notion_token, page_id, body_blocks)
 
     LOGGER.info("기존 TOP 정리 시작")
     disabled = disable_missing_top(notion_token, database_id, current_top_urls, current_top_dates)
