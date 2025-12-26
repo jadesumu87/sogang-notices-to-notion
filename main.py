@@ -764,12 +764,8 @@ def query_database(token: str, database_id: str, filter_payload: dict) -> list[d
 
 
 def build_properties(item: dict, has_views_property: bool) -> dict:
-    title_text = {"content": item["title"]}
-    if item.get("url"):
-        title_text["link"] = {"url": item["url"]}
-
     props = {
-        TITLE_PROPERTY: {"title": [{"text": title_text}]},
+        TITLE_PROPERTY: {"title": [{"text": {"content": item["title"]}}]},
         TOP_PROPERTY: {"checkbox": item["top"]},
     }
 
