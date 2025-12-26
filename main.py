@@ -3,10 +3,13 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from html import unescape
+import importlib.util
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 
 NOTION_API_VERSION = "2022-06-28"
@@ -19,14 +22,14 @@ AUTHOR_PROPERTY = "작성자"
 DATE_PROPERTY = "작성일"
 TOP_PROPERTY = "TOP"
 URL_PROPERTY = "URL"
+VIEWS_PROPERTY = "조회수"
 LOGGER = logging.getLogger("scholarship-crawler")
 BASE_SITE = "https://www.sogang.ac.kr"
-DETAIL_BBS_CONFIG_FK = os.environ.get("BBS_CONFIG_FK", "141")
 DATE_PATTERN = re.compile(
     r"\d{4}[.\-]\d{2}[.\-]\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?"
 )
 DATE_TIME_PATTERN = re.compile(r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2})?")
-DATE_TIME_JS_PATTERN = r"\\d{4}[.\\-]\\d{2}[.\\-]\\d{2}\\s+\\d{2}:\\d{2}(?::\\d{2})?"
+DATE_TIME_JS_PATTERN = r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2})?"
 DETAIL_PATH_PATTERN = re.compile(r"/detail/\d+")
 
 
@@ -65,7 +68,7 @@ def clean_text(html_text: str) -> str:
     return text.strip()
 
 
-def parse_datetime(date_text: str) -> str | None:
+def parse_datetime(date_text: str) -> Optional[str]:
     match = re.search(r"(\d{4})[.\-](\d{2})[.\-](\d{2})", date_text)
     if not match:
         return None
@@ -79,7 +82,7 @@ def parse_datetime(date_text: str) -> str | None:
     return f"{year}-{month}-{day}T00:00:00+09:00"
 
 
-def normalize_date_key(date_text: str | None) -> str:
+def normalize_date_key(date_text: Optional[str]) -> str:
     if not date_text:
         return ""
     match = re.search(r"\d{4}-\d{2}-\d{2}", date_text)
@@ -88,16 +91,26 @@ def normalize_date_key(date_text: str | None) -> str:
     return date_text[:10]
 
 
-def normalize_detail_url(raw_url: str | None) -> str | None:
+def normalize_detail_url(raw_url: Optional[str]) -> Optional[str]:
     if not raw_url:
         return None
+    raw_url = raw_url.strip()
+    lowered = raw_url.lower()
+    if lowered in {"#", "#/", "javascript:void(0)", "javascript:void(0);"}:
+        return None
+    if lowered.startswith(("javascript:", "mailto:", "tel:", "data:")):
+        return None
+    if raw_url.startswith("//"):
+        raw_url = "https:" + raw_url
     parsed = urlparse(raw_url)
+    if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
+        return None
     if not parsed.scheme or not parsed.netloc:
         if raw_url.startswith("/"):
             base = urlparse(BASE_URL)
             parsed = urlparse(f"{base.scheme}://{base.netloc}{raw_url}")
         else:
-            return raw_url
+            return None
     query = parse_qs(parsed.query)
     drop_keys = {"introPkId", "option", "page"}
     query_items: list[tuple[str, str]] = []
@@ -111,14 +124,25 @@ def normalize_detail_url(raw_url: str | None) -> str | None:
 
 
 def is_detail_url(url: str) -> bool:
-    return bool(DETAIL_PATH_PATTERN.search(url)) or "bbsConfigFk=" in url
+    if not url:
+        return False
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    if DETAIL_PATH_PATTERN.search(path):
+        return True
+    qs = parse_qs(parsed.query)
+    return "bbsConfigFk" in qs
+
+
+def get_bbs_config_fk() -> str:
+    return os.environ.get("BBS_CONFIG_FK", "141")
 
 
 def build_detail_url(detail_id: str) -> str:
-    return f"{BASE_SITE}/ko/detail/{detail_id}?bbsConfigFk={DETAIL_BBS_CONFIG_FK}"
+    return f"{BASE_SITE}/ko/detail/{detail_id}?bbsConfigFk={get_bbs_config_fk()}"
 
 
-def parse_int(value: str) -> int | None:
+def parse_int(value: str) -> Optional[int]:
     digits = re.sub(r"[^0-9]", "", value)
     if not digits:
         return None
@@ -136,7 +160,6 @@ def parse_rows(html_text: str) -> list[dict]:
             continue
 
         cleaned = [clean_text(cell) for cell in cells]
-        cleaned = [cell for cell in cleaned if cell]
 
         if len(cleaned) < 5:
             continue
@@ -169,18 +192,18 @@ def parse_rows(html_text: str) -> list[dict]:
     return items
 
 
-def extract_written_at_from_detail(html_text: str) -> str | None:
+def extract_written_at_from_detail(html_text: str) -> Optional[str]:
     matches = re.findall(
-        r"작성일.*?(\d{4}[.\-]\d{2}[.\-]\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)",
+        r"(작성일|등록일).*?(\d{4}[.\-]\d{2}[.\-]\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)",
         html_text,
         re.DOTALL,
     )
     if not matches:
         return None
-    for value in matches:
+    for _, value in matches:
         if DATE_TIME_PATTERN.search(value):
             return parse_datetime(value)
-    return None
+    return parse_datetime(matches[0][1])
 
 
 def build_list_url(page: int) -> str:
@@ -189,7 +212,7 @@ def build_list_url(page: int) -> str:
     return f"{BASE_URL}?{urlencode(query)}"
 
 
-def extract_detail_url_from_row_html(row_html: str) -> str | None:
+def extract_detail_url_from_row_html(row_html: str) -> Optional[str]:
     for match in re.finditer(r'href="([^"]+)"', row_html):
         href = unescape(match.group(1))
         candidate = normalize_detail_url(href)
@@ -288,7 +311,7 @@ def wait_for_written_at(page, timeout_ms: int = 30000) -> bool:
         return False
 
 
-def wait_for_detail_url(page, list_url: str) -> str | None:
+def wait_for_detail_url(page, list_url: str) -> Optional[str]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     try:
@@ -298,7 +321,7 @@ def wait_for_detail_url(page, list_url: str) -> str | None:
     return page.url
 
 
-def extract_detail_id_from_row(row) -> str | None:
+def extract_detail_id_from_row(row) -> Optional[str]:
     for key in ("data-id", "data-no", "data-board-id", "data-article-id", "data-detail-id"):
         value = row.get_attribute(key)
         if value and value.isdigit():
@@ -313,25 +336,46 @@ def extract_detail_id_from_row(row) -> str | None:
     return None
 
 
-def extract_written_at_from_page(page) -> str | None:
-    label = page.locator("text=작성일")
+def extract_written_at_from_page(page) -> Optional[str]:
+    label = page.locator("text=작성일").or_(page.locator("text=등록일"))
     for idx in range(label.count()):
-        container = label.nth(idx).locator(
-            "xpath=ancestor::div[contains(@class,'flex')][1]"
-        )
-        texts = container.locator("div").all_inner_texts()
-        for text in texts:
+        label_node = label.nth(idx)
+        try:
+            container_text = label_node.locator("xpath=..").inner_text()
+        except Exception:
+            container_text = ""
+        match = DATE_TIME_PATTERN.search(container_text)
+        if match:
+            return parse_datetime(match.group(0))
+        try:
+            sibling_texts = label_node.locator("xpath=following-sibling::*").all_inner_texts()
+        except Exception:
+            sibling_texts = []
+        for text in sibling_texts:
             match = DATE_TIME_PATTERN.search(text)
             if match:
                 return parse_datetime(match.group(0))
     body_text = page.locator("body").inner_text()
+    match = re.search(
+        rf"(작성일|등록일).*?({DATE_TIME_PATTERN.pattern})",
+        body_text,
+    )
+    if match:
+        return parse_datetime(match.group(2))
     match = DATE_TIME_PATTERN.search(body_text)
+    if match:
+        return parse_datetime(match.group(0))
+    match = DATE_PATTERN.search(body_text)
     if match:
         return parse_datetime(match.group(0))
     return None
 
 
-def fetch_written_at_via_playwright(page, list_url: str, detail_url: str) -> str | None:
+def fetch_written_at_via_playwright(
+    page,
+    list_url: str,
+    detail_url: str,
+) -> Optional[str]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     written_at = None
@@ -353,8 +397,8 @@ def fetch_detail_for_row(
     page,
     list_url: str,
     row_index: int,
-    detail_url: str | None,
-) -> tuple[str | None, str | None]:
+    detail_url: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     if detail_url:
@@ -509,25 +553,61 @@ def crawl_top_items_http() -> list[dict]:
     return items
 
 
-def notion_request(method: str, url: str, token: str, payload: dict | None = None) -> dict:
+def notion_request(
+    method: str,
+    url: str,
+    token: str,
+    payload: Optional[dict] = None,
+) -> dict:
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
+    max_retries = 3
+    backoff = 1.0
 
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Notion-Version", NOTION_API_VERSION)
-    req.add_header("Content-Type", "application/json")
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Notion-Version", NOTION_API_VERSION)
+        req.add_header("Content-Type", "application/json")
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Notion API error: HTTP {exc.code}: {body}") from exc
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            retryable = exc.code in {429, 500, 502, 503, 504}
+            if retryable and attempt < max_retries:
+                retry_after = exc.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    sleep_s = float(retry_after)
+                else:
+                    sleep_s = backoff
+                LOGGER.info(
+                    "Notion API 재시도(%s/%s): HTTP %s",
+                    attempt + 1,
+                    max_retries,
+                    exc.code,
+                )
+                time.sleep(sleep_s)
+                backoff = min(backoff * 2, 8.0)
+                continue
+            raise RuntimeError(f"Notion API error: HTTP {exc.code}: {body}") from exc
+        except urllib.error.URLError as exc:
+            if attempt < max_retries:
+                LOGGER.info(
+                    "Notion API 재시도(%s/%s): %s",
+                    attempt + 1,
+                    max_retries,
+                    exc.reason,
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 8.0)
+                continue
+            raise RuntimeError(f"Notion API error: {exc.reason}") from exc
 
 
-def fetch_html(url: str) -> str | None:
+def fetch_html(url: str) -> Optional[str]:
     req = urllib.request.Request(url)
     req.add_header("User-Agent", USER_AGENT)
     try:
@@ -540,7 +620,7 @@ def fetch_html(url: str) -> str | None:
     return None
 
 
-def fetch_written_at_from_url(detail_url: str) -> str | None:
+def fetch_written_at_from_url(detail_url: str) -> Optional[str]:
     html_text = fetch_html(detail_url)
     if not html_text:
         return None
@@ -559,10 +639,73 @@ def update_database(token: str, database_id: str, properties: dict) -> dict:
 
 
 def ensure_url_property(token: str, database_id: str, database: dict) -> dict:
-    if URL_PROPERTY in database.get("properties", {}):
+    prop = database.get("properties", {}).get(URL_PROPERTY)
+    if prop:
+        if prop.get("type") != "url":
+            raise RuntimeError(f"Notion 속성 타입 불일치: {URL_PROPERTY} (url 아님)")
         return database
     LOGGER.info("Notion 속성 추가: %s", URL_PROPERTY)
     return update_database(token, database_id, {URL_PROPERTY: {"url": {}}})
+
+
+def require_property_type(database: dict, property_name: str, expected_type: str) -> None:
+    prop = database.get("properties", {}).get(property_name)
+    if not prop:
+        raise RuntimeError(
+            f"Notion 속성 누락: {property_name} (필수 타입: {expected_type})"
+        )
+    actual = prop.get("type")
+    if actual != expected_type:
+        raise RuntimeError(
+            f"Notion 속성 타입 불일치: {property_name} (기대 {expected_type}, 실제 {actual})"
+        )
+
+
+def validate_required_properties(database: dict) -> None:
+    require_property_type(database, TITLE_PROPERTY, "title")
+    require_property_type(database, TOP_PROPERTY, "checkbox")
+    require_property_type(database, DATE_PROPERTY, "date")
+    require_property_type(database, AUTHOR_PROPERTY, "select")
+    require_property_type(database, URL_PROPERTY, "url")
+
+
+def validate_optional_property_type(
+    database: dict,
+    property_name: str,
+    expected_type: str,
+) -> bool:
+    prop = database.get("properties", {}).get(property_name)
+    if not prop:
+        return False
+    actual = prop.get("type")
+    if actual != expected_type:
+        LOGGER.info(
+            "Notion 속성 타입 불일치: %s (기대 %s, 실제 %s) -> 업데이트 생략",
+            property_name,
+            expected_type,
+            actual,
+        )
+        return False
+    return True
+
+
+def log_environment_info() -> None:
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    playwright_installed = importlib.util.find_spec("playwright") is not None
+    browser = os.environ.get("BROWSER", "chromium")
+    headless_raw = os.environ.get("HEADLESS", "1").strip().lower()
+    headless = headless_raw not in {"0", "false", "no", "off"}
+    LOGGER.info(
+        "환경: Python=%s, Playwright=%s",
+        python_version,
+        "설치됨" if playwright_installed else "미설치",
+    )
+    LOGGER.info(
+        "환경: BROWSER=%s, HEADLESS=%s, bbsConfigFk=%s",
+        browser,
+        "1" if headless else "0",
+        get_bbs_config_fk(),
+    )
 
 
 def get_select_options(database: dict, property_name: str) -> list[dict]:
@@ -581,6 +724,8 @@ def sanitize_select_options(options: list[dict]) -> list[dict]:
         if not name:
             continue
         item = {"name": name}
+        if option.get("id"):
+            item["id"] = option["id"]
         color = option.get("color")
         if color:
             item["color"] = color
@@ -618,7 +763,7 @@ def query_database(token: str, database_id: str, filter_payload: dict) -> list[d
     return data.get("results", [])
 
 
-def build_properties(item: dict) -> dict:
+def build_properties(item: dict, has_views_property: bool) -> dict:
     title_text = {"content": item["title"]}
     if item.get("url"):
         title_text["link"] = {"url": item["url"]}
@@ -632,8 +777,8 @@ def build_properties(item: dict) -> dict:
         props[DATE_PROPERTY] = {"date": {"start": item["date"]}}
     if item.get("author"):
         props[AUTHOR_PROPERTY] = {"select": {"name": item["author"]}}
-    if item.get("views") is not None:
-        props["조회수"] = {"number": item["views"]}
+    if has_views_property and item.get("views") is not None:
+        props[VIEWS_PROPERTY] = {"number": item["views"]}
     if item.get("url"):
         props[URL_PROPERTY] = {"url": item["url"]}
     return props
@@ -646,7 +791,7 @@ def extract_title(properties: dict) -> str:
     return text
 
 
-def extract_date(properties: dict) -> str | None:
+def extract_date(properties: dict) -> Optional[str]:
     date_prop = properties.get(DATE_PROPERTY, {})
     date_data = date_prop.get("date")
     if not date_data:
@@ -657,7 +802,7 @@ def extract_date(properties: dict) -> str | None:
     return start
 
 
-def extract_url(properties: dict) -> str | None:
+def extract_url(properties: dict) -> Optional[str]:
     url_prop = properties.get(URL_PROPERTY, {})
     url_value = url_prop.get("url")
     if not url_value:
@@ -668,10 +813,10 @@ def extract_url(properties: dict) -> str | None:
 def find_existing_page(
     token: str,
     database_id: str,
-    detail_url: str | None,
+    detail_url: Optional[str],
     title: str,
-    date_iso: str | None,
-) -> str | None:
+    date_iso: Optional[str],
+) -> Optional[str]:
     if detail_url:
         results = query_database(
             token,
@@ -773,7 +918,7 @@ def disable_missing_top(
     return disabled
 
 
-def resolve_html_path() -> Path | None:
+def resolve_html_path() -> Optional[Path]:
     if len(sys.argv) > 1:
         return Path(sys.argv[1])
     env_path = os.environ.get("HTML_PATH")
@@ -785,6 +930,7 @@ def resolve_html_path() -> Path | None:
 def main() -> None:
     setup_logging()
     load_dotenv()
+    log_environment_info()
 
     notion_token = os.environ.get("NOTION_TOKEN")
     database_id = os.environ.get("NOTION_DB_ID")
@@ -806,7 +952,9 @@ def main() -> None:
 
     database = fetch_database(notion_token, database_id)
     database = ensure_url_property(notion_token, database_id, database)
+    validate_required_properties(database)
     author_options = get_select_options(database, AUTHOR_PROPERTY)
+    has_views_property = validate_optional_property_type(database, VIEWS_PROPERTY, "number")
 
     created = 0
     updated = 0
@@ -831,7 +979,7 @@ def main() -> None:
                 item["author"],
                 author_options,
             )
-        properties = build_properties(item)
+        properties = build_properties(item, has_views_property)
         page_id = find_existing_page(
             notion_token,
             database_id,
