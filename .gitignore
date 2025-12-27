@@ -1,6 +1,5 @@
 html/
 
-.env
-inspect_notion_db.py
-notion_info_formula.txt
-test.*
+*env*
+*test*
+*notion*
