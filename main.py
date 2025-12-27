@@ -461,6 +461,16 @@ def build_image_block(url: str) -> dict:
     }
 
 
+def build_space_rich_text() -> list[dict]:
+    return [
+        {
+            "type": "text",
+            "text": {"content": "\u00a0"},
+            "annotations": dict(DEFAULT_ANNOTATIONS),
+        }
+    ]
+
+
 def build_container_block(rich_text: Optional[list[dict]] = None) -> dict:
     return {
         "object": "block",
@@ -1669,6 +1679,19 @@ def is_empty_paragraph_block(block: dict) -> bool:
     return content.replace("\u00a0", "").strip() == ""
 
 
+def is_image_only_blocks(blocks: list[dict]) -> bool:
+    if not blocks:
+        return False
+    has_image = False
+    for block in blocks:
+        if is_empty_paragraph_block(block):
+            continue
+        if block.get("type") != "image":
+            return False
+        has_image = True
+    return has_image
+
+
 def sync_page_body_blocks(token: str, page_id: str, blocks: list[dict]) -> None:
     if not blocks:
         return
@@ -1680,6 +1703,12 @@ def sync_page_body_blocks(token: str, page_id: str, blocks: list[dict]) -> None:
         container_rich_text = blocks[idx].get("paragraph", {}).get("rich_text", [])
         idx += 1
     remaining_blocks = blocks[idx:]
+    if is_image_only_blocks(remaining_blocks):
+        remaining_blocks = [
+            block for block in remaining_blocks if not is_empty_paragraph_block(block)
+        ]
+        if not container_rich_text:
+            container_rich_text = build_space_rich_text()
     children = list_block_children(token, page_id)
     for block in children:
         block_id = block.get("id")
