@@ -1,7 +1,9 @@
+import hashlib
 import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -26,6 +28,8 @@ URL_PROPERTY = "URL"
 VIEWS_PROPERTY = "조회수"
 ATTACHMENT_PROPERTY = "첨부파일"
 TYPE_PROPERTY = "유형"
+BODY_HASH_PROPERTY = "본문 해시"
+SYNC_CONTAINER_MARKER = "[SYNC_CONTAINER]"
 LOGGER = logging.getLogger("scholarship-crawler")
 BASE_SITE = "https://www.sogang.ac.kr"
 BBS_API_BASE = f"{BASE_SITE}/api/api/v1/mainKo/BbsData"
@@ -65,6 +69,11 @@ ATTACHMENT_HINTS = (
     "file-fe-prd/board",
     "sg=",
 )
+ATTACHMENT_LINK_PATTERN = re.compile(
+    r"(file-fe-prd/board|filedown|filedownload|bbsfile|download)",
+    re.IGNORECASE,
+)
+BODY_CONTAINER_PATTERN = re.compile(r"\b(tiptap|custom-css-tag-a)\b", re.IGNORECASE)
 TYPE_TAGS = (
     "교내/국가",
     "교외",
@@ -76,6 +85,18 @@ TYPE_TAGS = (
     "주거지원",
 )
 FALLBACK_TYPE = "공통"
+
+
+class NotionRequestError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.reason = reason
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -152,6 +173,11 @@ def normalize_date_key(date_text: Optional[str]) -> str:
     if match:
         return match.group(0)
     return date_text[:10]
+
+
+def compute_body_hash(blocks: list[dict]) -> str:
+    payload = json.dumps(blocks, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def normalize_detail_url(raw_url: Optional[str]) -> Optional[str]:
@@ -243,8 +269,11 @@ def fetch_site_json(url: str) -> Optional[dict]:
     except urllib.error.HTTPError as exc:
         LOGGER.info("API 요청 실패: %s (HTTP %s)", url, exc.code)
     except urllib.error.URLError as exc:
-        LOGGER.info("API 요청 실패: %s (%s)", url, exc.reason)
-    except TimeoutError:
+        if isinstance(exc.reason, socket.timeout):
+            LOGGER.info("API 요청 실패: %s (timeout)", url)
+        else:
+            LOGGER.info("API 요청 실패: %s (%s)", url, exc.reason)
+    except socket.timeout:
         LOGGER.info("API 요청 실패: %s (timeout)", url)
     except json.JSONDecodeError:
         LOGGER.info("API 응답 파싱 실패: %s", url)
@@ -584,6 +613,41 @@ def build_container_block(rich_text: Optional[list[dict]] = None) -> dict:
     }
 
 
+def build_table_row_block(cells: list[list[dict]]) -> dict:
+    return {
+        "object": "block",
+        "type": "table_row",
+        "table_row": {"cells": cells},
+    }
+
+
+def build_table_block(
+    rows: list[list[list[dict]]],
+    has_column_header: bool,
+    has_row_header: bool,
+) -> Optional[dict]:
+    if not rows:
+        return None
+    table_width = max((len(row) for row in rows), default=0)
+    if table_width <= 0:
+        return None
+    normalized_rows: list[dict] = []
+    for row in rows:
+        if len(row) < table_width:
+            row = row + [[] for _ in range(table_width - len(row))]
+        normalized_rows.append(build_table_row_block(row))
+    return {
+        "object": "block",
+        "type": "table",
+        "table": {
+            "table_width": table_width,
+            "has_column_header": has_column_header,
+            "has_row_header": has_row_header,
+            "children": normalized_rows,
+        },
+    }
+
+
 class TiptapBlockParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -602,6 +666,18 @@ class TiptapBlockParser(HTMLParser):
         self.color_stack: list[str] = ["default"]
         self.color_push_stack: list[bool] = []
         self.blocks: list[dict] = []
+        self.in_table = False
+        self.table_depth = 0
+        self.in_table_row = False
+        self.in_table_cell = False
+        self.table_rows: list[list[list[dict]]] = []
+        self.table_cells: list[list[dict]] = []
+        self.table_cell_segments: list[dict] = []
+        self.table_cell_is_header = False
+        self.table_row_index = -1
+        self.table_cell_index = 0
+        self.table_has_column_header = False
+        self.table_has_row_header = False
         self.void_tags = {
             "area",
             "base",
@@ -638,6 +714,44 @@ class TiptapBlockParser(HTMLParser):
                 self.color_push_stack.append(True)
             else:
                 self.color_push_stack.append(False)
+        if tag == "table":
+            if not self.in_table:
+                self.flush_block()
+                self.in_table = True
+                self.table_depth = 1
+                self.table_rows = []
+                self.table_cells = []
+                self.table_cell_segments = []
+                self.table_cell_is_header = False
+                self.table_row_index = -1
+                self.table_cell_index = 0
+                self.table_has_column_header = False
+                self.table_has_row_header = False
+            else:
+                self.table_depth += 1
+            return
+        if self.in_table:
+            if tag == "tr":
+                self.in_table_row = True
+                self.table_row_index += 1
+                self.table_cell_index = 0
+                self.table_cells = []
+                return
+            if tag in {"td", "th"}:
+                self.in_table_cell = True
+                self.table_cell_segments = []
+                self.table_cell_is_header = tag == "th"
+                return
+            if tag == "p":
+                if self.in_table_cell and self.table_cell_segments:
+                    self.append_line_break()
+                return
+            if tag == "li":
+                if self.in_table_cell and self.table_cell_segments:
+                    self.append_line_break()
+                return
+            if tag == "img":
+                return
         if tag == "li":
             if not self.in_list_item:
                 self.flush_block()
@@ -676,11 +790,25 @@ class TiptapBlockParser(HTMLParser):
             pushed = self.color_push_stack.pop()
             if pushed and len(self.color_stack) > 1:
                 self.color_stack.pop()
+        if self.in_table:
+            if tag in {"td", "th"}:
+                self.flush_table_cell()
+            elif tag == "tr":
+                self.flush_table_row()
+            elif tag == "table":
+                self.table_depth = max(0, self.table_depth - 1)
+                if self.table_depth == 0:
+                    self.flush_table()
         if tag == "li" and self.in_list_item:
             self.flush_block()
             self.in_list_item = False
             self.current_block_type = None
-        elif tag == "p" and not self.in_list_item and self.current_block_type == "p":
+        elif (
+            tag == "p"
+            and not self.in_list_item
+            and self.current_block_type == "p"
+            and not self.in_table
+        ):
             if self.rich_text:
                 self.flush_block()
             else:
@@ -714,6 +842,18 @@ class TiptapBlockParser(HTMLParser):
             self.link_stack.clear()
             self.color_stack = ["default"]
             self.color_push_stack = []
+            self.in_table = False
+            self.table_depth = 0
+            self.in_table_row = False
+            self.in_table_cell = False
+            self.table_rows = []
+            self.table_cells = []
+            self.table_cell_segments = []
+            self.table_cell_is_header = False
+            self.table_row_index = -1
+            self.table_cell_index = 0
+            self.table_has_column_header = False
+            self.table_has_row_header = False
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         if not self.in_tiptap:
@@ -721,6 +861,8 @@ class TiptapBlockParser(HTMLParser):
         if tag == "br":
             self.append_line_break()
         elif tag == "img":
+            if self.in_table:
+                return
             attrs_dict = {key: value or "" for key, value in attrs}
             src = attrs_dict.get("src") or ""
             url = normalize_content_url(src)
@@ -734,6 +876,8 @@ class TiptapBlockParser(HTMLParser):
         self.append_text(data)
 
     def append_text(self, data: str) -> None:
+        if self.in_table and not self.in_table_cell:
+            return
         text = normalize_inline_text(data)
         if not text:
             return
@@ -751,31 +895,31 @@ class TiptapBlockParser(HTMLParser):
         for segment_text, segment_link in split_text_with_links(text):
             self.append_segment(segment_text, annotations, segment_link)
 
-    def append_segment(
-        self,
-        text: str,
-        annotations: dict,
-        link: Optional[str],
-    ) -> None:
+    def append_segment(self, text: str, annotations: dict, link: Optional[str]) -> None:
         if not text:
             return
+        segments = self.table_cell_segments if self.in_table_cell else self.rich_text
         if text.isspace() and "\u00a0" not in text:
-            if not self.rich_text:
+            if not segments:
                 return
-            if not self.rich_text[-1]["text"].endswith((" ", "\n")):
-                self.rich_text[-1]["text"] += " "
+            if not segments[-1]["text"].endswith((" ", "\n")):
+                segments[-1]["text"] += " "
             return
-        if self.rich_text:
-            last = self.rich_text[-1]
+        if segments:
+            last = segments[-1]
             if last.get("annotations") == annotations and last.get("link") == link:
                 last["text"] += text
                 return
-        self.rich_text.append(
-            {"text": text, "annotations": annotations, "link": link}
-        )
+        segments.append({"text": text, "annotations": annotations, "link": link})
 
     def append_line_break(self) -> None:
-        if self.current_block_type is None and not self.in_list_item:
+        if self.in_table and not self.in_table_cell:
+            return
+        if (
+            self.current_block_type is None
+            and not self.in_list_item
+            and not self.in_table
+        ):
             self.current_block_type = "p"
         annotations = dict(DEFAULT_ANNOTATIONS)
         annotations["bold"] = self.bold_depth > 0
@@ -785,14 +929,13 @@ class TiptapBlockParser(HTMLParser):
         annotations["code"] = self.code_depth > 0
         annotations["color"] = self.color_stack[-1] if self.color_stack else "default"
         link = self.link_stack[-1] if self.link_stack else None
-        if self.rich_text:
-            last = self.rich_text[-1]
+        segments = self.table_cell_segments if self.in_table_cell else self.rich_text
+        if segments:
+            last = segments[-1]
             if last.get("annotations") == annotations and last.get("link") == link:
                 last["text"] += "\n"
                 return
-        self.rich_text.append(
-            {"text": "\n", "annotations": annotations, "link": link}
-        )
+        segments.append({"text": "\n", "annotations": annotations, "link": link})
 
     def flush_block(self) -> None:
         if not self.rich_text:
@@ -805,6 +948,54 @@ class TiptapBlockParser(HTMLParser):
             block = build_paragraph_block_from_rich_text(rich_text)
         if block:
             self.blocks.append(block)
+
+    def flush_table_cell(self) -> None:
+        if not self.in_table_cell:
+            return
+        rich_text = build_rich_text_from_segments(self.table_cell_segments)
+        self.table_cells.append(rich_text)
+        if self.table_cell_is_header:
+            if self.table_row_index == 0:
+                self.table_has_column_header = True
+            if self.table_cell_index == 0:
+                self.table_has_row_header = True
+        self.table_cell_segments = []
+        self.table_cell_is_header = False
+        self.in_table_cell = False
+        self.table_cell_index += 1
+
+    def flush_table_row(self) -> None:
+        if not self.in_table_row:
+            return
+        if self.in_table_cell:
+            self.flush_table_cell()
+        if self.table_cells:
+            self.table_rows.append(self.table_cells)
+        self.table_cells = []
+        self.in_table_row = False
+
+    def flush_table(self) -> None:
+        if self.in_table_cell:
+            self.flush_table_cell()
+        if self.in_table_row:
+            self.flush_table_row()
+        table_block = build_table_block(
+            self.table_rows, self.table_has_column_header, self.table_has_row_header
+        )
+        if table_block:
+            self.blocks.append(table_block)
+        self.in_table = False
+        self.table_depth = 0
+        self.in_table_row = False
+        self.in_table_cell = False
+        self.table_rows = []
+        self.table_cells = []
+        self.table_cell_segments = []
+        self.table_cell_is_header = False
+        self.table_row_index = -1
+        self.table_cell_index = 0
+        self.table_has_column_header = False
+        self.table_has_row_header = False
 
 
 def extract_body_blocks_from_html(html_text: str) -> list[dict]:
@@ -828,6 +1019,74 @@ def extract_body_blocks_from_html(html_text: str) -> list[dict]:
 
 def chunks(items: list[dict], size: int) -> list[list[dict]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+class BodyContentDetector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_container = False
+        self.depth = 0
+        self.has_content = False
+        self.void_tags = {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
+        }
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        attrs_dict = {key: value or "" for key, value in attrs}
+        if not self.in_container and tag == "div":
+            classes = attrs_dict.get("class", "")
+            if "tiptap" in classes.split() or "custom-css-tag-a" in classes.split():
+                self.in_container = True
+                self.depth = 1
+                return
+        if not self.in_container:
+            return
+        if tag in {"img", "a"}:
+            self.has_content = True
+        if tag not in self.void_tags:
+            self.depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.in_container:
+            return
+        if tag not in self.void_tags:
+            self.depth -= 1
+        if self.depth <= 0:
+            self.in_container = False
+            self.depth = 0
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if not self.in_container:
+            return
+        if tag == "img":
+            self.has_content = True
+
+    def handle_data(self, data: str) -> None:
+        if not self.in_container:
+            return
+        text = unescape(data).replace("\u00a0", " ").strip()
+        if text:
+            self.has_content = True
+
+
+def detect_body_has_content(html_text: str) -> bool:
+    detector = BodyContentDetector()
+    detector.feed(html_text)
+    detector.close()
+    return detector.has_content
 
 
 def is_detail_url(url: str) -> bool:
@@ -864,26 +1123,75 @@ def parse_int(value: str) -> Optional[int]:
     return int(digits)
 
 
+class TableRowParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_tr = False
+        self.in_td = False
+        self.current_cells: list[str] = []
+        self.current_parts: list[str] = []
+        self.current_meta: list[str] = []
+        self.rows: list[dict] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        attrs_dict = {key: value or "" for key, value in attrs}
+        if tag == "tr":
+            self.in_tr = True
+            self.current_cells = []
+            self.current_meta = []
+            onclick = attrs_dict.get("onclick")
+            if onclick:
+                self.current_meta.append(onclick)
+            for key, value in attrs:
+                if key.startswith("data-") and value:
+                    self.current_meta.append(f"{key}={value}")
+        if not self.in_tr:
+            return
+        onclick = attrs_dict.get("onclick")
+        if onclick:
+            self.current_meta.append(onclick)
+        if tag == "td":
+            self.in_td = True
+            self.current_parts = []
+        if tag == "a":
+            href = attrs_dict.get("href") or ""
+            if href:
+                self.current_meta.append(href)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "td" and self.in_td:
+            text = "".join(self.current_parts)
+            text = unescape(text).replace("\u00a0", " ")
+            self.current_cells.append(text.strip())
+            self.in_td = False
+            self.current_parts = []
+        if tag == "tr" and self.in_tr:
+            if self.current_cells:
+                self.rows.append({"cells": self.current_cells, "meta": self.current_meta})
+            self.in_tr = False
+            self.current_cells = []
+            self.current_meta = []
+
+    def handle_data(self, data: str) -> None:
+        if self.in_tr and self.in_td:
+            self.current_parts.append(data)
+
+
 def parse_rows(html_text: str) -> list[dict]:
-    row_pattern = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL)
-    rows = row_pattern.findall(html_text)
-    items = []
+    parser = TableRowParser()
+    parser.feed(html_text)
+    parser.close()
+    items: list[dict] = []
 
-    for row_html in rows:
-        cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL)
-        if not cells:
+    for row in parser.rows:
+        cells = row.get("cells", [])
+        if len(cells) < 5:
             continue
-
-        cleaned = [clean_text(cell) for cell in cells]
-
-        if len(cleaned) < 5:
-            continue
-
-        num_or_top = cleaned[0]
-        title = cleaned[1]
-        author = cleaned[2]
-        date_text = cleaned[-2]
-        views_text = cleaned[-1]
+        num_or_top = cells[0]
+        title = cells[1]
+        author = cells[2]
+        date_text = cells[-2]
+        views_text = cells[-1]
 
         date_iso = parse_datetime(date_text)
         views = parse_int(views_text)
@@ -891,7 +1199,16 @@ def parse_rows(html_text: str) -> list[dict]:
             continue
 
         top = num_or_top.strip().upper() == "TOP"
-        detail_url = extract_detail_url_from_row_html(row_html)
+        detail_url = None
+        for meta in row.get("meta", []):
+            candidate = normalize_detail_url(meta)
+            if candidate and is_detail_url(candidate):
+                detail_url = candidate
+                break
+            detail_id = extract_detail_id_from_text(meta)
+            if detail_id:
+                detail_url = normalize_detail_url(build_detail_url(detail_id))
+                break
 
         items.append(
             {
@@ -1247,24 +1564,27 @@ def extract_detail_id_from_row(row) -> Optional[str]:
 
 
 def extract_written_at_from_page(page) -> Optional[str]:
-    label = page.locator("text=작성일").or_(page.locator("text=등록일"))
-    for idx in range(label.count()):
-        label_node = label.nth(idx)
-        try:
-            container_text = label_node.locator("xpath=..").inner_text()
-        except Exception:
-            container_text = ""
-        match = DATE_TIME_PATTERN.search(container_text)
-        if match:
-            return parse_datetime(match.group(0))
-        try:
-            sibling_texts = label_node.locator("xpath=following-sibling::*").all_inner_texts()
-        except Exception:
-            sibling_texts = []
-        for text in sibling_texts:
-            match = DATE_TIME_PATTERN.search(text)
+    for label_text in ("작성일", "등록일"):
+        locator = page.locator(f"text={label_text}")
+        for idx in range(locator.count()):
+            label_node = locator.nth(idx)
+            try:
+                container_text = label_node.locator("xpath=..").inner_text()
+            except Exception:
+                container_text = ""
+            match = DATE_TIME_PATTERN.search(container_text)
             if match:
                 return parse_datetime(match.group(0))
+            try:
+                sibling_texts = label_node.locator(
+                    "xpath=following-sibling::*"
+                ).all_inner_texts()
+            except Exception:
+                sibling_texts = []
+            for text in sibling_texts:
+                match = DATE_TIME_PATTERN.search(text)
+                if match:
+                    return parse_datetime(match.group(0))
     body_text = page.locator("body").inner_text()
     match = re.search(
         rf"(작성일|등록일).*?({DATE_TIME_PATTERN.pattern})",
@@ -1337,8 +1657,10 @@ def fetch_detail_for_row(
             LOGGER.info("상세 URL 경로 아님: %s", detail_url)
             detail_url = None
     if detail_url:
-        written_at, attachments, body_blocks = fetch_detail_metadata_from_url(detail_url)
-        if not written_at or not attachments or not body_blocks:
+        written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
+            detail_url
+        )
+        if should_retry_detail_fetch(written_at, attachments, body_blocks, signals):
             pw_written_at, pw_attachments, pw_body_blocks = fetch_detail_metadata_via_playwright(
                 page, list_url, detail_url
             )
@@ -1359,8 +1681,10 @@ def fetch_detail_for_row(
     detail_id = extract_detail_id_from_row(row)
     if detail_id:
         detail_url = normalize_detail_url(build_detail_url(detail_id))
-        written_at, attachments, body_blocks = fetch_detail_metadata_from_url(detail_url)
-        if not written_at or not attachments or not body_blocks:
+        written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
+            detail_url
+        )
+        if should_retry_detail_fetch(written_at, attachments, body_blocks, signals):
             pw_written_at, pw_attachments, pw_body_blocks = fetch_detail_metadata_via_playwright(
                 page, list_url, detail_url
             )
@@ -1381,7 +1705,9 @@ def fetch_detail_for_row(
         return None, None, [], []
 
     normalized_detail_url = normalize_detail_url(detail_url) or detail_url
-    written_at, attachments, body_blocks = fetch_detail_metadata_from_url(normalized_detail_url)
+    written_at, attachments, body_blocks, _signals = fetch_detail_metadata_from_url(
+        normalized_detail_url
+    )
     if not wait_for_written_at(page):
         LOGGER.info("작성일 로드 대기 실패: %s", detail_url)
     if not written_at:
@@ -1609,7 +1935,7 @@ def crawl_top_items_http() -> list[dict]:
         new_top = 0
         for item in top_items:
             if item.get("url"):
-                written_at, attachments, body_blocks = fetch_detail_metadata_from_url(
+                written_at, attachments, body_blocks, _signals = fetch_detail_metadata_from_url(
                     item["url"]
                 )
                 if written_at:
@@ -1674,8 +2000,12 @@ def notion_request(
                 time.sleep(sleep_s)
                 backoff = min(backoff * 2, 8.0)
                 continue
-            raise RuntimeError(f"Notion API error: HTTP {exc.code}: {body}") from exc
-        except TimeoutError as exc:
+            raise NotionRequestError(
+                f"Notion API error: HTTP {exc.code}: {body}",
+                status_code=exc.code,
+                reason=body,
+            ) from exc
+        except (socket.timeout, TimeoutError) as exc:
             if attempt < max_retries:
                 LOGGER.info(
                     "Notion API 재시도(%s/%s): timeout",
@@ -1685,19 +2015,31 @@ def notion_request(
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 8.0)
                 continue
-            raise RuntimeError("Notion API error: timeout") from exc
+            raise NotionRequestError(
+                "Notion API error: timeout",
+                reason="timeout",
+            ) from exc
         except urllib.error.URLError as exc:
+            is_timeout = isinstance(exc.reason, socket.timeout)
             if attempt < max_retries:
                 LOGGER.info(
                     "Notion API 재시도(%s/%s): %s",
                     attempt + 1,
                     max_retries,
-                    exc.reason,
+                    "timeout" if is_timeout else exc.reason,
                 )
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 8.0)
                 continue
-            raise RuntimeError(f"Notion API error: {exc.reason}") from exc
+            if is_timeout:
+                raise NotionRequestError(
+                    "Notion API error: timeout",
+                    reason="timeout",
+                ) from exc
+            raise NotionRequestError(
+                f"Notion API error: {exc.reason}",
+                reason=str(exc.reason),
+            ) from exc
 
 
 def fetch_html(url: str) -> Optional[str]:
@@ -1708,20 +2050,63 @@ def fetch_html(url: str) -> Optional[str]:
     except urllib.error.HTTPError as exc:
         LOGGER.info("상세 HTML 요청 실패: %s (HTTP %s)", url, exc.code)
     except urllib.error.URLError as exc:
-        LOGGER.info("상세 HTML 요청 실패: %s (%s)", url, exc.reason)
+        if isinstance(exc.reason, socket.timeout):
+            LOGGER.info("상세 HTML 요청 실패: %s (timeout)", url)
+        else:
+            LOGGER.info("상세 HTML 요청 실패: %s (%s)", url, exc.reason)
+    except socket.timeout:
+        LOGGER.info("상세 HTML 요청 실패: %s (timeout)", url)
     return None
 
 
-def fetch_detail_metadata_from_url(detail_url: str) -> tuple[Optional[str], list[dict], list[dict]]:
+def build_detail_signals(html_text: str) -> dict:
+    return {
+        "has_html": True,
+        "has_attachment_label": "첨부파일" in html_text,
+        "has_attachment_link": bool(ATTACHMENT_LINK_PATTERN.search(html_text)),
+        "has_body_container": bool(BODY_CONTAINER_PATTERN.search(html_text)),
+        "body_has_content": detect_body_has_content(html_text),
+    }
+
+
+def should_retry_detail_fetch(
+    written_at: Optional[str],
+    attachments: list[dict],
+    body_blocks: list[dict],
+    signals: dict,
+) -> bool:
+    if not written_at:
+        return True
+    if (signals.get("has_attachment_label") or signals.get("has_attachment_link")) and not attachments:
+        return True
+    if (
+        signals.get("has_body_container")
+        and signals.get("body_has_content")
+        and not body_blocks
+    ):
+        return True
+    return False
+
+
+def fetch_detail_metadata_from_url(
+    detail_url: str,
+) -> tuple[Optional[str], list[dict], list[dict], dict]:
     html_text = fetch_html(detail_url)
     if not html_text:
-        return None, [], []
-    if "첨부파일" in html_text:
+        return None, [], [], {
+            "has_html": False,
+            "has_attachment_label": False,
+            "has_attachment_link": False,
+            "has_body_container": False,
+            "body_has_content": False,
+        }
+    signals = build_detail_signals(html_text)
+    if signals.get("has_attachment_label"):
         LOGGER.info("첨부파일 HTML 감지: %s", detail_url)
     written_at = extract_written_at_from_detail(html_text)
     attachments = extract_attachments_from_detail(html_text)
     body_blocks = extract_body_blocks_from_html(html_text)
-    return written_at, attachments, body_blocks
+    return written_at, attachments, body_blocks, signals
 
 
 def fetch_database(token: str, database_id: str) -> dict:
@@ -1766,6 +2151,18 @@ def ensure_attachment_property(token: str, database_id: str, database: dict) -> 
         return database
     LOGGER.info("Notion 속성 추가: %s", ATTACHMENT_PROPERTY)
     return update_database(token, database_id, {ATTACHMENT_PROPERTY: {"files": {}}})
+
+
+def ensure_body_hash_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(BODY_HASH_PROPERTY)
+    if prop:
+        if prop.get("type") != "rich_text":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {BODY_HASH_PROPERTY} (rich_text 아님)"
+            )
+        return database
+    LOGGER.info("Notion 속성 추가: %s", BODY_HASH_PROPERTY)
+    return update_database(token, database_id, {BODY_HASH_PROPERTY: {"rich_text": {}}})
 
 
 def require_property_type(database: dict, property_name: str, expected_type: str) -> None:
@@ -1825,16 +2222,18 @@ def log_environment_info() -> None:
     browser = os.environ.get("BROWSER", "chromium")
     headless_raw = os.environ.get("HEADLESS", "1").strip().lower()
     headless = headless_raw not in {"0", "false", "no", "off"}
+    sync_mode = get_sync_mode()
     LOGGER.info(
         "환경: Python=%s, Playwright=%s",
         python_version,
         "설치됨" if playwright_installed else "미설치",
     )
     LOGGER.info(
-        "환경: BROWSER=%s, HEADLESS=%s, bbsConfigFk=%s",
+        "환경: BROWSER=%s, HEADLESS=%s, bbsConfigFk=%s, SYNC_MODE=%s",
         browser,
         "1" if headless else "0",
         get_bbs_config_fk(),
+        sync_mode,
     )
 
 
@@ -1886,6 +2285,28 @@ def ensure_select_option(
     return get_select_options(data, property_name)
 
 
+def ensure_select_options_batch(
+    token: str,
+    database_id: str,
+    property_name: str,
+    options_cache: list[dict],
+    desired_names: set[str],
+) -> list[dict]:
+    sanitized_options = sanitize_select_options(options_cache)
+    existing = {opt.get("name") for opt in sanitized_options}
+    missing = sorted(name for name in desired_names if name and name not in existing)
+    if not missing:
+        return options_cache
+    updated_options = sanitized_options + [{"name": name} for name in missing]
+    LOGGER.info("Notion 옵션 일괄 추가: %s=%s", property_name, ", ".join(missing))
+    data = update_database(
+        token,
+        database_id,
+        {property_name: {"select": {"options": updated_options}}},
+    )
+    return get_select_options(data, property_name)
+
+
 def query_database(token: str, database_id: str, filter_payload: dict) -> list[dict]:
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
     payload = {"filter": filter_payload}
@@ -1918,7 +2339,22 @@ def list_block_children(token: str, block_id: str) -> list[dict]:
 
 def delete_block(token: str, block_id: str) -> None:
     url = f"https://api.notion.com/v1/blocks/{block_id}"
-    notion_request("DELETE", url, token)
+    fallback_statuses = {403, 405, 409, 429, 500, 502, 503, 504}
+    try:
+        notion_request("DELETE", url, token)
+    except NotionRequestError as exc:
+        if exc.status_code == 404:
+            LOGGER.info("블록 이미 삭제됨: %s", block_id)
+            return
+        if exc.status_code in fallback_statuses:
+            LOGGER.info(
+                "블록 DELETE 실패 -> archived 폴백: %s (HTTP %s)",
+                block_id,
+                exc.status_code,
+            )
+            notion_request("PATCH", url, token, {"archived": True})
+            return
+        raise
 
 
 def is_empty_paragraph_block(block: dict) -> bool:
@@ -1946,7 +2382,62 @@ def is_image_only_blocks(blocks: list[dict]) -> bool:
     return has_image
 
 
-def sync_page_body_blocks(token: str, page_id: str, blocks: list[dict]) -> None:
+def rich_text_plain_text(rich_text: list[dict]) -> str:
+    return "".join(item.get("text", {}).get("content", "") for item in rich_text)
+
+
+def has_sync_marker(rich_text: list[dict]) -> bool:
+    if not rich_text:
+        return False
+    plain = rich_text_plain_text(rich_text)
+    if not plain:
+        return False
+    first_line = plain.splitlines()[0].strip()
+    return first_line == SYNC_CONTAINER_MARKER
+
+
+def ensure_sync_marker_in_rich_text(rich_text: list[dict]) -> list[dict]:
+    if has_sync_marker(rich_text):
+        return rich_text
+    marker_segment = {
+        "type": "text",
+        "text": {"content": f"{SYNC_CONTAINER_MARKER}\n"},
+        "annotations": dict(DEFAULT_ANNOTATIONS),
+    }
+    if rich_text:
+        return [marker_segment] + rich_text
+    return [marker_segment]
+
+
+def get_sync_mode() -> str:
+    raw = os.environ.get("SYNC_MODE", "overwrite").strip().lower()
+    if raw in {"overwrite", "preserve"}:
+        return raw
+    return "overwrite"
+
+
+def find_sync_container_id(token: str, page_id: str) -> Optional[str]:
+    for block in list_block_children(token, page_id):
+        if block.get("type") != "quote":
+            continue
+        rich_text = block.get("quote", {}).get("rich_text", [])
+        if has_sync_marker(rich_text):
+            return block.get("id")
+    return None
+
+
+def update_quote_block(token: str, block_id: str, rich_text: list[dict]) -> None:
+    url = f"https://api.notion.com/v1/blocks/{block_id}"
+    payload = {"quote": {"rich_text": rich_text, "color": "default"}}
+    notion_request("PATCH", url, token, payload)
+
+
+def sync_page_body_blocks(
+    token: str,
+    page_id: str,
+    blocks: list[dict],
+    sync_mode: str = "overwrite",
+) -> None:
     if not blocks:
         return
     idx = 0
@@ -1963,6 +2454,33 @@ def sync_page_body_blocks(token: str, page_id: str, blocks: list[dict]) -> None:
         ]
         if not container_rich_text:
             container_rich_text = build_space_rich_text()
+    if (sync_mode or "overwrite").strip().lower() == "preserve":
+        container_rich_text = ensure_sync_marker_in_rich_text(container_rich_text)
+    sync_mode = (sync_mode or "overwrite").strip().lower()
+    container_payload = build_container_block(container_rich_text)
+
+    if sync_mode == "preserve":
+        container_id = find_sync_container_id(token, page_id)
+        if container_id:
+            update_quote_block(token, container_id, container_payload["quote"]["rich_text"])
+        else:
+            response = append_block_children(token, page_id, [container_payload])
+            results = response.get("results", []) if isinstance(response, dict) else []
+            container_id = results[0].get("id") if results else None
+        if not container_id:
+            LOGGER.info("컨테이너 생성 실패: %s", page_id)
+            return
+        for block in list_block_children(token, container_id):
+            block_id = block.get("id")
+            if block_id:
+                try:
+                    delete_block(token, block_id)
+                except RuntimeError as exc:
+                    LOGGER.info("블록 삭제 실패: %s (%s)", block_id, exc)
+        for chunk in chunks(remaining_blocks, 80):
+            append_block_children(token, container_id, chunk)
+        return
+
     children = list_block_children(token, page_id)
     for block in children:
         block_id = block.get("id")
@@ -1971,7 +2489,6 @@ def sync_page_body_blocks(token: str, page_id: str, blocks: list[dict]) -> None:
                 delete_block(token, block_id)
             except RuntimeError as exc:
                 LOGGER.info("블록 삭제 실패: %s (%s)", block_id, exc)
-    container_payload = build_container_block(container_rich_text)
     response = append_block_children(token, page_id, [container_payload])
     container_id = None
     results = response.get("results", []) if isinstance(response, dict) else []
@@ -1993,7 +2510,7 @@ def build_properties(
     if item.get("url"):
         title_text["link"] = {"url": item["url"]}
     props = {
-        TITLE_PROPERTY: {"title": [{"text": title_text}]},
+        TITLE_PROPERTY: {"title": [{"type": "text", "text": title_text}]},
         TOP_PROPERTY: {"checkbox": item["top"]},
     }
 
@@ -2038,13 +2555,19 @@ def extract_url(properties: dict) -> Optional[str]:
     return normalize_detail_url(url_value)
 
 
+def extract_rich_text_value(properties: dict, property_name: str) -> str:
+    prop = properties.get(property_name, {})
+    rich_text = prop.get("rich_text", [])
+    return "".join(part.get("plain_text", "") for part in rich_text).strip()
+
+
 def find_existing_page(
     token: str,
     database_id: str,
     detail_url: Optional[str],
     title: str,
     date_iso: Optional[str],
-) -> Optional[str]:
+) -> Optional[dict]:
     if detail_url:
         results = query_database(
             token,
@@ -2052,7 +2575,7 @@ def find_existing_page(
             {"property": URL_PROPERTY, "url": {"equals": detail_url}},
         )
         if len(results) == 1:
-            return results[0]["id"]
+            return results[0]
         if len(results) > 1:
             LOGGER.info("URL 중복 감지: %s", detail_url)
             return None
@@ -2069,7 +2592,7 @@ def find_existing_page(
             },
         )
         if len(results) == 1:
-            return results[0]["id"]
+            return results[0]
         if len(results) > 1:
             LOGGER.info("제목+작성일 중복 감지: %s (%s)", title, date_iso)
             return None
@@ -2081,7 +2604,7 @@ def find_existing_page(
             {"property": TITLE_PROPERTY, "title": {"equals": title}},
         )
         if len(results) == 1:
-            return results[0]["id"]
+            return results[0]
     return None
 
 
@@ -2179,17 +2702,37 @@ def main() -> None:
     if not items:
         raise RuntimeError("No items parsed from source")
 
+    author_values: set[str] = set()
+    type_values: set[str] = set()
+    for item in items:
+        item["type"] = extract_type_from_title(item["title"])
+        if item.get("author"):
+            author_values.add(item["author"])
+        if item.get("type"):
+            type_values.add(item["type"])
+
     database = fetch_database(notion_token, database_id)
     database = ensure_url_property(notion_token, database_id, database)
     database = ensure_type_property(notion_token, database_id, database)
     database = ensure_attachment_property(notion_token, database_id, database)
+    database = ensure_body_hash_property(notion_token, database_id, database)
     validate_required_properties(database)
     author_options = get_select_options(database, AUTHOR_PROPERTY)
     type_options = get_select_options(database, TYPE_PROPERTY)
+    author_options = ensure_select_options_batch(
+        notion_token, database_id, AUTHOR_PROPERTY, author_options, author_values
+    )
+    type_options = ensure_select_options_batch(
+        notion_token, database_id, TYPE_PROPERTY, type_options, type_values
+    )
     has_views_property = validate_optional_property_type(database, VIEWS_PROPERTY, "number")
     has_attachments_property = validate_optional_property_type(
         database, ATTACHMENT_PROPERTY, "files"
     )
+    has_body_hash_property = validate_optional_property_type(
+        database, BODY_HASH_PROPERTY, "rich_text"
+    )
+    sync_mode = get_sync_mode()
 
     created = 0
     updated = 0
@@ -2202,34 +2745,24 @@ def main() -> None:
             if normalized_url:
                 item["url"] = normalized_url
                 current_top_urls.add(normalized_url)
-        item["type"] = extract_type_from_title(item["title"])
         label = f"{item['title']} ({item.get('date') or '날짜없음'})"
         date_key = normalize_date_key(item.get("date"))
         current_top_dates.setdefault(item["title"], set()).add(date_key)
         LOGGER.info("처리 시작: %s", label)
-        if item.get("author"):
-            author_options = ensure_select_option(
-                notion_token,
-                database_id,
-                AUTHOR_PROPERTY,
-                item["author"],
-                author_options,
-            )
-        type_options = ensure_select_option(
-            notion_token,
-            database_id,
-            TYPE_PROPERTY,
-            item["type"],
-            type_options,
-        )
         properties = build_properties(item, has_views_property, has_attachments_property)
-        page_id = find_existing_page(
+        existing_page = find_existing_page(
             notion_token,
             database_id,
             item.get("url"),
             item["title"],
             item.get("date"),
         )
+        page_id = existing_page.get("id") if existing_page else None
+        existing_hash = ""
+        if has_body_hash_property and existing_page:
+            existing_hash = extract_rich_text_value(
+                existing_page.get("properties", {}), BODY_HASH_PROPERTY
+            )
         if page_id:
             update_page(notion_token, page_id, properties)
             updated += 1
@@ -2240,7 +2773,29 @@ def main() -> None:
             LOGGER.info("생성 완료: %s", label)
         body_blocks = item.get("body_blocks", [])
         if page_id and body_blocks:
-            sync_page_body_blocks(notion_token, page_id, body_blocks)
+            if has_body_hash_property:
+                body_hash = compute_body_hash(body_blocks)
+                if body_hash != existing_hash:
+                    sync_page_body_blocks(
+                        notion_token, page_id, body_blocks, sync_mode=sync_mode
+                    )
+                    update_page(
+                        notion_token,
+                        page_id,
+                        {
+                            BODY_HASH_PROPERTY: {
+                                "rich_text": [
+                                    {"type": "text", "text": {"content": body_hash}}
+                                ]
+                            }
+                        },
+                    )
+                else:
+                    LOGGER.info("본문 변경 없음: %s", label)
+            else:
+                sync_page_body_blocks(
+                    notion_token, page_id, body_blocks, sync_mode=sync_mode
+                )
 
     LOGGER.info("기존 TOP 정리 시작")
     disabled = disable_missing_top(notion_token, database_id, current_top_urls, current_top_dates)
