@@ -73,6 +73,19 @@ ATTACHMENT_LINK_PATTERN = re.compile(
     r"(file-fe-prd/board|filedown|filedownload|bbsfile|download)",
     re.IGNORECASE,
 )
+ATTACHMENT_QUERY_KEYS = {
+    "sg",
+    "fileid",
+    "file_id",
+    "fileno",
+    "file_no",
+    "fileseq",
+    "file_seq",
+    "attachid",
+    "attach_id",
+    "attachno",
+    "attach_no",
+}
 BODY_CONTAINER_PATTERN = re.compile(r"\b(tiptap|custom-css-tag-a)\b", re.IGNORECASE)
 TYPE_TAGS = (
     "교내/국가",
@@ -225,15 +238,45 @@ def normalize_file_url(raw_url: Optional[str]) -> Optional[str]:
         raw_url = "https:" + raw_url
     absolute = urljoin(BASE_SITE, raw_url)
     parsed = urlparse(absolute)
+    if parsed.scheme and parsed.scheme not in {"http", "https"}:
+        return None
     if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
         return None
     return urlunparse(parsed._replace(fragment=""))
 
 
+# Attachment policy:
+# - ATTACHMENT_ALLOWED_DOMAINS: comma-separated allowed hosts (default: sogang.ac.kr)
+# - ATTACHMENT_STRICT_ALLOW_EXTERNAL: 0 blocks external hosts in strict mode
+#   (1 allows external hosts only when strong_match holds in strict mode)
+# - ATTACHMENT_MAX_COUNT: per-page cap for attachments (default: 15)
+# - ATTACHMENT_SELFTEST: run attachment policy selftest and exit (1/true/on)
 def get_attachment_allowed_domains() -> tuple[str, ...]:
     raw = os.environ.get("ATTACHMENT_ALLOWED_DOMAINS", "sogang.ac.kr")
     domains = [part.strip().lower() for part in raw.split(",") if part.strip()]
     return tuple(domains)
+
+
+def get_attachment_strict_allow_external() -> bool:
+    raw = os.environ.get("ATTACHMENT_STRICT_ALLOW_EXTERNAL", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def get_attachment_max_count() -> int:
+    raw = os.environ.get("ATTACHMENT_MAX_COUNT", "15").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 15
+    return max(1, value)
+
+
+def has_attachment_query_key(url: str) -> bool:
+    params = parse_qs(urlparse(url).query)
+    for key in params.keys():
+        if key.lower() in ATTACHMENT_QUERY_KEYS:
+            return True
+    return False
 
 
 def is_allowed_attachment_host(host: str, allowed_domains: tuple[str, ...]) -> bool:
@@ -250,7 +293,7 @@ def is_attachment_candidate(
     url: str,
     text: str,
     allow_domain_only: bool = False,
-) -> bool:
+) -> tuple[bool, bool]:
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower()
     allowed_domains = get_attachment_allowed_domains()
@@ -262,10 +305,73 @@ def is_attachment_candidate(
     link_match = bool(ATTACHMENT_LINK_PATTERN.search(url))
     path_match = "/file-fe-prd/board/" in parsed.path
     strong_match = ext_match or hint_match or link_match or path_match
+    text_hint = "첨부" in text or "다운로드" in text
+    query_hint = has_attachment_query_key(url)
+    minimal_signal = strong_match or text_hint or query_hint
     allowed_host = is_allowed_attachment_host(host, allowed_domains)
-    if allow_domain_only and allowed_host:
-        return True
-    return strong_match
+
+    if allow_domain_only:
+        if not allowed_host and not get_attachment_strict_allow_external():
+            return False, False
+        if allowed_host and minimal_signal:
+            return True, not strong_match
+        if strong_match:
+            return True, False
+        return False, False
+
+    if strong_match:
+        return True, False
+    return False, False
+
+
+def run_attachment_policy_selftest() -> None:
+    LOGGER.info("첨부파일 정책 셀프테스트 시작")
+    keys = ("ATTACHMENT_STRICT_ALLOW_EXTERNAL", "ATTACHMENT_ALLOWED_DOMAINS")
+    original_env = {key: os.environ.get(key) for key in keys}
+    os.environ["ATTACHMENT_STRICT_ALLOW_EXTERNAL"] = "0"
+    os.environ["ATTACHMENT_ALLOWED_DOMAINS"] = "sogang.ac.kr"
+    try:
+        html = (
+            '<div>첨부파일</div>'
+            '<a href="https://example.com/file.pdf">file.pdf</a>'
+        )
+        html_attachments = extract_attachments_from_detail(html)
+        page_candidates = [("https://example.com/file.pdf", "file.pdf")]
+        page_attachments = []
+        for href, text in page_candidates:
+            url = normalize_file_url(href)
+            if not url:
+                continue
+            allowed, _ = is_attachment_candidate(
+                url, text, allow_domain_only=True
+            )
+            if allowed:
+                page_attachments.append(url)
+        strict_allowed, _ = is_attachment_candidate(
+            "https://example.com/file.pdf",
+            "file.pdf",
+            allow_domain_only=True,
+        )
+        if html_attachments or strict_allowed or page_attachments:
+            LOGGER.info(
+                "첨부파일 정책 셀프테스트 실패: html=%s, strict_allowed=%s, page=%s",
+                len(html_attachments),
+                int(strict_allowed),
+                len(page_attachments),
+            )
+            raise RuntimeError("첨부파일 정책 셀프테스트 실패")
+        LOGGER.info("첨부파일 정책 셀프테스트 통과")
+    finally:
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def should_run_attachment_selftest() -> bool:
+    raw = os.environ.get("ATTACHMENT_SELFTEST", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def log_attachments(label: str, attachments: list[dict]) -> None:
@@ -276,6 +382,21 @@ def log_attachments(label: str, attachments: list[dict]) -> None:
         url = attachment.get("external", {}).get("url") or ""
         name = attachment.get("name") or ""
         LOGGER.info("첨부파일 링크: %s (%s)", url, name)
+
+
+def cap_attachments(attachments: list[dict], label: str) -> list[dict]:
+    max_count = get_attachment_max_count()
+    if max_count <= 0:
+        return attachments
+    if len(attachments) > max_count:
+        LOGGER.info(
+            "첨부파일 상한 적용: %s (원본 %s개 -> %s개)",
+            label,
+            len(attachments),
+            max_count,
+        )
+        return attachments[:max_count]
+    return attachments
 
 
 def build_site_headers() -> dict:
@@ -1264,14 +1385,20 @@ def extract_written_at_from_detail(html_text: str) -> Optional[str]:
 def extract_attachments_from_detail(html_text: str) -> list[dict]:
     attachments: list[dict] = []
     seen_urls: set[str] = set()
+    allowlist_only_urls: list[str] = []
 
     def add_attachment(href: str, text: str, allow_domain_only: bool) -> None:
         url = normalize_file_url(href)
         if not url or url in seen_urls:
             return
-        if not is_attachment_candidate(url, text, allow_domain_only=allow_domain_only):
+        allowed, allowlist_only = is_attachment_candidate(
+            url, text, allow_domain_only=allow_domain_only
+        )
+        if not allowed:
             return
         seen_urls.add(url)
+        if allowlist_only:
+            allowlist_only_urls.append(url)
         if text:
             name = text
         else:
@@ -1307,13 +1434,21 @@ def extract_attachments_from_detail(html_text: str) -> list[dict]:
             add_attachment(href, text, allow_domain_only=strict)
 
     label_matches = list(re.finditer(r"첨부파일", html_text))
-    if label_matches:
+    has_label = bool(label_matches)
+    if has_label:
         for match in label_matches:
             start = max(0, match.start() - 800)
             end = min(len(html_text), match.end() + 6000)
             extract_from_chunk(html_text[start:end], strict=True)
     if not attachments:
-        extract_from_chunk(html_text, strict=False)
+        extract_from_chunk(html_text, strict=has_label)
+    if allowlist_only_urls:
+        sample = ", ".join(allowlist_only_urls[:3])
+        LOGGER.info(
+            "allow_domain_only 첨부: %s개 (샘플=%s)",
+            len(allowlist_only_urls),
+            sample or "없음",
+        )
 
     return attachments
 
@@ -1326,10 +1461,22 @@ def extract_attachments_from_page(page) -> list[dict]:
             const seen = new Set();
             let labelCount = 0;
             let labelLinkCount = 0;
+            let labelCandidateCount = 0;
+            const labelCandidateSamples = [];
+            const extPattern = /\\.(pdf|hwp|hwpx|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|jpg|jpeg|png|gif|bmp)(?:$|\\?)/i;
+            const hintPattern = /(file-fe-prd\\/board|filedown|filedownload|bbsfile|download|attach)/i;
+            const queryKeyPattern = /(sg=|fileid=|file_id=|fileno=|file_no=|fileseq=|file_seq=|attachid=|attach_id=|attachno=|attach_no=)/i;
+            const textHintPattern = /(첨부|다운로드)/;
+            const isCandidate = (href, text) => (
+                extPattern.test(href) ||
+                hintPattern.test(href) ||
+                queryKeyPattern.test(href) ||
+                textHintPattern.test(text || "")
+            );
             const labels = Array.from(document.querySelectorAll("body *"))
                 .filter(el => el.textContent && el.textContent.includes("첨부파일"));
             labelCount = labels.length;
-            const collectLinks = (root) => {
+            const collectLinks = (root, trackCandidates) => {
                 const links = root.querySelectorAll("a[href]");
                 links.forEach(a => {
                     const href = a.getAttribute("href") || "";
@@ -1339,13 +1486,19 @@ def extract_attachments_from_page(page) -> list[dict]:
                     if (seen.has(key)) return;
                     seen.add(key);
                     results.push({href, text});
+                    if (trackCandidates && isCandidate(href, text)) {
+                        labelCandidateCount += 1;
+                        if (labelCandidateSamples.length < 3) {
+                            labelCandidateSamples.push(href);
+                        }
+                    }
                 });
                 return links.length;
             };
             for (const label of labels) {
                 let node = label;
                 for (let i = 0; i < 6 && node; i += 1) {
-                    const count = collectLinks(node);
+                    const count = collectLinks(node, true);
                     if (count) {
                         labelLinkCount += count;
                         break;
@@ -1365,25 +1518,40 @@ def extract_attachments_from_page(page) -> list[dict]:
                     results.push({href, text});
                 });
             }
-            return {links: results, labelCount, labelLinkCount};
+            return {
+                links: results,
+                labelCount,
+                labelLinkCount,
+                labelCandidateCount,
+                labelCandidateSamples,
+            };
         }
         """
     )
     candidates = result.get("links", []) if isinstance(result, dict) else []
     label_count = result.get("labelCount", 0) if isinstance(result, dict) else 0
     label_link_count = result.get("labelLinkCount", 0) if isinstance(result, dict) else 0
-    allow_domain_only = label_link_count > 0
+    label_candidate_count = (
+        result.get("labelCandidateCount", 0) if isinstance(result, dict) else 0
+    )
+    allow_domain_only = label_candidate_count > 0
     attachments: list[dict] = []
     seen_urls: set[str] = set()
+    allowlist_only_urls: list[str] = []
     for candidate in candidates:
         href = candidate.get("href", "")
         text = candidate.get("text", "")
         url = normalize_file_url(href)
         if not url or url in seen_urls:
             continue
-        if not is_attachment_candidate(url, text, allow_domain_only=allow_domain_only):
+        allowed, allowlist_only = is_attachment_candidate(
+            url, text, allow_domain_only=allow_domain_only
+        )
+        if not allowed:
             continue
         seen_urls.add(url)
+        if allowlist_only:
+            allowlist_only_urls.append(url)
         name = text
         if not name:
             params = parse_qs(urlparse(url).query)
@@ -1391,6 +1559,13 @@ def extract_attachments_from_page(page) -> list[dict]:
         if not name:
             name = Path(urlparse(url).path).name or "첨부파일"
         attachments.append({"name": name, "type": "external", "external": {"url": url}})
+    if allowlist_only_urls:
+        sample = ", ".join(allowlist_only_urls[:3])
+        LOGGER.info(
+            "allow_domain_only 첨부: %s개 (샘플=%s)",
+            len(allowlist_only_urls),
+            sample or "없음",
+        )
     if not attachments:
         if not candidates:
             LOGGER.info("첨부파일 후보 링크 없음 (라벨=%s)", label_count)
@@ -1813,6 +1988,7 @@ def crawl_top_items_api() -> list[dict]:
             top = str(entry.get("isTop", "")).upper() == "Y"
 
             attachments = extract_attachments_from_api_data(detail or entry)
+            attachments = cap_attachments(attachments, title)
             content_html = detail.get("content") or ""
             body_blocks = extract_body_blocks_from_html(content_html) if content_html else []
 
@@ -1913,6 +2089,7 @@ def crawl_top_items() -> list[dict]:
                 if detail_url:
                     item["url"] = normalize_detail_url(detail_url)
                 if attachments:
+                    attachments = cap_attachments(attachments, item["title"])
                     item["attachments"] = attachments
                     log_attachments(item["title"], attachments)
                 if body_blocks:
@@ -1965,6 +2142,7 @@ def crawl_top_items_http() -> list[dict]:
                 if written_at:
                     item["date"] = written_at
                 if attachments:
+                    attachments = cap_attachments(attachments, item["title"])
                     item["attachments"] = attachments
                     log_attachments(item["title"], attachments)
                 if body_blocks:
@@ -2730,6 +2908,9 @@ def main() -> None:
     setup_logging()
     load_dotenv()
     log_environment_info()
+    if should_run_attachment_selftest():
+        run_attachment_policy_selftest()
+        return
 
     notion_token = os.environ.get("NOTION_TOKEN")
     database_id = os.environ.get("NOTION_DB_ID")
