@@ -360,6 +360,34 @@ def run_attachment_policy_selftest() -> None:
                 len(page_attachments),
             )
             raise RuntimeError("첨부파일 정책 셀프테스트 실패")
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            LOGGER.info("Playwright 미설치: 셀프테스트(Playwright) 스킵")
+        else:
+            pw_attachments: list[dict] = []
+            with sync_playwright() as playwright:
+                try:
+                    browser = playwright.chromium.launch(headless=True)
+                except Exception as exc:
+                    LOGGER.info(
+                        "Playwright 브라우저 실행 실패: %s (셀프테스트 스킵)",
+                        exc,
+                    )
+                    browser = None
+                if browser:
+                    try:
+                        page = browser.new_page()
+                        page.set_content(html, wait_until="domcontentloaded")
+                        pw_attachments = extract_attachments_from_page(page)
+                    finally:
+                        browser.close()
+            if pw_attachments:
+                LOGGER.info(
+                    "첨부파일 정책 셀프테스트 실패(Playwright): %s개",
+                    len(pw_attachments),
+                )
+                raise RuntimeError("첨부파일 정책 셀프테스트 실패(Playwright)")
         LOGGER.info("첨부파일 정책 셀프테스트 통과")
     finally:
         for key, value in original_env.items():
@@ -1473,8 +1501,20 @@ def extract_attachments_from_page(page) -> list[dict]:
                 queryKeyPattern.test(href) ||
                 textHintPattern.test(text || "")
             );
-            const labels = Array.from(document.querySelectorAll("body *"))
+            const collectLabelNodes = (root) => Array.from(root.querySelectorAll("*"))
                 .filter(el => el.textContent && el.textContent.includes("첨부파일"));
+            const containers = Array.from(document.querySelectorAll(".tiptap, .custom-css-tag-a"));
+            let labels = [];
+            if (containers.length) {
+                const labelSet = new Set();
+                containers.forEach(container => {
+                    collectLabelNodes(container).forEach(label => labelSet.add(label));
+                });
+                labels = Array.from(labelSet);
+            }
+            if (!labels.length) {
+                labels = collectLabelNodes(document.body);
+            }
             labelCount = labels.length;
             const collectLinks = (root, trackCandidates) => {
                 const links = root.querySelectorAll("a[href]");
@@ -1534,7 +1574,7 @@ def extract_attachments_from_page(page) -> list[dict]:
     label_candidate_count = (
         result.get("labelCandidateCount", 0) if isinstance(result, dict) else 0
     )
-    allow_domain_only = label_candidate_count > 0
+    allow_domain_only = label_count > 0
     attachments: list[dict] = []
     seen_urls: set[str] = set()
     allowlist_only_urls: list[str] = []
