@@ -589,6 +589,7 @@ class TiptapBlockParser(HTMLParser):
         super().__init__()
         self.in_tiptap = False
         self.tiptap_depth = 0
+        self.seen_tiptap = False
         self.in_list_item = False
         self.current_block_type: Optional[str] = None
         self.rich_text: list[dict] = []
@@ -623,6 +624,7 @@ class TiptapBlockParser(HTMLParser):
         if not self.in_tiptap and tag == "div":
             classes = attrs_dict.get("class", "")
             if "tiptap" in classes.split():
+                self.seen_tiptap = True
                 self.in_tiptap = True
                 self.tiptap_depth = 1
                 return
@@ -806,9 +808,21 @@ class TiptapBlockParser(HTMLParser):
 
 
 def extract_body_blocks_from_html(html_text: str) -> list[dict]:
+    if not html_text:
+        return []
     parser = TiptapBlockParser()
     parser.feed(html_text)
     parser.close()
+    if parser.blocks:
+        return parser.blocks
+    lowered = html_text.lower()
+    looks_like_fragment = "<html" not in lowered and "<body" not in lowered
+    if not parser.seen_tiptap and looks_like_fragment:
+        wrapped = f'<div class="tiptap">{html_text}</div>'
+        fallback = TiptapBlockParser()
+        fallback.feed(wrapped)
+        fallback.close()
+        return fallback.blocks
     return parser.blocks
 
 
