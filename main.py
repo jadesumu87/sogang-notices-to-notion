@@ -28,12 +28,27 @@ ATTACHMENT_PROPERTY = "첨부파일"
 TYPE_PROPERTY = "유형"
 LOGGER = logging.getLogger("scholarship-crawler")
 BASE_SITE = "https://www.sogang.ac.kr"
+BBS_API_BASE = f"{BASE_SITE}/api/api/v1/mainKo/BbsData"
+BBS_LIST_API_URL = f"{BBS_API_BASE}/boardListMultiConfigId"
 DATE_PATTERN = re.compile(
     r"\d{4}[.\-]\d{2}[.\-]\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?"
 )
 DATE_TIME_PATTERN = re.compile(r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2})?")
 DATE_TIME_JS_PATTERN = r"\d{4}[.\-]\d{2}[.\-]\d{2}\s+\d{2}:\d{2}(?::\d{2})?"
 DETAIL_PATH_PATTERN = re.compile(r"/detail/\d+")
+DETAIL_ID_CAPTURE_PATTERN = re.compile(r"/detail/(\d+)")
+DETAIL_ID_FUNCTION_PATTERN = re.compile(
+    r"(?:view|detail|article)\s*\(\s*'?(\d{5,})'?",
+    re.IGNORECASE,
+)
+DETAIL_ID_PARAM_PATTERN = re.compile(
+    r"(?:detailId|detail_id|articleId|article_id|boardNo|board_no|contentId|content_id)\D{0,5}(\d{5,})",
+    re.IGNORECASE,
+)
+DETAIL_ID_DATA_ATTR_PATTERN = re.compile(
+    r"data-(?:id|no|board-id|board-no|article-id|article-no|detail-id|detail-no)=['\"](\d{5,})['\"]",
+    re.IGNORECASE,
+)
 LIST_ROW_SELECTOR = "tr[data-v-6debbb14], table tbody tr"
 ATTACHMENT_EXT_PATTERN = re.compile(
     r"\.(pdf|hwp|hwpx|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|jpg|jpeg|png|gif|bmp)(?:$|\\?)",
@@ -98,6 +113,10 @@ def clean_text(html_text: str) -> str:
     return text.strip()
 
 
+def normalize_title_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
 def parse_datetime(date_text: str) -> Optional[str]:
     match = re.search(r"(\d{4})[.\-](\d{2})[.\-](\d{2})", date_text)
     if not match:
@@ -110,6 +129,20 @@ def parse_datetime(date_text: str) -> Optional[str]:
             second = "00"
         return f"{year}-{month}-{day}T{hour}:{minute}:{second}+09:00"
     return f"{year}-{month}-{day}T00:00:00+09:00"
+
+
+def parse_compact_datetime(date_text: Optional[str]) -> Optional[str]:
+    if not date_text:
+        return None
+    digits = re.sub(r"[^0-9]", "", str(date_text))
+    if len(digits) >= 14:
+        year, month, day = digits[0:4], digits[4:6], digits[6:8]
+        hour, minute, second = digits[8:10], digits[10:12], digits[12:14]
+        return f"{year}-{month}-{day}T{hour}:{minute}:{second}+09:00"
+    if len(digits) >= 8:
+        year, month, day = digits[0:4], digits[4:6], digits[6:8]
+        return f"{year}-{month}-{day}T00:00:00+09:00"
+    return parse_datetime(str(date_text))
 
 
 def normalize_date_key(date_text: Optional[str]) -> str:
@@ -194,6 +227,75 @@ def log_attachments(label: str, attachments: list[dict]) -> None:
         url = attachment.get("external", {}).get("url") or ""
         name = attachment.get("name") or ""
         LOGGER.info("첨부파일 링크: %s (%s)", url, name)
+
+
+def build_site_headers() -> dict:
+    return {"User-Agent": USER_AGENT, "Referer": BASE_URL}
+
+
+def fetch_site_json(url: str) -> Optional[dict]:
+    req = urllib.request.Request(url, headers=build_site_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+        text = raw.decode("utf-8", errors="replace")
+        return json.loads(text)
+    except urllib.error.HTTPError as exc:
+        LOGGER.info("API 요청 실패: %s (HTTP %s)", url, exc.code)
+    except urllib.error.URLError as exc:
+        LOGGER.info("API 요청 실패: %s (%s)", url, exc.reason)
+    except TimeoutError:
+        LOGGER.info("API 요청 실패: %s (timeout)", url)
+    except json.JSONDecodeError:
+        LOGGER.info("API 응답 파싱 실패: %s", url)
+    return None
+
+
+def fetch_bbs_list(page_num: int, page_size: int = 20) -> list[dict]:
+    params = {
+        "pageNum": str(page_num),
+        "pageSize": str(page_size),
+        "bbsConfigFks": get_bbs_config_fk(),
+        "title": "",
+        "content": "",
+        "username": "",
+        "category": "",
+    }
+    url = f"{BBS_LIST_API_URL}?{urlencode(params)}"
+    data = fetch_site_json(url)
+    if not data:
+        return []
+    return data.get("data", {}).get("list", []) or []
+
+
+def fetch_bbs_detail(pk_id: str) -> Optional[dict]:
+    url = f"{BBS_API_BASE}?pkId={pk_id}"
+    data = fetch_site_json(url)
+    if not data:
+        return None
+    detail = data.get("data")
+    if not isinstance(detail, dict):
+        return None
+    return detail
+
+
+def extract_attachments_from_api_data(data: dict) -> list[dict]:
+    attachments: list[dict] = []
+    seen: set[str] = set()
+    for idx in range(1, 6):
+        raw = data.get(f"fileValue{idx}")
+        if not raw:
+            continue
+        url = normalize_file_url(str(raw))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        params = parse_qs(urlparse(url).query)
+        name = params.get("sg", [""])[0].strip()
+        if not name:
+            name = Path(urlparse(url).path).name or "첨부파일"
+        attachments.append({"name": name, "type": "external", "external": {"url": url}})
+    return attachments
 
 
 DEFAULT_ANNOTATIONS = {
@@ -961,8 +1063,11 @@ def extract_detail_url_from_row_html(row_html: str) -> Optional[str]:
     for match in re.finditer(r'href="([^"]+)"', row_html):
         href = unescape(match.group(1))
         candidate = normalize_detail_url(href)
-        if candidate and is_detail_path_url(candidate):
+        if candidate and is_detail_url(candidate):
             return candidate
+        detail_id = extract_detail_id_from_text(href)
+        if detail_id:
+            return normalize_detail_url(build_detail_url(detail_id))
     match = re.search(r"/detail/(\d+)", row_html)
     if match:
         return normalize_detail_url(build_detail_url(match.group(1)))
@@ -1013,9 +1118,26 @@ def extract_list_rows(page) -> list[dict]:
                 if not href:
                     continue
                 candidate = normalize_detail_url(href)
-                if candidate and is_detail_path_url(candidate):
+                if candidate and is_detail_url(candidate):
                     detail_url = candidate
                     break
+                detail_id = extract_detail_id_from_text(href)
+                if detail_id:
+                    detail_url = normalize_detail_url(build_detail_url(detail_id))
+                    break
+        if not detail_url:
+            onclick = row.get_attribute("onclick") or ""
+            detail_id = extract_detail_id_from_text(onclick)
+            if detail_id:
+                detail_url = normalize_detail_url(build_detail_url(detail_id))
+            else:
+                try:
+                    row_html = row.evaluate("row => row.outerHTML")
+                except Exception:
+                    row_html = ""
+                detail_id = extract_detail_id_from_text(row_html or "")
+                if detail_id:
+                    detail_url = normalize_detail_url(build_detail_url(detail_id))
         items.append(
             {
                 "title": title,
@@ -1066,18 +1188,47 @@ def wait_for_detail_url(page, list_url: str) -> Optional[str]:
     return page.url
 
 
+def extract_detail_id_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = DETAIL_ID_CAPTURE_PATTERN.search(text)
+    if match:
+        return match.group(1)
+    match = DETAIL_ID_FUNCTION_PATTERN.search(text)
+    if match:
+        return match.group(1)
+    match = DETAIL_ID_PARAM_PATTERN.search(text)
+    if match:
+        return match.group(1)
+    match = DETAIL_ID_DATA_ATTR_PATTERN.search(text)
+    if match:
+        return match.group(1)
+    return None
+
+
 def extract_detail_id_from_row(row) -> Optional[str]:
     for key in ("data-id", "data-no", "data-board-id", "data-article-id", "data-detail-id"):
         value = row.get_attribute(key)
         if value and value.isdigit():
             return value
+    onclick = row.get_attribute("onclick") or ""
+    detail_id = extract_detail_id_from_text(onclick)
+    if detail_id:
+        return detail_id
     try:
         dataset = row.evaluate("row => ({...row.dataset})")
         for value in dataset.values():
             if isinstance(value, str) and value.isdigit():
                 return value
     except Exception:
+        dataset = {}
+    try:
+        row_html = row.evaluate("row => row.outerHTML")
+    except Exception:
         return None
+    detail_id = extract_detail_id_from_text(row_html or "")
+    if detail_id:
+        return detail_id
     return None
 
 
@@ -1168,12 +1319,12 @@ def fetch_detail_for_row(
 
     if detail_url:
         detail_url = normalize_detail_url(detail_url) or detail_url
-        if detail_url and not is_detail_path_url(detail_url):
+        if detail_url and not is_detail_url(detail_url):
             LOGGER.info("상세 URL 경로 아님: %s", detail_url)
             detail_url = None
     if detail_url:
         written_at, attachments, body_blocks = fetch_detail_metadata_from_url(detail_url)
-        if not attachments or not body_blocks:
+        if not written_at or not attachments or not body_blocks:
             pw_written_at, pw_attachments, pw_body_blocks = fetch_detail_metadata_via_playwright(
                 page, list_url, detail_url
             )
@@ -1195,7 +1346,7 @@ def fetch_detail_for_row(
     if detail_id:
         detail_url = normalize_detail_url(build_detail_url(detail_id))
         written_at, attachments, body_blocks = fetch_detail_metadata_from_url(detail_url)
-        if not attachments or not body_blocks:
+        if not written_at or not attachments or not body_blocks:
             pw_written_at, pw_attachments, pw_body_blocks = fetch_detail_metadata_via_playwright(
                 page, list_url, detail_url
             )
@@ -1253,7 +1404,89 @@ def goto_list_page(page, url: str) -> bool:
     return True
 
 
+def crawl_top_items_api() -> list[dict]:
+    items: list[dict] = []
+    seen: set[str] = set()
+    page_number = 1
+    page_size_raw = os.environ.get("BBS_PAGE_SIZE", "20")
+    try:
+        page_size = max(1, int(page_size_raw))
+    except ValueError:
+        page_size = 20
+
+    while True:
+        LOGGER.info("페이지 로드 시작(API): %s", page_number)
+        page_entries = fetch_bbs_list(page_number, page_size)
+        LOGGER.info("페이지 %s 항목 수(API): %s", page_number, len(page_entries))
+        if not page_entries:
+            break
+
+        top_entries = [
+            entry for entry in page_entries if str(entry.get("isTop", "")).upper() == "Y"
+        ]
+        has_non_top = any(
+            str(entry.get("isTop", "")).upper() != "Y" for entry in page_entries
+        )
+        new_top = 0
+
+        for entry in top_entries:
+            pk_id = str(entry.get("pkId") or "").strip()
+            if not pk_id:
+                continue
+            detail_url = normalize_detail_url(build_detail_url(pk_id)) or build_detail_url(pk_id)
+            detail = fetch_bbs_detail(pk_id)
+            if detail is None:
+                LOGGER.info("상세 API 로드 실패: %s", pk_id)
+                detail = {}
+
+            title = detail.get("title") or entry.get("title") or ""
+            if not title:
+                continue
+            author = detail.get("userName") or entry.get("userName") or entry.get("userNickName") or ""
+            written_at = parse_compact_datetime(detail.get("regDate") or entry.get("regDate"))
+            views_raw = detail.get("viewCount", entry.get("viewCount"))
+            views = parse_int(str(views_raw)) if views_raw is not None else None
+            top = str(entry.get("isTop", "")).upper() == "Y"
+
+            attachments = extract_attachments_from_api_data(detail or entry)
+            content_html = detail.get("content") or ""
+            body_blocks = extract_body_blocks_from_html(content_html) if content_html else []
+
+            key = detail_url or f"{title}|{written_at or ''}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            item = {
+                "title": title,
+                "author": author,
+                "date": written_at,
+                "views": views,
+                "top": top,
+                "url": detail_url,
+            }
+            if attachments:
+                item["attachments"] = attachments
+                log_attachments(title, attachments)
+            if body_blocks:
+                item["body_blocks"] = body_blocks
+            items.append(item)
+            new_top += 1
+
+        LOGGER.info("페이지 %s 신규 TOP 수(API): %s", page_number, new_top)
+        if has_non_top:
+            LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단(API)", page_number)
+            break
+        page_number += 1
+
+    return items
+
+
 def crawl_top_items() -> list[dict]:
+    api_items = crawl_top_items_api()
+    if api_items:
+        return api_items
+
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
     except ImportError as exc:
@@ -1303,8 +1536,16 @@ def crawl_top_items() -> list[dict]:
                     item["row_index"],
                     item.get("detail_url"),
                 )
+                if not detail_url:
+                    LOGGER.info("상세 URL 미확보: %s", item["title"])
                 if written_at:
                     item["date"] = written_at
+                else:
+                    LOGGER.info(
+                        "작성일 미검출: %s (%s)",
+                        item["title"],
+                        detail_url or "URL없음",
+                    )
                 if detail_url:
                     item["url"] = normalize_detail_url(detail_url)
                 if attachments:
@@ -1446,8 +1687,7 @@ def notion_request(
 
 
 def fetch_html(url: str) -> Optional[str]:
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", USER_AGENT)
+    req = urllib.request.Request(url, headers=build_site_headers())
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read().decode("utf-8", errors="replace")
