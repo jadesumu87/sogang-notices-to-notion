@@ -230,19 +230,42 @@ def normalize_file_url(raw_url: Optional[str]) -> Optional[str]:
     return urlunparse(parsed._replace(fragment=""))
 
 
-def is_attachment_candidate(url: str, text: str) -> bool:
+def get_attachment_allowed_domains() -> tuple[str, ...]:
+    raw = os.environ.get("ATTACHMENT_ALLOWED_DOMAINS", "sogang.ac.kr")
+    domains = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    return tuple(domains)
+
+
+def is_allowed_attachment_host(host: str, allowed_domains: tuple[str, ...]) -> bool:
+    if not host:
+        return True
+    host = host.split(":", 1)[0]
+    for domain in allowed_domains:
+        if host == domain or host.endswith(f".{domain}"):
+            return True
+    return False
+
+
+def is_attachment_candidate(
+    url: str,
+    text: str,
+    allow_domain_only: bool = False,
+) -> bool:
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower()
-    if host and not host.endswith("sogang.ac.kr"):
-        return False
-    if ATTACHMENT_EXT_PATTERN.search(url) or ATTACHMENT_EXT_PATTERN.search(text):
-        return True
+    allowed_domains = get_attachment_allowed_domains()
     lowered_url = url.lower()
-    if any(hint in lowered_url for hint in ATTACHMENT_HINTS):
+    ext_match = bool(
+        ATTACHMENT_EXT_PATTERN.search(url) or ATTACHMENT_EXT_PATTERN.search(text)
+    )
+    hint_match = any(hint in lowered_url for hint in ATTACHMENT_HINTS)
+    link_match = bool(ATTACHMENT_LINK_PATTERN.search(url))
+    path_match = "/file-fe-prd/board/" in parsed.path
+    strong_match = ext_match or hint_match or link_match or path_match
+    allowed_host = is_allowed_attachment_host(host, allowed_domains)
+    if allow_domain_only and allowed_host:
         return True
-    if "/file-fe-prd/board/" in parsed.path:
-        return True
-    return False
+    return strong_match
 
 
 def log_attachments(label: str, attachments: list[dict]) -> None:
@@ -1242,11 +1265,11 @@ def extract_attachments_from_detail(html_text: str) -> list[dict]:
     attachments: list[dict] = []
     seen_urls: set[str] = set()
 
-    def add_attachment(href: str, text: str) -> None:
+    def add_attachment(href: str, text: str, allow_domain_only: bool) -> None:
         url = normalize_file_url(href)
         if not url or url in seen_urls:
             return
-        if not is_attachment_candidate(url, text):
+        if not is_attachment_candidate(url, text, allow_domain_only=allow_domain_only):
             return
         seen_urls.add(url)
         if text:
@@ -1281,7 +1304,7 @@ def extract_attachments_from_detail(html_text: str) -> list[dict]:
                     and not any(hint in lowered_href for hint in ATTACHMENT_HINTS)
                 ):
                     continue
-            add_attachment(href, text)
+            add_attachment(href, text, allow_domain_only=strict)
 
     label_matches = list(re.finditer(r"첨부파일", html_text))
     if label_matches:
@@ -1349,6 +1372,7 @@ def extract_attachments_from_page(page) -> list[dict]:
     candidates = result.get("links", []) if isinstance(result, dict) else []
     label_count = result.get("labelCount", 0) if isinstance(result, dict) else 0
     label_link_count = result.get("labelLinkCount", 0) if isinstance(result, dict) else 0
+    allow_domain_only = label_link_count > 0
     attachments: list[dict] = []
     seen_urls: set[str] = set()
     for candidate in candidates:
@@ -1357,7 +1381,7 @@ def extract_attachments_from_page(page) -> list[dict]:
         url = normalize_file_url(href)
         if not url or url in seen_urls:
             continue
-        if not is_attachment_candidate(url, text):
+        if not is_attachment_candidate(url, text, allow_domain_only=allow_domain_only):
             continue
         seen_urls.add(url)
         name = text
@@ -2075,17 +2099,31 @@ def should_retry_detail_fetch(
     body_blocks: list[dict],
     signals: dict,
 ) -> bool:
+    reasons: list[str] = []
     if not written_at:
-        return True
+        reasons.append("작성일")
     if (signals.get("has_attachment_label") or signals.get("has_attachment_link")) and not attachments:
-        return True
+        reasons.append("첨부파일")
     if (
         signals.get("has_body_container")
         and signals.get("body_has_content")
         and not body_blocks
     ):
-        return True
-    return False
+        reasons.append("본문")
+    retry = bool(reasons)
+    LOGGER.info(
+        "상세 재시도 판단: %s (reasons=%s, written_at=%s, attachments=%s, body_blocks=%s, signals=label=%s,link=%s,body_container=%s,body_content=%s)",
+        "Y" if retry else "N",
+        ",".join(reasons) if reasons else "-",
+        "Y" if written_at else "N",
+        len(attachments),
+        len(body_blocks),
+        int(bool(signals.get("has_attachment_label"))),
+        int(bool(signals.get("has_attachment_link"))),
+        int(bool(signals.get("has_body_container"))),
+        int(bool(signals.get("body_has_content"))),
+    )
+    return retry
 
 
 def fetch_detail_metadata_from_url(
@@ -2417,12 +2455,21 @@ def get_sync_mode() -> str:
 
 
 def find_sync_container_id(token: str, page_id: str) -> Optional[str]:
-    for block in list_block_children(token, page_id):
-        if block.get("type") != "quote":
-            continue
-        rich_text = block.get("quote", {}).get("rich_text", [])
-        if has_sync_marker(rich_text):
-            return block.get("id")
+    queue = list_block_children(token, page_id)
+    while queue:
+        block = queue.pop(0)
+        if block.get("type") == "quote":
+            rich_text = block.get("quote", {}).get("rich_text", [])
+            if has_sync_marker(rich_text):
+                return block.get("id")
+        if block.get("has_children"):
+            block_id = block.get("id")
+            if not block_id:
+                continue
+            try:
+                queue.extend(list_block_children(token, block_id))
+            except NotionRequestError as exc:
+                LOGGER.info("하위 블록 조회 실패: %s (%s)", block_id, exc)
     return None
 
 
