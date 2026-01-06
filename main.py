@@ -247,19 +247,12 @@ def normalize_file_url(raw_url: Optional[str]) -> Optional[str]:
 
 # Attachment policy:
 # - ATTACHMENT_ALLOWED_DOMAINS: comma-separated allowed hosts (default: sogang.ac.kr)
-# - ATTACHMENT_STRICT_ALLOW_EXTERNAL: 0 blocks external hosts in strict mode
-#   (1 allows external hosts only when strong_match holds in strict mode)
 # - ATTACHMENT_MAX_COUNT: per-page cap for attachments (default: 15)
 # - ATTACHMENT_SELFTEST: run attachment policy selftest and exit (1/true/on)
 def get_attachment_allowed_domains() -> tuple[str, ...]:
     raw = os.environ.get("ATTACHMENT_ALLOWED_DOMAINS", "sogang.ac.kr")
     domains = [part.strip().lower() for part in raw.split(",") if part.strip()]
     return tuple(domains)
-
-
-def get_attachment_strict_allow_external() -> bool:
-    raw = os.environ.get("ATTACHMENT_STRICT_ALLOW_EXTERNAL", "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
 
 
 def get_attachment_max_count() -> int:
@@ -281,7 +274,7 @@ def has_attachment_query_key(url: str) -> bool:
 
 def is_allowed_attachment_host(host: str, allowed_domains: tuple[str, ...]) -> bool:
     if not host:
-        return True
+        return False
     host = host.split(":", 1)[0]
     for domain in allowed_domains:
         if host == domain or host.endswith(f".{domain}"):
@@ -310,14 +303,13 @@ def is_attachment_candidate(
     minimal_signal = strong_match or text_hint or query_hint
     allowed_host = is_allowed_attachment_host(host, allowed_domains)
 
-    if allow_domain_only:
-        if not allowed_host and not get_attachment_strict_allow_external():
-            return False, False
-        if allowed_host and minimal_signal:
-            return True, not strong_match
-        if strong_match:
-            return True, False
+    if not allowed_host:
         return False, False
+
+    if allow_domain_only:
+        if not minimal_signal:
+            return False, False
+        return True, not strong_match
 
     if strong_match:
         return True, False
@@ -326,9 +318,8 @@ def is_attachment_candidate(
 
 def run_attachment_policy_selftest() -> None:
     LOGGER.info("첨부파일 정책 셀프테스트 시작")
-    keys = ("ATTACHMENT_STRICT_ALLOW_EXTERNAL", "ATTACHMENT_ALLOWED_DOMAINS")
+    keys = ("ATTACHMENT_ALLOWED_DOMAINS",)
     original_env = {key: os.environ.get(key) for key in keys}
-    os.environ["ATTACHMENT_STRICT_ALLOW_EXTERNAL"] = "0"
     os.environ["ATTACHMENT_ALLOWED_DOMAINS"] = "sogang.ac.kr"
     try:
         html = (
@@ -336,6 +327,9 @@ def run_attachment_policy_selftest() -> None:
             '<a href="https://example.com/file.pdf">file.pdf</a>'
         )
         html_attachments = extract_attachments_from_detail(html)
+        api_attachments = extract_attachments_from_api_data(
+            {"fileValue1": "https://example.com/file.pdf"}
+        )
         page_candidates = [("https://example.com/file.pdf", "file.pdf")]
         page_attachments = []
         for href, text in page_candidates:
@@ -352,10 +346,11 @@ def run_attachment_policy_selftest() -> None:
             "file.pdf",
             allow_domain_only=True,
         )
-        if html_attachments or strict_allowed or page_attachments:
+        if html_attachments or api_attachments or strict_allowed or page_attachments:
             LOGGER.info(
-                "첨부파일 정책 셀프테스트 실패: html=%s, strict_allowed=%s, page=%s",
+                "첨부파일 정책 셀프테스트 실패: html=%s, api=%s, strict_allowed=%s, page=%s",
                 len(html_attachments),
+                len(api_attachments),
                 int(strict_allowed),
                 len(page_attachments),
             )
@@ -483,12 +478,17 @@ def fetch_bbs_detail(pk_id: str) -> Optional[dict]:
 def extract_attachments_from_api_data(data: dict) -> list[dict]:
     attachments: list[dict] = []
     seen: set[str] = set()
+    allowed_domains = get_attachment_allowed_domains()
     for idx in range(1, 6):
         raw = data.get(f"fileValue{idx}")
         if not raw:
             continue
         url = normalize_file_url(str(raw))
         if not url or url in seen:
+            continue
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        if not is_allowed_attachment_host(host, allowed_domains):
             continue
         seen.add(url)
         params = parse_qs(urlparse(url).query)
@@ -1575,30 +1575,60 @@ def extract_attachments_from_page(page) -> list[dict]:
         result.get("labelCandidateCount", 0) if isinstance(result, dict) else 0
     )
     allow_domain_only = label_count > 0
-    attachments: list[dict] = []
-    seen_urls: set[str] = set()
-    allowlist_only_urls: list[str] = []
-    for candidate in candidates:
-        href = candidate.get("href", "")
-        text = candidate.get("text", "")
-        url = normalize_file_url(href)
-        if not url or url in seen_urls:
-            continue
-        allowed, allowlist_only = is_attachment_candidate(
-            url, text, allow_domain_only=allow_domain_only
+    def build_attachments(candidate_list: list[dict]) -> tuple[list[dict], list[str]]:
+        attachments: list[dict] = []
+        seen_urls: set[str] = set()
+        allowlist_only_urls: list[str] = []
+        for candidate in candidate_list:
+            href = candidate.get("href", "")
+            text = candidate.get("text", "")
+            url = normalize_file_url(href)
+            if not url or url in seen_urls:
+                continue
+            allowed, allowlist_only = is_attachment_candidate(
+                url, text, allow_domain_only=allow_domain_only
+            )
+            if not allowed:
+                continue
+            seen_urls.add(url)
+            if allowlist_only:
+                allowlist_only_urls.append(url)
+            name = text
+            if not name:
+                params = parse_qs(urlparse(url).query)
+                name = params.get("sg", [""])[0]
+            if not name:
+                name = Path(urlparse(url).path).name or "첨부파일"
+            attachments.append(
+                {"name": name, "type": "external", "external": {"url": url}}
+            )
+        return attachments, allowlist_only_urls
+
+    attachments, allowlist_only_urls = build_attachments(candidates)
+    if allow_domain_only and label_link_count > 0 and not attachments:
+        all_candidates = page.evaluate(
+            """
+            () => {
+                const results = [];
+                const seen = new Set();
+                const links = document.querySelectorAll("a[href]");
+                links.forEach(a => {
+                    const href = a.getAttribute("href") || "";
+                    const text = (a.textContent || "").trim();
+                    if (!href) return;
+                    const key = href + "|" + text;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    results.push({href, text});
+                });
+                return results;
+            }
+            """
         )
-        if not allowed:
-            continue
-        seen_urls.add(url)
-        if allowlist_only:
-            allowlist_only_urls.append(url)
-        name = text
-        if not name:
-            params = parse_qs(urlparse(url).query)
-            name = params.get("sg", [""])[0]
-        if not name:
-            name = Path(urlparse(url).path).name or "첨부파일"
-        attachments.append({"name": name, "type": "external", "external": {"url": url}})
+        if isinstance(all_candidates, list) and all_candidates:
+            LOGGER.info("첨부파일 폴백: 라벨 있음, 전체 링크 재스캔")
+            candidates = all_candidates
+            attachments, allowlist_only_urls = build_attachments(candidates)
     if allowlist_only_urls:
         sample = ", ".join(allowlist_only_urls[:3])
         LOGGER.info(
@@ -2081,73 +2111,78 @@ def crawl_top_items() -> list[dict]:
     user_agent = os.environ.get("USER_AGENT", USER_AGENT)
 
     with sync_playwright() as playwright:
-        launcher = get_browser_launcher(playwright, browser_name)
-        browser = launcher.launch(headless=headless)
-        context = browser.new_context(
-            user_agent=user_agent,
-            viewport={"width": 1920, "height": 1080},
-        )
-        page = context.new_page()
+        try:
+            launcher = get_browser_launcher(playwright, browser_name)
+            browser = launcher.launch(headless=headless)
+        except Exception as exc:
+            LOGGER.info("Playwright 브라우저 실행 실패: %s (HTTP 모드로 전환)", exc)
+            return crawl_top_items_http()
+        try:
+            context = browser.new_context(
+                user_agent=user_agent,
+                viewport={"width": 1920, "height": 1080},
+            )
+            page = context.new_page()
 
-        page_number = 1
-        fallback_to_http = False
-        while True:
-            url = build_list_url(page_number)
-            LOGGER.info("페이지 로드 시작: %s", url)
-            if not goto_list_page(page, url):
-                LOGGER.info("페이지 %s 로드 실패", page_number)
-                if page_number == 1:
-                    LOGGER.info("Playwright 페이지 로드 실패: HTTP 모드로 전환")
-                    fallback_to_http = True
-                break
+            page_number = 1
+            fallback_to_http = False
+            while True:
+                url = build_list_url(page_number)
+                LOGGER.info("페이지 로드 시작: %s", url)
+                if not goto_list_page(page, url):
+                    LOGGER.info("페이지 %s 로드 실패", page_number)
+                    if page_number == 1:
+                        LOGGER.info("Playwright 페이지 로드 실패: HTTP 모드로 전환")
+                        fallback_to_http = True
+                    break
 
-            page_items = extract_list_rows(page)
-            LOGGER.info("페이지 %s 항목 수: %s", page_number, len(page_items))
-            if not page_items:
-                break
+                page_items = extract_list_rows(page)
+                LOGGER.info("페이지 %s 항목 수: %s", page_number, len(page_items))
+                if not page_items:
+                    break
 
-            top_items = [item for item in page_items if item.get("top")]
-            has_non_top = any(not item.get("top") for item in page_items)
-            new_top = 0
-            for item in top_items:
-                written_at, detail_url, attachments, body_blocks = fetch_detail_for_row(
-                    page,
-                    url,
-                    item["row_index"],
-                    item.get("detail_url"),
-                )
-                if not detail_url:
-                    LOGGER.info("상세 URL 미확보: %s", item["title"])
-                if written_at:
-                    item["date"] = written_at
-                else:
-                    LOGGER.info(
-                        "작성일 미검출: %s (%s)",
-                        item["title"],
-                        detail_url or "URL없음",
+                top_items = [item for item in page_items if item.get("top")]
+                has_non_top = any(not item.get("top") for item in page_items)
+                new_top = 0
+                for item in top_items:
+                    written_at, detail_url, attachments, body_blocks = fetch_detail_for_row(
+                        page,
+                        url,
+                        item["row_index"],
+                        item.get("detail_url"),
                     )
-                if detail_url:
-                    item["url"] = normalize_detail_url(detail_url)
-                if attachments:
-                    attachments = cap_attachments(attachments, item["title"])
-                    item["attachments"] = attachments
-                    log_attachments(item["title"], attachments)
-                if body_blocks:
-                    item["body_blocks"] = body_blocks
-                key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                items.append(item)
-                new_top += 1
+                    if not detail_url:
+                        LOGGER.info("상세 URL 미확보: %s", item["title"])
+                    if written_at:
+                        item["date"] = written_at
+                    else:
+                        LOGGER.info(
+                            "작성일 미검출: %s (%s)",
+                            item["title"],
+                            detail_url or "URL없음",
+                        )
+                    if detail_url:
+                        item["url"] = normalize_detail_url(detail_url)
+                    if attachments:
+                        attachments = cap_attachments(attachments, item["title"])
+                        item["attachments"] = attachments
+                        log_attachments(item["title"], attachments)
+                    if body_blocks:
+                        item["body_blocks"] = body_blocks
+                    key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    items.append(item)
+                    new_top += 1
 
-            LOGGER.info("페이지 %s 신규 TOP 수: %s", page_number, new_top)
-            if has_non_top:
-                LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단", page_number)
-                break
-            page_number += 1
-
-        browser.close()
+                LOGGER.info("페이지 %s 신규 TOP 수: %s", page_number, new_top)
+                if has_non_top:
+                    LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단", page_number)
+                    break
+                page_number += 1
+        finally:
+            browser.close()
 
     if fallback_to_http:
         return crawl_top_items_http()
