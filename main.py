@@ -143,6 +143,7 @@ TYPE_TAGS = (
 FALLBACK_TYPE = "공통"
 DEFAULT_CONFIG_CLASSIFICATIONS = {"141": "장학공지", "2": "학사공지"}
 DEFAULT_CONFIG_LIST_URLS = {"141": BASE_URL, "2": ACADEMIC_BASE_URL}
+DEFAULT_BBS_CONFIG_FKS = ["141", "2"]
 
 FILE_UPLOAD_CACHE: dict[str, str] = {}
 WORKSPACE_UPLOAD_LIMIT: Optional[int] = None
@@ -1818,7 +1819,16 @@ def parse_config_map(raw: str) -> dict[str, str]:
 
 
 def get_bbs_config_fk() -> str:
-    return os.environ.get("BBS_CONFIG_FK", "141").strip()
+    raw = os.environ.get("BBS_CONFIG_FK", "").strip()
+    if raw:
+        return raw
+    raw_list = os.environ.get("BBS_CONFIG_FKS", "").strip()
+    if raw_list:
+        parts = re.split(r"[,\s]+", raw_list)
+        for part in parts:
+            if part:
+                return part
+    return DEFAULT_BBS_CONFIG_FKS[0]
 
 
 def get_bbs_config_fks() -> list[str]:
@@ -1826,8 +1836,10 @@ def get_bbs_config_fks() -> list[str]:
     if raw:
         parts = re.split(r"[,\\s]+", raw)
         return [part for part in parts if part]
-    single = get_bbs_config_fk().strip()
-    return [single] if single else []
+    single = os.environ.get("BBS_CONFIG_FK", "").strip()
+    if single:
+        return [single]
+    return list(DEFAULT_BBS_CONFIG_FKS)
 
 
 def get_config_classification_map() -> dict[str, str]:
