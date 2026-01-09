@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
 import importlib.util
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 from urllib.parse import (
@@ -42,6 +43,7 @@ VIEWS_PROPERTY = "조회수"
 ATTACHMENT_PROPERTY = "첨부파일"
 TYPE_PROPERTY = "유형"
 BODY_HASH_PROPERTY = "본문 해시"
+BODY_HASH_IMAGE_MODE_UPLOAD = "upload-files-v1"
 SYNC_CONTAINER_MARKER = "[SYNC_CONTAINER]"
 LOGGER = logging.getLogger("scholarship-crawler")
 BASE_SITE = "https://www.sogang.ac.kr"
@@ -212,9 +214,25 @@ def normalize_date_key(date_text: Optional[str]) -> str:
     return date_text[:10]
 
 
-def compute_body_hash(blocks: list[dict]) -> str:
-    payload = json.dumps(blocks, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def compute_body_hash(blocks: list[dict], image_mode: str = "") -> str:
+    payload_value: object
+    if image_mode:
+        payload_value = {"image_mode": image_mode, "blocks": blocks}
+    else:
+        payload_value = blocks
+    payload = json.dumps(
+        payload_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def has_image_blocks(blocks: list[dict]) -> bool:
+    if not blocks:
+        return False
+    for block in blocks:
+        if block.get("type") == "image":
+            return True
+    return False
 
 
 def normalize_detail_url(raw_url: Optional[str]) -> Optional[str]:
@@ -598,6 +616,66 @@ def download_file_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
     except socket.timeout:
         LOGGER.info("파일 다운로드 실패: %s (timeout)", url)
     return None, None
+
+
+def compress_image_to_limit(
+    payload: bytes,
+    content_type: str,
+    max_bytes: int,
+) -> Optional[tuple[bytes, str]]:
+    if max_bytes <= 0:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        LOGGER.info("이미지 압축 스킵: Pillow 미설치")
+        return None
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            image.load()
+            working = image.copy()
+    except Exception as exc:
+        LOGGER.info("이미지 압축 실패: 열기 실패 (%s)", exc)
+        return None
+    if working.size[0] <= 0 or working.size[1] <= 0:
+        return None
+    if working.mode in {"RGBA", "LA"}:
+        background = Image.new("RGB", working.size, (255, 255, 255))
+        background.paste(working, mask=working.split()[-1])
+        working = background
+    elif working.mode != "RGB":
+        working = working.convert("RGB")
+    quality_steps = [85, 75, 65, 55, 45]
+    scale_steps = [1.0, 0.9, 0.8, 0.7, 0.6]
+    original_size = len(payload)
+    width, height = working.size
+    for scale in scale_steps:
+        if scale < 1.0:
+            resized = working.resize(
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                Image.LANCZOS,
+            )
+        else:
+            resized = working
+        for quality in quality_steps:
+            buffer = BytesIO()
+            try:
+                resized.save(buffer, format="JPEG", quality=quality, optimize=True)
+            except Exception as exc:
+                LOGGER.info("이미지 압축 실패: 저장 실패 (%s)", exc)
+                return None
+            data = buffer.getvalue()
+            if len(data) <= max_bytes:
+                LOGGER.info(
+                    "이미지 압축 적용: %s -> %s bytes (q=%s, scale=%.2f)",
+                    original_size,
+                    len(data),
+                    quality,
+                    scale,
+                )
+                return data, "image/jpeg"
+    LOGGER.info("이미지 압축 실패: %s bytes -> limit %s bytes", original_size, max_bytes)
+    return None
 
 
 def get_workspace_upload_limit(token: str) -> Optional[int]:
@@ -999,7 +1077,7 @@ def build_space_rich_text() -> list[dict]:
     return [
         {
             "type": "text",
-            "text": {"content": "\u00a0"},
+            "text": {"content": " \u00a0"},
             "annotations": dict(DEFAULT_ANNOTATIONS),
         }
     ]
@@ -1408,7 +1486,7 @@ def extract_body_blocks_from_html(html_text: str) -> list[dict]:
     parser.feed(html_text)
     parser.close()
     if parser.blocks:
-        return parser.blocks
+        return normalize_body_blocks(parser.blocks)
     lowered = html_text.lower()
     looks_like_fragment = "<html" not in lowered and "<body" not in lowered
     if not parser.seen_tiptap and looks_like_fragment:
@@ -1416,8 +1494,8 @@ def extract_body_blocks_from_html(html_text: str) -> list[dict]:
         fallback = TiptapBlockParser()
         fallback.feed(wrapped)
         fallback.close()
-        return fallback.blocks
-    return parser.blocks
+        return normalize_body_blocks(fallback.blocks)
+    return normalize_body_blocks(parser.blocks)
 
 
 def chunks(items: list[dict], size: int) -> list[list[dict]]:
@@ -1598,7 +1676,7 @@ def parse_rows(html_text: str) -> list[dict]:
 
         date_iso = parse_datetime(date_text)
         views = parse_int(views_text)
-        if not date_iso or views is None or not title:
+        if not date_iso or views is None:
             continue
 
         top = num_or_top.strip().upper() == "TOP"
@@ -1936,7 +2014,7 @@ def extract_list_rows(page) -> list[dict]:
 
         date_iso = parse_datetime(date_text)
         views = parse_int(views_text)
-        if not title or views is None:
+        if views is None:
             continue
 
         top = num_or_top.strip().upper() == "TOP"
@@ -2288,9 +2366,7 @@ def crawl_top_items_api(include_non_top: bool, non_top_max_pages: int) -> list[d
                 LOGGER.info("상세 API 로드 실패: %s", pk_id)
                 detail = {}
 
-            title = detail.get("title") or entry.get("title") or ""
-            if not title:
-                continue
+            title = normalize_title_key(detail.get("title") or entry.get("title") or "")
             author = detail.get("userName") or entry.get("userName") or entry.get("userNickName") or ""
             written_at = parse_compact_datetime(detail.get("regDate") or entry.get("regDate"))
             views_raw = detail.get("viewCount", entry.get("viewCount"))
@@ -2300,16 +2376,10 @@ def crawl_top_items_api(include_non_top: bool, non_top_max_pages: int) -> list[d
                 continue
 
             attachments = extract_attachments_from_api_data(detail or entry)
-            attachments = cap_attachments(attachments, title)
             content_html = detail.get("content") or ""
             body_blocks = extract_body_blocks_from_html(content_html) if content_html else []
             if attachments and body_blocks:
                 body_blocks = replace_body_image_urls(body_blocks, attachments)
-
-            key = detail_url or f"{title}|{written_at or ''}"
-            if key in seen:
-                continue
-            seen.add(key)
 
             item = {
                 "title": title,
@@ -2319,11 +2389,18 @@ def crawl_top_items_api(include_non_top: bool, non_top_max_pages: int) -> list[d
                 "top": top,
                 "url": detail_url,
             }
-            if attachments:
-                item["attachments"] = attachments
-                log_attachments(title, attachments)
             if body_blocks:
                 item["body_blocks"] = body_blocks
+            ensure_item_title(item, body_blocks, detail_url)
+            if attachments:
+                attachments = cap_attachments(attachments, item["title"])
+                item["attachments"] = attachments
+                log_attachments(item["title"], attachments)
+
+            key = detail_url or f"{item['title']}|{written_at or ''}"
+            if key in seen:
+                continue
+            seen.add(key)
             items.append(item)
             new_count += 1
 
@@ -2403,30 +2480,33 @@ def crawl_top_items() -> list[dict]:
                     items_to_process = [item for item in page_items if item.get("top")]
                 new_count = 0
                 for item in items_to_process:
+                    body_blocks: list[dict] = []
+                    attachments: list[dict] = []
                     written_at, detail_url, attachments, body_blocks = fetch_detail_for_row(
                         page,
                         url,
                         item["row_index"],
                         item.get("detail_url"),
                     )
-                    if not detail_url:
-                        LOGGER.info("상세 URL 미확보: %s", item["title"])
                     if written_at:
                         item["date"] = written_at
-                    else:
+                    if detail_url:
+                        item["url"] = normalize_detail_url(detail_url)
+                    if body_blocks:
+                        item["body_blocks"] = body_blocks
+                    ensure_item_title(item, body_blocks, detail_url or item.get("url"))
+                    if not detail_url:
+                        LOGGER.info("상세 URL 미확보: %s", item["title"])
+                    if not written_at:
                         LOGGER.info(
                             "작성일 미검출: %s (%s)",
                             item["title"],
                             detail_url or "URL없음",
                         )
-                    if detail_url:
-                        item["url"] = normalize_detail_url(detail_url)
                     if attachments:
                         attachments = cap_attachments(attachments, item["title"])
                         item["attachments"] = attachments
                         log_attachments(item["title"], attachments)
-                    if body_blocks:
-                        item["body_blocks"] = body_blocks
                     key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
                     if key in seen:
                         continue
@@ -2475,18 +2555,21 @@ def crawl_top_items_http(include_non_top: bool, non_top_max_pages: int) -> list[
             items_to_process = [item for item in page_items if item.get("top")]
         new_count = 0
         for item in items_to_process:
+            body_blocks: list[dict] = []
+            attachments: list[dict] = []
             if item.get("url"):
                 written_at, attachments, body_blocks, _signals = fetch_detail_metadata_from_url(
                     item["url"]
                 )
                 if written_at:
                     item["date"] = written_at
-                if attachments:
-                    attachments = cap_attachments(attachments, item["title"])
-                    item["attachments"] = attachments
-                    log_attachments(item["title"], attachments)
                 if body_blocks:
                     item["body_blocks"] = body_blocks
+            ensure_item_title(item, body_blocks, item.get("url"))
+            if attachments:
+                attachments = cap_attachments(attachments, item["title"])
+                item["attachments"] = attachments
+                log_attachments(item["title"], attachments)
             key = item.get("url") or f"{item['title']}|{item.get('date') or ''}"
             if key in seen:
                 continue
@@ -2654,6 +2737,11 @@ def upload_external_file_to_notion(
         return None
     file_size = len(payload)
     max_bytes = get_workspace_upload_limit(token)
+    if max_bytes and file_size > max_bytes and expect_image:
+        compressed = compress_image_to_limit(payload, content_type, max_bytes)
+        if compressed:
+            payload, content_type = compressed
+            file_size = len(payload)
     if max_bytes and file_size > max_bytes:
         LOGGER.info("업로드 용량 초과: %s bytes (limit=%s)", file_size, max_bytes)
         return None
@@ -2668,6 +2756,10 @@ def upload_external_file_to_notion(
         ext = mimetypes.guess_extension(content_type) or ""
         if ext:
             filename = f"{filename}{ext}"
+    if content_type.lower() == "image/jpeg":
+        stem, ext = os.path.splitext(filename)
+        if ext.lower() not in {".jpg", ".jpeg"}:
+            filename = f"{stem}.jpg"
 
     created = create_file_upload(token, filename, content_type)
     if not created:
@@ -3100,6 +3192,50 @@ def is_empty_paragraph_block(block: dict) -> bool:
     return content.replace("\u00a0", "").strip() == ""
 
 
+def strip_trailing_empty_paragraphs(blocks: list[dict]) -> list[dict]:
+    if not blocks:
+        return blocks
+    end = len(blocks)
+    while end > 0 and is_empty_paragraph_block(blocks[end - 1]):
+        end -= 1
+    if end == len(blocks):
+        return blocks
+    return blocks[:end]
+
+
+def trim_trailing_whitespace_rich_text(rich_text: list[dict]) -> None:
+    idx = len(rich_text) - 1
+    while idx >= 0:
+        item = rich_text[idx]
+        if item.get("type") != "text":
+            break
+        text_payload = item.get("text", {})
+        content = text_payload.get("content", "")
+        trimmed = content.rstrip()
+        if trimmed == content:
+            break
+        if trimmed:
+            text_payload["content"] = trimmed
+            break
+        rich_text.pop()
+        idx -= 1
+
+
+def normalize_body_blocks(blocks: list[dict]) -> list[dict]:
+    normalized = strip_trailing_empty_paragraphs(blocks or [])
+    if not normalized:
+        return normalized
+    last = normalized[-1]
+    block_type = last.get("type")
+    if block_type in {"paragraph", "bulleted_list_item"}:
+        rich_text = last.get(block_type, {}).get("rich_text", [])
+        if rich_text:
+            trim_trailing_whitespace_rich_text(rich_text)
+            if not rich_text:
+                normalized = strip_trailing_empty_paragraphs(normalized[:-1])
+    return normalized
+
+
 def is_image_only_blocks(blocks: list[dict]) -> bool:
     if not blocks:
         return False
@@ -3115,6 +3251,57 @@ def is_image_only_blocks(blocks: list[dict]) -> bool:
 
 def rich_text_plain_text(rich_text: list[dict]) -> str:
     return "".join(item.get("text", {}).get("content", "") for item in rich_text)
+
+
+def extract_first_nonempty_line(text: str) -> str:
+    if not text:
+        return ""
+    for line in text.splitlines():
+        cleaned = line.replace("\u00a0", " ").strip()
+        if cleaned:
+            return cleaned
+    return text.replace("\u00a0", " ").strip()
+
+
+def derive_title_from_blocks(blocks: list[dict]) -> str:
+    for block in blocks or []:
+        block_type = block.get("type")
+        if block_type not in {"paragraph", "bulleted_list_item"}:
+            continue
+        rich_text = block.get(block_type, {}).get("rich_text", [])
+        if not rich_text:
+            continue
+        text = rich_text_plain_text(rich_text)
+        candidate = extract_first_nonempty_line(text)
+        if candidate:
+            return candidate
+    return ""
+
+
+def build_fallback_title(detail_url: Optional[str], date_iso: Optional[str]) -> str:
+    detail_id = extract_detail_id_from_text(detail_url or "")
+    if detail_id:
+        return f"제목없음-{detail_id}"
+    date_key = normalize_date_key(date_iso)
+    if date_key:
+        return f"제목없음-{date_key}"
+    return "제목없음"
+
+
+def ensure_item_title(
+    item: dict,
+    body_blocks: list[dict],
+    detail_url: Optional[str] = None,
+) -> None:
+    title = normalize_title_key(item.get("title", ""))
+    if title:
+        item["title"] = title
+        return
+    derived = derive_title_from_blocks(body_blocks)
+    if derived:
+        item["title"] = normalize_title_key(derived)
+        return
+    item["title"] = build_fallback_title(detail_url or item.get("url"), item.get("date"))
 
 
 def has_sync_marker(rich_text: list[dict]) -> bool:
@@ -3197,9 +3384,9 @@ def sync_page_body_blocks(
     if (sync_mode or "overwrite").strip().lower() == "preserve":
         container_rich_text = ensure_sync_marker_in_rich_text(container_rich_text)
     sync_mode = (sync_mode or "overwrite").strip().lower()
-    container_payload = build_container_block(container_rich_text)
 
     if sync_mode == "preserve":
+        container_payload = build_container_block(container_rich_text)
         container_id = find_sync_container_id(token, page_id)
         if container_id:
             update_quote_block(token, container_id, container_payload["quote"]["rich_text"])
@@ -3221,6 +3408,9 @@ def sync_page_body_blocks(
             append_block_children(token, container_id, chunk)
         return
 
+    if not container_rich_text:
+        container_rich_text = build_space_rich_text()
+    container_payload = build_container_block(container_rich_text)
     children = list_block_children(token, page_id)
     for block in children:
         block_id = block.get("id")
@@ -3448,6 +3638,7 @@ def main() -> None:
     author_values: set[str] = set()
     type_values: set[str] = set()
     for item in items:
+        ensure_item_title(item, item.get("body_blocks", []), item.get("url"))
         item["type"] = extract_type_from_title(item["title"])
         if item.get("author"):
             author_values.add(item["author"])
@@ -3525,7 +3716,10 @@ def main() -> None:
         body_blocks = item.get("body_blocks", [])
         if page_id and body_blocks:
             if has_body_hash_property:
-                body_hash = compute_body_hash(body_blocks)
+                image_mode = ""
+                if upload_files and has_image_blocks(body_blocks):
+                    image_mode = BODY_HASH_IMAGE_MODE_UPLOAD
+                body_hash = compute_body_hash(body_blocks, image_mode=image_mode)
                 if body_hash != existing_hash:
                     blocks_for_sync = prepare_body_blocks_for_sync(
                         notion_token, body_blocks
