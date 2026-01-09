@@ -3,3 +3,5 @@ html*/
 *env*
 *test*
 *notion*
+__pycache__/
+*.pyc
