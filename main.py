@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import socket
@@ -8,14 +9,26 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
 import importlib.util
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlencode, urlparse, parse_qs, urlunparse, urljoin
+from urllib.parse import (
+    urlencode,
+    urlparse,
+    parse_qs,
+    urlunparse,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+    quote,
+    unquote,
+)
 
-NOTION_API_VERSION = "2022-06-28"
+DEFAULT_NOTION_API_VERSION = "2022-06-28"
 BASE_URL = "https://www.sogang.ac.kr/ko/scholarship-notice"
 DEFAULT_QUERY = {"introPkId": "All", "option": "TITLE"}
 USER_AGENT = "Mozilla/5.0 (compatible; ScholarshipCrawler/1.0)"
@@ -56,6 +69,10 @@ DETAIL_ID_DATA_ATTR_PATTERN = re.compile(
 LIST_ROW_SELECTOR = "tr[data-v-6debbb14], table tbody tr"
 ATTACHMENT_EXT_PATTERN = re.compile(
     r"\.(pdf|hwp|hwpx|docx?|xlsx?|pptx?|zip|rar|7z|txt|csv|jpg|jpeg|png|gif|bmp)(?:$|\\?)",
+    re.IGNORECASE,
+)
+IMAGE_EXT_PATTERN = re.compile(
+    r"\.(jpg|jpeg|png|gif|bmp|webp|svg)(?:$|\\?)",
     re.IGNORECASE,
 )
 ATTACHMENT_HINTS = (
@@ -99,6 +116,9 @@ TYPE_TAGS = (
 )
 FALLBACK_TYPE = "공통"
 
+FILE_UPLOAD_CACHE: dict[str, str] = {}
+WORKSPACE_UPLOAD_LIMIT: Optional[int] = None
+
 
 class NotionRequestError(RuntimeError):
     def __init__(
@@ -131,6 +151,10 @@ def load_dotenv(path: str = ".env") -> None:
                 os.environ.setdefault(key, value)
     except FileNotFoundError:
         return
+
+
+def get_notion_api_version() -> str:
+    return os.environ.get("NOTION_API_VERSION", DEFAULT_NOTION_API_VERSION)
 
 
 def setup_logging() -> None:
@@ -237,12 +261,16 @@ def normalize_file_url(raw_url: Optional[str]) -> Optional[str]:
     if raw_url.startswith("//"):
         raw_url = "https:" + raw_url
     absolute = urljoin(BASE_SITE, raw_url)
-    parsed = urlparse(absolute)
+    parsed = urlsplit(absolute)
     if parsed.scheme and parsed.scheme not in {"http", "https"}:
         return None
     if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
         return None
-    return urlunparse(parsed._replace(fragment=""))
+    encoded = encode_url(absolute)
+    encoded_parts = urlsplit(encoded)
+    return urlunsplit(
+        (encoded_parts.scheme, encoded_parts.netloc, encoded_parts.path, encoded_parts.query, "")
+    )
 
 
 # Attachment policy:
@@ -397,6 +425,30 @@ def should_run_attachment_selftest() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+# Notion file upload:
+# - NOTION_UPLOAD_FILES: enable uploading image files to Notion (default: true)
+def should_upload_files_to_notion() -> bool:
+    raw = os.environ.get("NOTION_UPLOAD_FILES", "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+# Crawl policy:
+# - INCLUDE_NON_TOP: include non-top posts when true (default: true)
+# - NON_TOP_MAX_PAGES: max pages to scan when including non-top (default: 3, 0=unlimited)
+def should_include_non_top() -> bool:
+    raw = os.environ.get("INCLUDE_NON_TOP", "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def get_non_top_max_pages() -> int:
+    raw = os.environ.get("NON_TOP_MAX_PAGES", "3").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(0, value)
+
+
 def log_attachments(label: str, attachments: list[dict]) -> None:
     if not attachments:
         return
@@ -422,8 +474,176 @@ def cap_attachments(attachments: list[dict], label: str) -> list[dict]:
     return attachments
 
 
+def normalize_attachment_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "")).strip().lower()
+
+
+def extract_attachment_name(attachment: dict) -> str:
+    name = attachment.get("name") or ""
+    if name:
+        return name
+    url = attachment.get("external", {}).get("url") or ""
+    if not url:
+        return ""
+    params = parse_qs(urlparse(url).query)
+    name = params.get("sg", [""])[0].strip()
+    if name:
+        return name
+    return Path(urlparse(url).path).name
+
+
+def strip_dataview_prefix(filename: str) -> str:
+    if re.match(r"^\d{10}", filename):
+        return filename[10:]
+    return filename
+
+
+def replace_body_image_urls(body_blocks: list[dict], attachments: list[dict]) -> list[dict]:
+    if not body_blocks or not attachments:
+        return body_blocks
+    name_map: dict[str, str] = {}
+    for attachment in attachments:
+        name = extract_attachment_name(attachment)
+        key = normalize_attachment_name(name)
+        url = attachment.get("external", {}).get("url") or ""
+        if key and url and key not in name_map:
+            name_map[key] = url
+    if not name_map:
+        return body_blocks
+    replaced = 0
+    for block in body_blocks:
+        if block.get("type") != "image":
+            continue
+        image = block.get("image", {})
+        if image.get("type") != "external":
+            continue
+        url = image.get("external", {}).get("url") or ""
+        if not url:
+            continue
+        parsed = urlparse(url)
+        if "/dataview/board/" not in parsed.path:
+            continue
+        filename = unquote(Path(parsed.path).name)
+        if not filename:
+            continue
+        normalized = normalize_attachment_name(strip_dataview_prefix(filename))
+        replacement = name_map.get(normalized)
+        if replacement and replacement != url:
+            image["external"]["url"] = replacement
+            replaced += 1
+    if replaced:
+        LOGGER.info("본문 이미지 URL 치환: %s개", replaced)
+    return body_blocks
+
+
 def build_site_headers() -> dict:
     return {"User-Agent": USER_AGENT, "Referer": BASE_URL}
+
+
+def is_image_name_or_url(name: str, url: str) -> bool:
+    if IMAGE_EXT_PATTERN.search(name or ""):
+        return True
+    return bool(IMAGE_EXT_PATTERN.search(url or ""))
+
+
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    truncated = encoded[:max_bytes]
+    while truncated and (truncated[-1] & 0xC0) == 0x80:
+        truncated = truncated[:-1]
+    return truncated.decode("utf-8", errors="ignore")
+
+
+def sanitize_filename(name: str, fallback: str = "file") -> str:
+    cleaned = re.sub(r"[\r\n]+", " ", (name or "")).strip()
+    if not cleaned:
+        return fallback
+    cleaned = cleaned.replace("\"", "'")
+    max_bytes = 900
+    if len(cleaned.encode("utf-8")) <= max_bytes:
+        return cleaned
+    stem, ext = os.path.splitext(cleaned)
+    if ext:
+        ext_bytes = len(ext.encode("utf-8"))
+        trimmed_stem = truncate_utf8(stem, max_bytes - ext_bytes)
+        return f"{trimmed_stem}{ext}" if trimmed_stem else truncate_utf8(cleaned, max_bytes)
+    return truncate_utf8(cleaned, max_bytes)
+
+
+def derive_filename_from_url(url: str, fallback: str = "file") -> str:
+    name = unquote(Path(urlparse(url).path).name)
+    if name:
+        return name
+    return fallback
+
+
+def download_file_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
+    req = urllib.request.Request(url, headers=build_site_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip()
+            data = resp.read()
+            return data, content_type or None
+    except urllib.error.HTTPError as exc:
+        LOGGER.info("파일 다운로드 실패: %s (HTTP %s)", url, exc.code)
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, socket.timeout):
+            LOGGER.info("파일 다운로드 실패: %s (timeout)", url)
+        else:
+            LOGGER.info("파일 다운로드 실패: %s (%s)", url, exc.reason)
+    except socket.timeout:
+        LOGGER.info("파일 다운로드 실패: %s (timeout)", url)
+    return None, None
+
+
+def get_workspace_upload_limit(token: str) -> Optional[int]:
+    global WORKSPACE_UPLOAD_LIMIT
+    if WORKSPACE_UPLOAD_LIMIT is not None:
+        return WORKSPACE_UPLOAD_LIMIT
+    try:
+        data = notion_request("GET", "https://api.notion.com/v1/users/me", token)
+    except NotionRequestError as exc:
+        LOGGER.info("업로드 제한 조회 실패: %s", exc)
+        WORKSPACE_UPLOAD_LIMIT = None
+        return None
+    limit = data.get("bot", {}).get("workspace_limits", {}).get(
+        "max_file_upload_size_in_bytes"
+    )
+    if isinstance(limit, int):
+        WORKSPACE_UPLOAD_LIMIT = limit
+        return limit
+    WORKSPACE_UPLOAD_LIMIT = None
+    return None
+
+
+def encode_multipart_form_data(
+    filename: str,
+    content_type: str,
+    payload: bytes,
+    part_number: Optional[int] = None,
+) -> tuple[bytes, str]:
+    boundary = f"----NotionUpload{uuid.uuid4().hex}"
+    lines: list[bytes] = []
+    if part_number is not None:
+        lines.append(
+            f"--{boundary}\r\n"
+            "Content-Disposition: form-data; name=\"part_number\"\r\n\r\n"
+            f"{part_number}\r\n".encode("utf-8")
+        )
+    safe_name = re.sub(r"[^ -~]", "_", filename)
+    lines.append(
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"file\"; filename=\"{safe_name}\"\r\n"
+        f"Content-Type: {content_type}\r\n\r\n".encode("utf-8")
+    )
+    lines.append(payload)
+    lines.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(lines)
+    return body, f"multipart/form-data; boundary={boundary}"
 
 
 def fetch_site_json(url: str) -> Optional[dict]:
@@ -717,8 +937,19 @@ def normalize_content_url(raw_url: Optional[str]) -> Optional[str]:
     if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
         return None
     if not parsed.scheme:
-        return urljoin(BASE_SITE, raw_url)
-    return raw_url
+        raw_url = urljoin(BASE_SITE, raw_url)
+    return encode_url(raw_url)
+
+
+QUERY_SAFE_CHARS = "/?:@-._~!$&'()*+,;=%"
+
+
+def encode_url(raw_url: str) -> str:
+    parsed = urlsplit(raw_url)
+    path = quote(parsed.path, safe="/%")
+    query = quote(parsed.query, safe=QUERY_SAFE_CHARS)
+    fragment = quote(parsed.fragment, safe=QUERY_SAFE_CHARS)
+    return urlunsplit((parsed.scheme, parsed.netloc, path, query, fragment))
 
 
 def normalize_link_url(raw_url: Optional[str]) -> Optional[str]:
@@ -1905,6 +2136,8 @@ def fetch_detail_metadata_via_playwright(
         if not attachments:
             attachments = extract_attachments_from_detail(page.content())
         body_blocks = extract_body_blocks_from_html(page.content())
+        if attachments and body_blocks:
+            body_blocks = replace_body_image_urls(body_blocks, attachments)
     except PlaywrightTimeoutError:
         LOGGER.info("상세 페이지 로드 실패: %s", detail_url)
     finally:
@@ -1991,6 +2224,8 @@ def fetch_detail_for_row(
     page_blocks = extract_body_blocks_from_html(page.content())
     if page_blocks:
         body_blocks = page_blocks
+    if attachments and body_blocks:
+        body_blocks = replace_body_image_urls(body_blocks, attachments)
     return_to_list_page(page, list_url)
     return written_at, normalized_detail_url, attachments, body_blocks
 
@@ -2013,7 +2248,7 @@ def goto_list_page(page, url: str) -> bool:
     return True
 
 
-def crawl_top_items_api() -> list[dict]:
+def crawl_top_items_api(include_non_top: bool, non_top_max_pages: int) -> list[dict]:
     items: list[dict] = []
     seen: set[str] = set()
     page_number = 1
@@ -2024,21 +2259,26 @@ def crawl_top_items_api() -> list[dict]:
         page_size = 20
 
     while True:
+        if include_non_top and non_top_max_pages > 0 and page_number > non_top_max_pages:
+            LOGGER.info("비TOP 페이지 상한 도달(API): %s", non_top_max_pages)
+            break
         LOGGER.info("페이지 로드 시작(API): %s", page_number)
         page_entries = fetch_bbs_list(page_number, page_size)
         LOGGER.info("페이지 %s 항목 수(API): %s", page_number, len(page_entries))
         if not page_entries:
             break
 
-        top_entries = [
-            entry for entry in page_entries if str(entry.get("isTop", "")).upper() == "Y"
-        ]
-        has_non_top = any(
-            str(entry.get("isTop", "")).upper() != "Y" for entry in page_entries
-        )
-        new_top = 0
+        if include_non_top:
+            entries_to_process = page_entries
+        else:
+            entries_to_process = [
+                entry
+                for entry in page_entries
+                if str(entry.get("isTop", "")).upper() == "Y"
+            ]
+        new_count = 0
 
-        for entry in top_entries:
+        for entry in entries_to_process:
             pk_id = str(entry.get("pkId") or "").strip()
             if not pk_id:
                 continue
@@ -2056,11 +2296,15 @@ def crawl_top_items_api() -> list[dict]:
             views_raw = detail.get("viewCount", entry.get("viewCount"))
             views = parse_int(str(views_raw)) if views_raw is not None else None
             top = str(entry.get("isTop", "")).upper() == "Y"
+            if not include_non_top and not top:
+                continue
 
             attachments = extract_attachments_from_api_data(detail or entry)
             attachments = cap_attachments(attachments, title)
             content_html = detail.get("content") or ""
             body_blocks = extract_body_blocks_from_html(content_html) if content_html else []
+            if attachments and body_blocks:
+                body_blocks = replace_body_image_urls(body_blocks, attachments)
 
             key = detail_url or f"{title}|{written_at or ''}"
             if key in seen:
@@ -2081,19 +2325,28 @@ def crawl_top_items_api() -> list[dict]:
             if body_blocks:
                 item["body_blocks"] = body_blocks
             items.append(item)
-            new_top += 1
+            new_count += 1
 
-        LOGGER.info("페이지 %s 신규 TOP 수(API): %s", page_number, new_top)
-        if has_non_top:
-            LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단(API)", page_number)
-            break
+        LOGGER.info("페이지 %s 신규 수집 수(API): %s", page_number, new_count)
+        if not include_non_top:
+            has_non_top = any(
+                str(entry.get("isTop", "")).upper() != "Y" for entry in page_entries
+            )
+            if has_non_top:
+                LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단(API)", page_number)
+                break
         page_number += 1
 
     return items
 
 
 def crawl_top_items() -> list[dict]:
-    api_items = crawl_top_items_api()
+    include_non_top = should_include_non_top()
+    non_top_max_pages = get_non_top_max_pages()
+    if include_non_top:
+        limit_label = "제한없음" if non_top_max_pages <= 0 else str(non_top_max_pages)
+        LOGGER.info("비TOP 포함 모드: 최대 페이지=%s", limit_label)
+    api_items = crawl_top_items_api(include_non_top, non_top_max_pages)
     if api_items:
         return api_items
 
@@ -2101,7 +2354,7 @@ def crawl_top_items() -> list[dict]:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
     except ImportError as exc:
         LOGGER.info("Playwright 미설치: HTTP 모드로 전환")
-        return crawl_top_items_http()
+        return crawl_top_items_http(include_non_top, non_top_max_pages)
 
     items = []
     seen = set()
@@ -2116,7 +2369,7 @@ def crawl_top_items() -> list[dict]:
             browser = launcher.launch(headless=headless)
         except Exception as exc:
             LOGGER.info("Playwright 브라우저 실행 실패: %s (HTTP 모드로 전환)", exc)
-            return crawl_top_items_http()
+            return crawl_top_items_http(include_non_top, non_top_max_pages)
         try:
             context = browser.new_context(
                 user_agent=user_agent,
@@ -2127,6 +2380,9 @@ def crawl_top_items() -> list[dict]:
             page_number = 1
             fallback_to_http = False
             while True:
+                if include_non_top and non_top_max_pages > 0 and page_number > non_top_max_pages:
+                    LOGGER.info("비TOP 페이지 상한 도달: %s", non_top_max_pages)
+                    break
                 url = build_list_url(page_number)
                 LOGGER.info("페이지 로드 시작: %s", url)
                 if not goto_list_page(page, url):
@@ -2141,10 +2397,12 @@ def crawl_top_items() -> list[dict]:
                 if not page_items:
                     break
 
-                top_items = [item for item in page_items if item.get("top")]
-                has_non_top = any(not item.get("top") for item in page_items)
-                new_top = 0
-                for item in top_items:
+                if include_non_top:
+                    items_to_process = page_items
+                else:
+                    items_to_process = [item for item in page_items if item.get("top")]
+                new_count = 0
+                for item in items_to_process:
                     written_at, detail_url, attachments, body_blocks = fetch_detail_for_row(
                         page,
                         url,
@@ -2174,27 +2432,32 @@ def crawl_top_items() -> list[dict]:
                         continue
                     seen.add(key)
                     items.append(item)
-                    new_top += 1
+                    new_count += 1
 
-                LOGGER.info("페이지 %s 신규 TOP 수: %s", page_number, new_top)
-                if has_non_top:
-                    LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단", page_number)
-                    break
+                LOGGER.info("페이지 %s 신규 수집 수: %s", page_number, new_count)
+                if not include_non_top:
+                    has_non_top = any(not item.get("top") for item in page_items)
+                    if has_non_top:
+                        LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단", page_number)
+                        break
                 page_number += 1
         finally:
             browser.close()
 
     if fallback_to_http:
-        return crawl_top_items_http()
+        return crawl_top_items_http(include_non_top, non_top_max_pages)
     return items
 
 
-def crawl_top_items_http() -> list[dict]:
+def crawl_top_items_http(include_non_top: bool, non_top_max_pages: int) -> list[dict]:
     items = []
     seen = set()
     page_number = 1
 
     while True:
+        if include_non_top and non_top_max_pages > 0 and page_number > non_top_max_pages:
+            LOGGER.info("비TOP 페이지 상한 도달(HTTP): %s", non_top_max_pages)
+            break
         url = build_list_url(page_number)
         LOGGER.info("페이지 로드 시작(HTTP): %s", url)
         html_text = fetch_html(url)
@@ -2206,10 +2469,12 @@ def crawl_top_items_http() -> list[dict]:
         if not page_items:
             break
 
-        top_items = [item for item in page_items if item.get("top")]
-        has_non_top = any(not item.get("top") for item in page_items)
-        new_top = 0
-        for item in top_items:
+        if include_non_top:
+            items_to_process = page_items
+        else:
+            items_to_process = [item for item in page_items if item.get("top")]
+        new_count = 0
+        for item in items_to_process:
             if item.get("url"):
                 written_at, attachments, body_blocks, _signals = fetch_detail_metadata_from_url(
                     item["url"]
@@ -2227,12 +2492,14 @@ def crawl_top_items_http() -> list[dict]:
                 continue
             seen.add(key)
             items.append(item)
-            new_top += 1
+            new_count += 1
 
-        LOGGER.info("페이지 %s 신규 TOP 수(HTTP): %s", page_number, new_top)
-        if has_non_top:
-            LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단(HTTP)", page_number)
-            break
+        LOGGER.info("페이지 %s 신규 수집 수(HTTP): %s", page_number, new_count)
+        if not include_non_top:
+            has_non_top = any(not item.get("top") for item in page_items)
+            if has_non_top:
+                LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단(HTTP)", page_number)
+                break
         page_number += 1
 
     return items
@@ -2253,7 +2520,7 @@ def notion_request(
     for attempt in range(max_retries + 1):
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Authorization", f"Bearer {token}")
-        req.add_header("Notion-Version", NOTION_API_VERSION)
+        req.add_header("Notion-Version", get_notion_api_version())
         req.add_header("Content-Type", "application/json")
 
         try:
@@ -2317,6 +2584,171 @@ def notion_request(
                 f"Notion API error: {exc.reason}",
                 reason=str(exc.reason),
             ) from exc
+
+
+def create_file_upload(
+    token: str,
+    filename: str,
+    content_type: str,
+    mode: str = "single_part",
+) -> Optional[dict]:
+    payload = {"mode": mode, "filename": filename, "content_type": content_type}
+    try:
+        return notion_request("POST", "https://api.notion.com/v1/file_uploads", token, payload)
+    except NotionRequestError as exc:
+        LOGGER.info("파일 업로드 생성 실패: %s (%s)", filename, exc)
+        return None
+
+
+def send_file_upload(
+    token: str,
+    upload_url: str,
+    filename: str,
+    content_type: str,
+    payload: bytes,
+    part_number: Optional[int] = None,
+) -> Optional[dict]:
+    body, content_header = encode_multipart_form_data(
+        filename, content_type, payload, part_number=part_number
+    )
+    req = urllib.request.Request(upload_url, data=body, method="POST")
+    req.add_header("Content-Type", content_header)
+    req.add_header("Content-Length", str(len(body)))
+    if "api.notion.com" in upload_url:
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Notion-Version", get_notion_api_version())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace")
+        LOGGER.info("파일 업로드 전송 실패: HTTP %s (%s)", exc.code, body_text)
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, socket.timeout):
+            LOGGER.info("파일 업로드 전송 실패: timeout")
+        else:
+            LOGGER.info("파일 업로드 전송 실패: %s", exc.reason)
+    except socket.timeout:
+        LOGGER.info("파일 업로드 전송 실패: timeout")
+    return None
+
+
+def upload_external_file_to_notion(
+    token: str,
+    url: str,
+    filename_hint: Optional[str] = None,
+    expect_image: bool = True,
+) -> Optional[str]:
+    if not url:
+        return None
+    cached = FILE_UPLOAD_CACHE.get(url)
+    if cached:
+        return cached
+
+    payload, content_type = download_file_bytes(url)
+    if not payload:
+        return None
+    content_type = content_type or mimetypes.guess_type(url)[0] or "application/octet-stream"
+    if expect_image and not content_type.lower().startswith("image/"):
+        LOGGER.info("이미지 업로드 스킵: content_type=%s (%s)", content_type, url)
+        return None
+    file_size = len(payload)
+    max_bytes = get_workspace_upload_limit(token)
+    if max_bytes and file_size > max_bytes:
+        LOGGER.info("업로드 용량 초과: %s bytes (limit=%s)", file_size, max_bytes)
+        return None
+    if file_size > 20 * 1024 * 1024:
+        LOGGER.info("업로드 스킵(멀티파트 필요): %s bytes", file_size)
+        return None
+
+    filename = sanitize_filename(
+        filename_hint or derive_filename_from_url(url, fallback="image")
+    )
+    if "." not in filename:
+        ext = mimetypes.guess_extension(content_type) or ""
+        if ext:
+            filename = f"{filename}{ext}"
+
+    created = create_file_upload(token, filename, content_type)
+    if not created:
+        return None
+    upload_id = created.get("id")
+    upload_url = created.get("upload_url")
+    if isinstance(upload_url, str):
+        upload_url = upload_url.strip("`")
+    upload_url = upload_url or (
+        f"https://api.notion.com/v1/file_uploads/{upload_id}/send"
+        if upload_id
+        else None
+    )
+    if not upload_id or not upload_url:
+        LOGGER.info("파일 업로드 응답 누락: id=%s url=%s", upload_id, upload_url)
+        return None
+    sent = send_file_upload(
+        token, upload_url, filename, content_type, payload, part_number=None
+    )
+    if not sent or sent.get("status") != "uploaded":
+        LOGGER.info(
+            "파일 업로드 상태 이상: %s (%s)", url, sent.get("status") if sent else "no_response"
+        )
+        return None
+    FILE_UPLOAD_CACHE[url] = upload_id
+    return upload_id
+
+
+def prepare_attachments_for_sync(token: str, attachments: list[dict]) -> list[dict]:
+    if not attachments or not should_upload_files_to_notion():
+        return attachments
+    updated: list[dict] = []
+    for attachment in attachments:
+        if attachment.get("type") != "external":
+            updated.append(attachment)
+            continue
+        url = attachment.get("external", {}).get("url") or ""
+        name = attachment.get("name") or extract_attachment_name(attachment)
+        if not is_image_name_or_url(name, url):
+            updated.append(attachment)
+            continue
+        upload_id = upload_external_file_to_notion(token, url, name, expect_image=True)
+        if upload_id:
+            updated.append(
+                {"name": name, "type": "file_upload", "file_upload": {"id": upload_id}}
+            )
+        else:
+            updated.append(attachment)
+    return updated
+
+
+def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> list[dict]:
+    if not blocks or not should_upload_files_to_notion():
+        return blocks
+    updated: list[dict] = []
+    for block in blocks:
+        if block.get("type") != "image":
+            updated.append(block)
+            continue
+        image = block.get("image", {})
+        if image.get("type") != "external":
+            updated.append(block)
+            continue
+        url = image.get("external", {}).get("url") or ""
+        if not url:
+            updated.append(block)
+            continue
+        filename = derive_filename_from_url(url, fallback="image")
+        upload_id = upload_external_file_to_notion(token, url, filename, expect_image=True)
+        if not upload_id:
+            updated.append(block)
+            continue
+        new_block = {
+            "object": "block",
+            "type": "image",
+            "image": {"type": "file_upload", "file_upload": {"id": upload_id}},
+        }
+        if image.get("caption"):
+            new_block["image"]["caption"] = image["caption"]
+        updated.append(new_block)
+    return updated
 
 
 def fetch_html(url: str) -> Optional[str]:
@@ -2397,6 +2829,8 @@ def fetch_detail_metadata_from_url(
     written_at = extract_written_at_from_detail(html_text)
     attachments = extract_attachments_from_detail(html_text)
     body_blocks = extract_body_blocks_from_html(html_text)
+    if attachments and body_blocks:
+        body_blocks = replace_body_image_urls(body_blocks, attachments)
     return written_at, attachments, body_blocks, signals
 
 
@@ -2514,6 +2948,7 @@ def log_environment_info() -> None:
     headless_raw = os.environ.get("HEADLESS", "1").strip().lower()
     headless = headless_raw not in {"0", "false", "no", "off"}
     sync_mode = get_sync_mode()
+    upload_files = should_upload_files_to_notion()
     LOGGER.info(
         "환경: Python=%s, Playwright=%s",
         python_version,
@@ -2525,6 +2960,11 @@ def log_environment_info() -> None:
         "1" if headless else "0",
         get_bbs_config_fk(),
         sync_mode,
+    )
+    LOGGER.info(
+        "환경: NOTION_VERSION=%s, NOTION_UPLOAD_FILES=%s",
+        get_notion_api_version(),
+        "1" if upload_files else "0",
     )
 
 
@@ -3036,6 +3476,7 @@ def main() -> None:
         database, BODY_HASH_PROPERTY, "rich_text"
     )
     sync_mode = get_sync_mode()
+    upload_files = should_upload_files_to_notion()
 
     created = 0
     updated = 0
@@ -3043,15 +3484,22 @@ def main() -> None:
     current_top_urls: set[str] = set()
     current_top_dates: dict[str, set[str]] = {}
     for item in items:
+        is_top = bool(item.get("top"))
         if item.get("url"):
             normalized_url = normalize_detail_url(item["url"])
             if normalized_url:
                 item["url"] = normalized_url
-                current_top_urls.add(normalized_url)
+                if is_top:
+                    current_top_urls.add(normalized_url)
         label = f"{item['title']} ({item.get('date') or '날짜없음'})"
         date_key = normalize_date_key(item.get("date"))
-        current_top_dates.setdefault(item["title"], set()).add(date_key)
+        if is_top:
+            current_top_dates.setdefault(item["title"], set()).add(date_key)
         LOGGER.info("처리 시작: %s", label)
+        if upload_files and has_attachments_property and item.get("attachments"):
+            item["attachments"] = prepare_attachments_for_sync(
+                notion_token, item["attachments"]
+            )
         properties = build_properties(item, has_views_property, has_attachments_property)
         existing_page = find_existing_page(
             notion_token,
@@ -3079,8 +3527,11 @@ def main() -> None:
             if has_body_hash_property:
                 body_hash = compute_body_hash(body_blocks)
                 if body_hash != existing_hash:
+                    blocks_for_sync = prepare_body_blocks_for_sync(
+                        notion_token, body_blocks
+                    )
                     sync_page_body_blocks(
-                        notion_token, page_id, body_blocks, sync_mode=sync_mode
+                        notion_token, page_id, blocks_for_sync, sync_mode=sync_mode
                     )
                     update_page(
                         notion_token,
@@ -3096,15 +3547,18 @@ def main() -> None:
                 else:
                     LOGGER.info("본문 변경 없음: %s", label)
             else:
+                blocks_for_sync = prepare_body_blocks_for_sync(
+                    notion_token, body_blocks
+                )
                 sync_page_body_blocks(
-                    notion_token, page_id, body_blocks, sync_mode=sync_mode
+                    notion_token, page_id, blocks_for_sync, sync_mode=sync_mode
                 )
 
     LOGGER.info("기존 TOP 정리 시작")
     disabled = disable_missing_top(notion_token, database_id, current_top_urls, current_top_dates)
     LOGGER.info("TOP 해제 수: %s", disabled)
 
-    LOGGER.info("TOP 항목 수: %s", len(items))
+    LOGGER.info("수집 항목 수: %s", len(items))
     LOGGER.info("생성: %s", created)
     LOGGER.info("업데이트: %s", updated)
 
