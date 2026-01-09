@@ -34,7 +34,7 @@ BASE_URL = "https://www.sogang.ac.kr/ko/scholarship-notice"
 ACADEMIC_BASE_URL = "https://www.sogang.ac.kr/ko/academic-support/notices"
 DEFAULT_QUERY = {"introPkId": "All", "option": "TITLE"}
 USER_AGENT = "Mozilla/5.0 (compatible; ScholarshipCrawler/1.0)"
-PAGE_ICON_EMOJI = "🌱"
+PAGE_ICON_EMOJI = "📢"
 TITLE_PROPERTY = "장학공지"
 AUTHOR_PROPERTY = "작성자"
 DATE_PROPERTY = "작성일"
@@ -965,6 +965,8 @@ def build_rich_text_from_segments(segments: list[dict]) -> list[dict]:
             continue
         annotations = segment.get("annotations", DEFAULT_ANNOTATIONS)
         link = segment.get("link")
+        if link and not is_valid_notion_url(link, allow_mailto=True):
+            link = None
         remaining = text
         while remaining:
             chunk = remaining[:2000]
@@ -1043,6 +1045,34 @@ def encode_url(raw_url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, query, fragment))
 
 
+def is_valid_notion_url(url: Optional[str], allow_mailto: bool = True) -> bool:
+    if not url or any(ch.isspace() for ch in url):
+        return False
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme in {"http", "https"}:
+        return bool(parsed.netloc)
+    if allow_mailto and scheme in {"mailto", "tel"}:
+        return bool(parsed.path)
+    return False
+
+
+def resolve_iframe_embed_url(raw_url: Optional[str]) -> Optional[str]:
+    normalized = normalize_content_url(raw_url)
+    if not normalized:
+        return None
+    parsed = urlsplit(normalized)
+    qs = parse_qs(parsed.query)
+    file_values = qs.get("file")
+    if file_values:
+        candidate = file_values[0]
+        if candidate:
+            file_url = normalize_content_url(candidate)
+            if file_url:
+                return file_url
+    return normalized
+
+
 def normalize_link_url(raw_url: Optional[str]) -> Optional[str]:
     if not raw_url:
         return None
@@ -1069,6 +1099,8 @@ def split_text_with_links(text: str) -> list[tuple[str, Optional[str]]]:
             link = trimmed
             if link.lower().startswith("www."):
                 link = "https://" + link
+            normalized = normalize_content_url(link)
+            link = normalized if normalized else None
             parts.append((trimmed, link))
         if suffix:
             parts.append((suffix, None))
@@ -1083,6 +1115,14 @@ def build_image_block(url: str) -> dict:
         "object": "block",
         "type": "image",
         "image": {"type": "external", "external": {"url": url}},
+    }
+
+
+def build_embed_block(url: str) -> dict:
+    return {
+        "object": "block",
+        "type": "embed",
+        "embed": {"url": url},
     }
 
 
@@ -1179,6 +1219,7 @@ class TiptapBlockParser(HTMLParser):
             "col",
             "embed",
             "hr",
+            "iframe",
             "img",
             "input",
             "link",
@@ -1244,7 +1285,7 @@ class TiptapBlockParser(HTMLParser):
                 if self.in_table_cell and self.table_cell_segments:
                     self.append_line_break()
                 return
-            if tag == "img":
+            if tag in {"img", "iframe"}:
                 return
         if tag == "li":
             if not self.in_list_item:
@@ -1267,7 +1308,18 @@ class TiptapBlockParser(HTMLParser):
             self.code_depth += 1
         elif tag == "a":
             href = attrs_dict.get("href") or ""
-            self.link_stack.append(normalize_link_url(href))
+            link = normalize_link_url(href)
+            if link and not is_valid_notion_url(link, allow_mailto=True):
+                link = None
+            self.link_stack.append(link)
+        elif tag == "iframe":
+            if self.in_table:
+                return
+            src = attrs_dict.get("src") or ""
+            url = resolve_iframe_embed_url(src)
+            if url and is_valid_notion_url(url, allow_mailto=False):
+                self.flush_block()
+                self.blocks.append(build_embed_block(url))
         elif tag == "img":
             src = attrs_dict.get("src") or ""
             url = normalize_content_url(src)
@@ -1321,39 +1373,49 @@ class TiptapBlockParser(HTMLParser):
         elif tag == "a":
             if self.link_stack:
                 self.link_stack.pop()
-        self.tiptap_depth -= 1
-        if self.tiptap_depth <= 0:
-            self.flush_block()
-            self.in_tiptap = False
-            self.tiptap_depth = 0
-            self.in_list_item = False
-            self.current_block_type = None
-            self.bold_depth = 0
-            self.italic_depth = 0
-            self.underline_depth = 0
-            self.strike_depth = 0
-            self.code_depth = 0
-            self.link_stack.clear()
-            self.color_stack = ["default"]
-            self.color_push_stack = []
-            self.in_table = False
-            self.table_depth = 0
-            self.in_table_row = False
-            self.in_table_cell = False
-            self.table_rows = []
-            self.table_cells = []
-            self.table_cell_segments = []
-            self.table_cell_is_header = False
-            self.table_row_index = -1
-            self.table_cell_index = 0
-            self.table_has_column_header = False
-            self.table_has_row_header = False
+        if tag not in self.void_tags:
+            self.tiptap_depth -= 1
+            if self.tiptap_depth <= 0:
+                self.flush_block()
+                self.in_tiptap = False
+                self.tiptap_depth = 0
+                self.in_list_item = False
+                self.current_block_type = None
+                self.bold_depth = 0
+                self.italic_depth = 0
+                self.underline_depth = 0
+                self.strike_depth = 0
+                self.code_depth = 0
+                self.link_stack.clear()
+                self.color_stack = ["default"]
+                self.color_push_stack = []
+                self.in_table = False
+                self.table_depth = 0
+                self.in_table_row = False
+                self.in_table_cell = False
+                self.table_rows = []
+                self.table_cells = []
+                self.table_cell_segments = []
+                self.table_cell_is_header = False
+                self.table_row_index = -1
+                self.table_cell_index = 0
+                self.table_has_column_header = False
+                self.table_has_row_header = False
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         if not self.in_tiptap:
             return
         if tag == "br":
             self.append_line_break()
+        elif tag == "iframe":
+            if self.in_table:
+                return
+            attrs_dict = {key: value or "" for key, value in attrs}
+            src = attrs_dict.get("src") or ""
+            url = resolve_iframe_embed_url(src)
+            if url and is_valid_notion_url(url, allow_mailto=False):
+                self.flush_block()
+                self.blocks.append(build_embed_block(url))
         elif tag == "img":
             if self.in_table:
                 return
@@ -1528,6 +1590,7 @@ class BodyContentDetector(HTMLParser):
             "col",
             "embed",
             "hr",
+            "iframe",
             "img",
             "input",
             "link",
@@ -1548,7 +1611,7 @@ class BodyContentDetector(HTMLParser):
                 return
         if not self.in_container:
             return
-        if tag in {"img", "a"}:
+        if tag in {"img", "a", "iframe"}:
             self.has_content = True
         if tag not in self.void_tags:
             self.depth += 1
@@ -1565,7 +1628,7 @@ class BodyContentDetector(HTMLParser):
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         if not self.in_container:
             return
-        if tag == "img":
+        if tag in {"img", "iframe"}:
             self.has_content = True
 
     def handle_data(self, data: str) -> None:
