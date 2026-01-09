@@ -31,6 +31,7 @@ from urllib.parse import (
 
 DEFAULT_NOTION_API_VERSION = "2022-06-28"
 BASE_URL = "https://www.sogang.ac.kr/ko/scholarship-notice"
+ACADEMIC_BASE_URL = "https://www.sogang.ac.kr/ko/academic-support/notices"
 DEFAULT_QUERY = {"introPkId": "All", "option": "TITLE"}
 USER_AGENT = "Mozilla/5.0 (compatible; ScholarshipCrawler/1.0)"
 PAGE_ICON_EMOJI = "🌱"
@@ -42,6 +43,7 @@ URL_PROPERTY = "URL"
 VIEWS_PROPERTY = "조회수"
 ATTACHMENT_PROPERTY = "첨부파일"
 TYPE_PROPERTY = "유형"
+CLASSIFICATION_PROPERTY = "분류"
 BODY_HASH_PROPERTY = "본문 해시"
 BODY_HASH_IMAGE_MODE_UPLOAD = "upload-files-v1"
 SYNC_CONTAINER_MARKER = "[SYNC_CONTAINER]"
@@ -117,6 +119,8 @@ TYPE_TAGS = (
     "주거지원",
 )
 FALLBACK_TYPE = "공통"
+DEFAULT_CONFIG_CLASSIFICATIONS = {"141": "장학공지", "2": "학사공지"}
+DEFAULT_CONFIG_LIST_URLS = {"141": BASE_URL, "2": ACADEMIC_BASE_URL}
 
 FILE_UPLOAD_CACHE: dict[str, str] = {}
 WORKSPACE_UPLOAD_LIMIT: Optional[int] = None
@@ -745,11 +749,16 @@ def fetch_site_json(url: str) -> Optional[dict]:
     return None
 
 
-def fetch_bbs_list(page_num: int, page_size: int = 20) -> list[dict]:
+def fetch_bbs_list(
+    page_num: int,
+    page_size: int = 20,
+    config_fk: Optional[str] = None,
+) -> list[dict]:
+    config_fk = (config_fk or get_bbs_config_fk()).strip()
     params = {
         "pageNum": str(page_num),
         "pageSize": str(page_size),
-        "bbsConfigFks": get_bbs_config_fk(),
+        "bbsConfigFks": config_fk,
         "title": "",
         "content": "",
         "username": "",
@@ -762,8 +771,12 @@ def fetch_bbs_list(page_num: int, page_size: int = 20) -> list[dict]:
     return data.get("data", {}).get("list", []) or []
 
 
-def fetch_bbs_detail(pk_id: str) -> Optional[dict]:
-    url = f"{BBS_API_BASE}?pkId={pk_id}"
+def fetch_bbs_detail(pk_id: str, config_fk: Optional[str] = None) -> Optional[dict]:
+    config_fk = (config_fk or get_bbs_config_fk()).strip()
+    params = {"pkId": pk_id}
+    if config_fk:
+        params["bbsConfigFk"] = config_fk
+    url = f"{BBS_API_BASE}?{urlencode(params)}"
     data = fetch_site_json(url)
     if not data:
         return None
@@ -1077,7 +1090,7 @@ def build_space_rich_text() -> list[dict]:
     return [
         {
             "type": "text",
-            "text": {"content": " \u00a0"},
+            "text": {"content": "\u00a0"},
             "annotations": dict(DEFAULT_ANNOTATIONS),
         }
     ]
@@ -1589,12 +1602,71 @@ def is_detail_path_url(url: str) -> bool:
     return bool(DETAIL_PATH_PATTERN.search(path))
 
 
+def parse_config_map(raw: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    if not raw:
+        return mapping
+    for chunk in re.split(r"[;,]+", raw):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" in chunk:
+            key, value = chunk.split(":", 1)
+        elif "=" in chunk:
+            key, value = chunk.split("=", 1)
+        else:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            mapping[key] = value
+    return mapping
+
+
 def get_bbs_config_fk() -> str:
-    return os.environ.get("BBS_CONFIG_FK", "141")
+    return os.environ.get("BBS_CONFIG_FK", "141").strip()
 
 
-def build_detail_url(detail_id: str) -> str:
-    return f"{BASE_SITE}/ko/detail/{detail_id}?bbsConfigFk={get_bbs_config_fk()}"
+def get_bbs_config_fks() -> list[str]:
+    raw = os.environ.get("BBS_CONFIG_FKS", "").strip()
+    if raw:
+        parts = re.split(r"[,\\s]+", raw)
+        return [part for part in parts if part]
+    single = get_bbs_config_fk().strip()
+    return [single] if single else []
+
+
+def get_config_classification_map() -> dict[str, str]:
+    mapping = dict(DEFAULT_CONFIG_CLASSIFICATIONS)
+    raw = os.environ.get("BBS_CONFIG_CLASSIFY", "").strip()
+    if raw:
+        mapping.update(parse_config_map(raw))
+    return mapping
+
+
+def get_classification_for_config(config_fk: str) -> Optional[str]:
+    key = str(config_fk or "").strip()
+    if not key:
+        return None
+    return get_config_classification_map().get(key)
+
+
+def get_config_list_url_map() -> dict[str, str]:
+    mapping = dict(DEFAULT_CONFIG_LIST_URLS)
+    raw = os.environ.get("BBS_CONFIG_LIST_URLS", "").strip()
+    if raw:
+        mapping.update(parse_config_map(raw))
+    return mapping
+
+
+def get_list_base_url(config_fk: str) -> str:
+    key = str(config_fk or "").strip()
+    return get_config_list_url_map().get(key, BASE_URL)
+
+
+def build_detail_url(detail_id: str, config_fk: Optional[str] = None) -> str:
+    config_fk = (config_fk or get_bbs_config_fk()).strip()
+    return f"{BASE_SITE}/ko/detail/{detail_id}?bbsConfigFk={config_fk}"
 
 
 def parse_int(value: str) -> Optional[int]:
@@ -1658,7 +1730,7 @@ class TableRowParser(HTMLParser):
             self.current_parts.append(data)
 
 
-def parse_rows(html_text: str) -> list[dict]:
+def parse_rows(html_text: str, config_fk: Optional[str] = None) -> list[dict]:
     parser = TableRowParser()
     parser.feed(html_text)
     parser.close()
@@ -1688,7 +1760,7 @@ def parse_rows(html_text: str) -> list[dict]:
                 break
             detail_id = extract_detail_id_from_text(meta)
             if detail_id:
-                detail_url = normalize_detail_url(build_detail_url(detail_id))
+                detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
                 break
 
         items.append(
@@ -1962,13 +2034,17 @@ def extract_attachments_from_page(page) -> list[dict]:
     return attachments
 
 
-def build_list_url(page: int) -> str:
+def build_list_url(page: int, base_url: Optional[str] = None) -> str:
     query = dict(DEFAULT_QUERY)
     query["page"] = str(page)
-    return f"{BASE_URL}?{urlencode(query)}"
+    base_url = base_url or BASE_URL
+    return f"{base_url}?{urlencode(query)}"
 
 
-def extract_detail_url_from_row_html(row_html: str) -> Optional[str]:
+def extract_detail_url_from_row_html(
+    row_html: str,
+    config_fk: Optional[str] = None,
+) -> Optional[str]:
     for match in re.finditer(r'href="([^"]+)"', row_html):
         href = unescape(match.group(1))
         candidate = normalize_detail_url(href)
@@ -1976,10 +2052,10 @@ def extract_detail_url_from_row_html(row_html: str) -> Optional[str]:
             return candidate
         detail_id = extract_detail_id_from_text(href)
         if detail_id:
-            return normalize_detail_url(build_detail_url(detail_id))
+            return normalize_detail_url(build_detail_url(detail_id, config_fk))
     match = re.search(r"/detail/(\d+)", row_html)
     if match:
-        return normalize_detail_url(build_detail_url(match.group(1)))
+        return normalize_detail_url(build_detail_url(match.group(1), config_fk))
     return None
 
 
@@ -1994,7 +2070,7 @@ def get_browser_launcher(playwright, browser: str):
     raise RuntimeError(f"Unsupported BROWSER: {browser}")
 
 
-def extract_list_rows(page) -> list[dict]:
+def extract_list_rows(page, config_fk: Optional[str] = None) -> list[dict]:
     rows = page.locator(LIST_ROW_SELECTOR)
     count = rows.count()
     items = []
@@ -2032,13 +2108,13 @@ def extract_list_rows(page) -> list[dict]:
                     break
                 detail_id = extract_detail_id_from_text(href)
                 if detail_id:
-                    detail_url = normalize_detail_url(build_detail_url(detail_id))
+                    detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
                     break
         if not detail_url:
             onclick = row.get_attribute("onclick") or ""
             detail_id = extract_detail_id_from_text(onclick)
             if detail_id:
-                detail_url = normalize_detail_url(build_detail_url(detail_id))
+                detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
             else:
                 try:
                     row_html = row.evaluate("row => row.outerHTML")
@@ -2046,7 +2122,7 @@ def extract_list_rows(page) -> list[dict]:
                     row_html = ""
                 detail_id = extract_detail_id_from_text(row_html or "")
                 if detail_id:
-                    detail_url = normalize_detail_url(build_detail_url(detail_id))
+                    detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
         items.append(
             {
                 "title": title,
@@ -2228,6 +2304,7 @@ def fetch_detail_for_row(
     list_url: str,
     row_index: int,
     detail_url: Optional[str],
+    config_fk: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str], list[dict], list[dict]]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -2260,7 +2337,7 @@ def fetch_detail_for_row(
     row.scroll_into_view_if_needed()
     detail_id = extract_detail_id_from_row(row)
     if detail_id:
-        detail_url = normalize_detail_url(build_detail_url(detail_id))
+        detail_url = normalize_detail_url(build_detail_url(detail_id, config_fk))
         written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
             detail_url
         )
@@ -2326,10 +2403,15 @@ def goto_list_page(page, url: str) -> bool:
     return True
 
 
-def crawl_top_items_api(include_non_top: bool, non_top_max_pages: int) -> list[dict]:
+def crawl_top_items_api(
+    config_fk: str,
+    include_non_top: bool,
+    non_top_max_pages: int,
+) -> list[dict]:
     items: list[dict] = []
     seen: set[str] = set()
     page_number = 1
+    classification = get_classification_for_config(config_fk)
     page_size_raw = os.environ.get("BBS_PAGE_SIZE", "20")
     try:
         page_size = max(1, int(page_size_raw))
@@ -2341,7 +2423,7 @@ def crawl_top_items_api(include_non_top: bool, non_top_max_pages: int) -> list[d
             LOGGER.info("비TOP 페이지 상한 도달(API): %s", non_top_max_pages)
             break
         LOGGER.info("페이지 로드 시작(API): %s", page_number)
-        page_entries = fetch_bbs_list(page_number, page_size)
+        page_entries = fetch_bbs_list(page_number, page_size, config_fk=config_fk)
         LOGGER.info("페이지 %s 항목 수(API): %s", page_number, len(page_entries))
         if not page_entries:
             break
@@ -2360,8 +2442,10 @@ def crawl_top_items_api(include_non_top: bool, non_top_max_pages: int) -> list[d
             pk_id = str(entry.get("pkId") or "").strip()
             if not pk_id:
                 continue
-            detail_url = normalize_detail_url(build_detail_url(pk_id)) or build_detail_url(pk_id)
-            detail = fetch_bbs_detail(pk_id)
+            detail_url = normalize_detail_url(
+                build_detail_url(pk_id, config_fk)
+            ) or build_detail_url(pk_id, config_fk)
+            detail = fetch_bbs_detail(pk_id, config_fk=config_fk)
             if detail is None:
                 LOGGER.info("상세 API 로드 실패: %s", pk_id)
                 detail = {}
@@ -2391,6 +2475,8 @@ def crawl_top_items_api(include_non_top: bool, non_top_max_pages: int) -> list[d
             }
             if body_blocks:
                 item["body_blocks"] = body_blocks
+            if classification:
+                item["classification"] = classification
             ensure_item_title(item, body_blocks, detail_url)
             if attachments:
                 attachments = cap_attachments(attachments, item["title"])
@@ -2417,21 +2503,18 @@ def crawl_top_items_api(include_non_top: bool, non_top_max_pages: int) -> list[d
     return items
 
 
-def crawl_top_items() -> list[dict]:
-    include_non_top = should_include_non_top()
-    non_top_max_pages = get_non_top_max_pages()
-    if include_non_top:
-        limit_label = "제한없음" if non_top_max_pages <= 0 else str(non_top_max_pages)
-        LOGGER.info("비TOP 포함 모드: 최대 페이지=%s", limit_label)
-    api_items = crawl_top_items_api(include_non_top, non_top_max_pages)
-    if api_items:
-        return api_items
-
+def crawl_top_items_playwright(
+    config_fk: str,
+    include_non_top: bool,
+    non_top_max_pages: int,
+) -> list[dict]:
+    base_url = get_list_base_url(config_fk)
+    classification = get_classification_for_config(config_fk)
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    except ImportError as exc:
+    except ImportError:
         LOGGER.info("Playwright 미설치: HTTP 모드로 전환")
-        return crawl_top_items_http(include_non_top, non_top_max_pages)
+        return crawl_top_items_http(config_fk, include_non_top, non_top_max_pages)
 
     items = []
     seen = set()
@@ -2439,6 +2522,7 @@ def crawl_top_items() -> list[dict]:
     headless_raw = os.environ.get("HEADLESS", "1").strip().lower()
     headless = headless_raw not in {"0", "false", "no", "off"}
     user_agent = os.environ.get("USER_AGENT", USER_AGENT)
+    fallback_to_http = False
 
     with sync_playwright() as playwright:
         try:
@@ -2446,7 +2530,7 @@ def crawl_top_items() -> list[dict]:
             browser = launcher.launch(headless=headless)
         except Exception as exc:
             LOGGER.info("Playwright 브라우저 실행 실패: %s (HTTP 모드로 전환)", exc)
-            return crawl_top_items_http(include_non_top, non_top_max_pages)
+            return crawl_top_items_http(config_fk, include_non_top, non_top_max_pages)
         try:
             context = browser.new_context(
                 user_agent=user_agent,
@@ -2455,12 +2539,11 @@ def crawl_top_items() -> list[dict]:
             page = context.new_page()
 
             page_number = 1
-            fallback_to_http = False
             while True:
                 if include_non_top and non_top_max_pages > 0 and page_number > non_top_max_pages:
                     LOGGER.info("비TOP 페이지 상한 도달: %s", non_top_max_pages)
                     break
-                url = build_list_url(page_number)
+                url = build_list_url(page_number, base_url)
                 LOGGER.info("페이지 로드 시작: %s", url)
                 if not goto_list_page(page, url):
                     LOGGER.info("페이지 %s 로드 실패", page_number)
@@ -2469,7 +2552,7 @@ def crawl_top_items() -> list[dict]:
                         fallback_to_http = True
                     break
 
-                page_items = extract_list_rows(page)
+                page_items = extract_list_rows(page, config_fk)
                 LOGGER.info("페이지 %s 항목 수: %s", page_number, len(page_items))
                 if not page_items:
                     break
@@ -2487,6 +2570,7 @@ def crawl_top_items() -> list[dict]:
                         url,
                         item["row_index"],
                         item.get("detail_url"),
+                        config_fk,
                     )
                     if written_at:
                         item["date"] = written_at
@@ -2494,6 +2578,8 @@ def crawl_top_items() -> list[dict]:
                         item["url"] = normalize_detail_url(detail_url)
                     if body_blocks:
                         item["body_blocks"] = body_blocks
+                    if classification:
+                        item["classification"] = classification
                     ensure_item_title(item, body_blocks, detail_url or item.get("url"))
                     if not detail_url:
                         LOGGER.info("상세 URL 미확보: %s", item["title"])
@@ -2525,26 +2611,66 @@ def crawl_top_items() -> list[dict]:
             browser.close()
 
     if fallback_to_http:
-        return crawl_top_items_http(include_non_top, non_top_max_pages)
+        return crawl_top_items_http(config_fk, include_non_top, non_top_max_pages)
     return items
 
 
-def crawl_top_items_http(include_non_top: bool, non_top_max_pages: int) -> list[dict]:
+def crawl_top_items() -> list[dict]:
+    include_non_top = should_include_non_top()
+    non_top_max_pages = get_non_top_max_pages()
+    if include_non_top:
+        limit_label = "제한없음" if non_top_max_pages <= 0 else str(non_top_max_pages)
+        LOGGER.info("비TOP 포함 모드: 최대 페이지=%s", limit_label)
+
+    config_fks = get_bbs_config_fks()
+    if not config_fks:
+        return []
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    for config_fk in config_fks:
+        classification = get_classification_for_config(config_fk)
+        LOGGER.info(
+            "수집 설정: bbsConfigFk=%s, 분류=%s",
+            config_fk,
+            classification or "없음",
+        )
+        config_items = crawl_top_items_api(config_fk, include_non_top, non_top_max_pages)
+        if not config_items:
+            config_items = crawl_top_items_playwright(
+                config_fk, include_non_top, non_top_max_pages
+            )
+        for item in config_items:
+            key = item.get("url") or f"{item.get('title','')}|{item.get('date') or ''}"
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+    return items
+
+
+def crawl_top_items_http(
+    config_fk: str,
+    include_non_top: bool,
+    non_top_max_pages: int,
+) -> list[dict]:
     items = []
     seen = set()
     page_number = 1
+    base_url = get_list_base_url(config_fk)
+    classification = get_classification_for_config(config_fk)
 
     while True:
         if include_non_top and non_top_max_pages > 0 and page_number > non_top_max_pages:
             LOGGER.info("비TOP 페이지 상한 도달(HTTP): %s", non_top_max_pages)
             break
-        url = build_list_url(page_number)
+        url = build_list_url(page_number, base_url)
         LOGGER.info("페이지 로드 시작(HTTP): %s", url)
         html_text = fetch_html(url)
         if not html_text:
             LOGGER.info("페이지 %s 로드 실패(HTTP)", page_number)
             break
-        page_items = parse_rows(html_text)
+        page_items = parse_rows(html_text, config_fk)
         LOGGER.info("페이지 %s 항목 수(HTTP): %s", page_number, len(page_items))
         if not page_items:
             break
@@ -2565,6 +2691,8 @@ def crawl_top_items_http(include_non_top: bool, non_top_max_pages: int) -> list[
                     item["date"] = written_at
                 if body_blocks:
                     item["body_blocks"] = body_blocks
+            if classification:
+                item["classification"] = classification
             ensure_item_title(item, body_blocks, item.get("url"))
             if attachments:
                 attachments = cap_attachments(attachments, item["title"])
@@ -3005,10 +3133,20 @@ def validate_required_properties(database: dict) -> None:
 
 
 def extract_type_from_title(title: str) -> str:
+    def normalize_type_label(raw: str) -> str:
+        cleaned = (raw or "").strip()
+        if not cleaned:
+            return ""
+        cleaned = cleaned.replace(",", "/")
+        cleaned = re.sub(r"\s*/\s*", "/", cleaned)
+        cleaned = re.sub(r"/{2,}", "/", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
     match = re.match(r"\s*\[([^\]]+)\]", title)
     if match:
-        label = match.group(1).strip()
-        if label in TYPE_TAGS:
+        label = normalize_type_label(match.group(1))
+        if label:
             return label
     return FALLBACK_TYPE
 
@@ -3046,13 +3184,21 @@ def log_environment_info() -> None:
         python_version,
         "설치됨" if playwright_installed else "미설치",
     )
+    config_fks = get_bbs_config_fks()
+    config_label = ",".join(config_fks) if config_fks else "없음"
+    class_map = get_config_classification_map()
+    class_label = ", ".join(
+        f"{key}:{value}" for key, value in class_map.items() if key in config_fks
+    )
     LOGGER.info(
-        "환경: BROWSER=%s, HEADLESS=%s, bbsConfigFk=%s, SYNC_MODE=%s",
+        "환경: BROWSER=%s, HEADLESS=%s, BBS_CONFIG_FKS=%s, SYNC_MODE=%s",
         browser,
         "1" if headless else "0",
-        get_bbs_config_fk(),
+        config_label,
         sync_mode,
     )
+    if class_label:
+        LOGGER.info("환경: BBS_CONFIG_CLASSIFY=%s", class_label)
     LOGGER.info(
         "환경: NOTION_VERSION=%s, NOTION_UPLOAD_FILES=%s",
         get_notion_api_version(),
@@ -3435,6 +3581,7 @@ def build_properties(
     item: dict,
     has_views_property: bool,
     has_attachments_property: bool,
+    has_classification_property: bool,
 ) -> dict:
     title_text = {"content": item["title"]}
     if item.get("url"):
@@ -3454,6 +3601,10 @@ def build_properties(
         props[ATTACHMENT_PROPERTY] = {"files": item["attachments"]}
     if has_views_property and item.get("views") is not None:
         props[VIEWS_PROPERTY] = {"number": item["views"]}
+    if has_classification_property and item.get("classification"):
+        props[CLASSIFICATION_PROPERTY] = {
+            "select": {"name": item["classification"]}
+        }
     if item.get("url"):
         props[URL_PROPERTY] = {"url": item["url"]}
     return props
@@ -3628,7 +3779,7 @@ def main() -> None:
         if not html_path.exists():
             raise RuntimeError(f"HTML file not found: {html_path}")
         html_text = html_path.read_text(encoding="utf-8", errors="replace")
-        items = parse_rows(html_text)
+        items = parse_rows(html_text, get_bbs_config_fk())
     else:
         items = crawl_top_items()
 
@@ -3637,13 +3788,19 @@ def main() -> None:
 
     author_values: set[str] = set()
     type_values: set[str] = set()
+    classification_values: set[str] = set()
+    default_classification = get_classification_for_config(get_bbs_config_fk())
     for item in items:
         ensure_item_title(item, item.get("body_blocks", []), item.get("url"))
+        if not item.get("classification") and default_classification:
+            item["classification"] = default_classification
         item["type"] = extract_type_from_title(item["title"])
         if item.get("author"):
             author_values.add(item["author"])
         if item.get("type"):
             type_values.add(item["type"])
+        if item.get("classification"):
+            classification_values.add(item["classification"])
 
     database = fetch_database(notion_token, database_id)
     database = ensure_url_property(notion_token, database_id, database)
@@ -3653,12 +3810,24 @@ def main() -> None:
     validate_required_properties(database)
     author_options = get_select_options(database, AUTHOR_PROPERTY)
     type_options = get_select_options(database, TYPE_PROPERTY)
+    has_classification_property = validate_optional_property_type(
+        database, CLASSIFICATION_PROPERTY, "select"
+    )
     author_options = ensure_select_options_batch(
         notion_token, database_id, AUTHOR_PROPERTY, author_options, author_values
     )
     type_options = ensure_select_options_batch(
         notion_token, database_id, TYPE_PROPERTY, type_options, type_values
     )
+    if has_classification_property and classification_values:
+        classification_options = get_select_options(database, CLASSIFICATION_PROPERTY)
+        classification_options = ensure_select_options_batch(
+            notion_token,
+            database_id,
+            CLASSIFICATION_PROPERTY,
+            classification_options,
+            classification_values,
+        )
     has_views_property = validate_optional_property_type(database, VIEWS_PROPERTY, "number")
     has_attachments_property = validate_optional_property_type(
         database, ATTACHMENT_PROPERTY, "files"
@@ -3691,7 +3860,12 @@ def main() -> None:
             item["attachments"] = prepare_attachments_for_sync(
                 notion_token, item["attachments"]
             )
-        properties = build_properties(item, has_views_property, has_attachments_property)
+        properties = build_properties(
+            item,
+            has_views_property,
+            has_attachments_property,
+            has_classification_property,
+        )
         existing_page = find_existing_page(
             notion_token,
             database_id,
