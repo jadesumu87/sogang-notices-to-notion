@@ -79,6 +79,28 @@ IMAGE_EXT_PATTERN = re.compile(
     r"\.(jpg|jpeg|png|gif|bmp|webp|svg)(?:$|\\?)",
     re.IGNORECASE,
 )
+CONTENT_TYPE_OVERRIDES = {
+    ".pdf": "application/pdf",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".hwp": "application/vnd.hancom.hwp",
+    ".hwpx": "application/vnd.hancom.hwpx",
+    ".zip": "application/zip",
+    ".rar": "application/vnd.rar",
+    ".7z": "application/x-7z-compressed",
+    ".csv": "text/csv",
+    ".txt": "text/plain",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".svg": "image/svg+xml",
+}
 ATTACHMENT_HINTS = (
     "download",
     "filedown",
@@ -237,6 +259,28 @@ def has_image_blocks(blocks: list[dict]) -> bool:
         if block.get("type") == "image":
             return True
     return False
+
+
+def normalize_body_blocks_for_hash(
+    blocks: list[dict], upload_files: bool
+) -> list[dict]:
+    if not blocks:
+        return []
+    normalized: list[dict] = []
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type == "embed":
+            embed = block.get("embed", {})
+            url = embed.get("url") or ""
+            if upload_files and is_embed_file_candidate(url):
+                filename = derive_filename_from_url(url, fallback="file")
+                marker_type = "pdf" if is_pdf_name_or_url(filename, url) else "file"
+                normalized.append({ "type": marker_type, marker_type: {"source_url": url}})
+            else:
+                normalized.append(block)
+            continue
+        normalized.append(block)
+    return normalized
 
 
 def normalize_detail_url(raw_url: Optional[str]) -> Optional[str]:
@@ -568,6 +612,30 @@ def is_image_name_or_url(name: str, url: str) -> bool:
     return bool(IMAGE_EXT_PATTERN.search(url or ""))
 
 
+def is_pdf_name_or_url(name: str, url: str) -> bool:
+    if re.search(r"\.pdf(?:$|\\?)", name or "", re.IGNORECASE):
+        return True
+    return bool(re.search(r"\.pdf(?:$|\\?)", url or "", re.IGNORECASE))
+
+
+def is_embed_file_candidate(url: str) -> bool:
+    if not url:
+        return False
+    if ATTACHMENT_EXT_PATTERN.search(url):
+        return True
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    for key in ("filename", "fileName", "file_name", "sg"):
+        value = params.get(key)
+        if not value:
+            continue
+        candidate = value[0]
+        if candidate and ATTACHMENT_EXT_PATTERN.search(candidate):
+            return True
+    allowed, _ = is_attachment_candidate(url, url, allow_domain_only=True)
+    return allowed
+
+
 def truncate_utf8(text: str, max_bytes: int) -> str:
     if max_bytes <= 0:
         return ""
@@ -597,10 +665,50 @@ def sanitize_filename(name: str, fallback: str = "file") -> str:
 
 
 def derive_filename_from_url(url: str, fallback: str = "file") -> str:
-    name = unquote(Path(urlparse(url).path).name)
+    parsed = urlparse(url)
+    name = unquote(Path(parsed.path).name)
+    params = parse_qs(parsed.query)
+    query_name = ""
+    for key in ("filename", "fileName", "file_name", "sg", "name"):
+        value = params.get(key)
+        if value:
+            candidate = value[0].strip()
+            if candidate:
+                query_name = candidate
+                break
+    if query_name:
+        if not name:
+            return query_name
+        if "." not in name and "." in query_name:
+            return query_name
+        if name.lower() in {"download", "download3", "file"}:
+            return query_name
     if name:
         return name
     return fallback
+
+
+def guess_content_type_from_filename(filename: str) -> Optional[str]:
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in CONTENT_TYPE_OVERRIDES:
+        return CONTENT_TYPE_OVERRIDES[ext]
+    return mimetypes.guess_type(filename)[0]
+
+
+def normalize_content_type(
+    raw_content_type: Optional[str],
+    filename: str,
+    url: str,
+) -> str:
+    cleaned = (raw_content_type or "").split(";", 1)[0].strip().lower()
+    if cleaned and cleaned not in {"application/octet-stream", "binary/octet-stream"}:
+        return cleaned
+    guessed = guess_content_type_from_filename(filename)
+    if not guessed:
+        guessed = mimetypes.guess_type(url)[0]
+    if guessed:
+        return guessed
+    return cleaned or "application/octet-stream"
 
 
 def download_file_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
@@ -959,9 +1067,15 @@ def normalize_inline_text(text: str) -> str:
 
 def build_rich_text_from_segments(segments: list[dict]) -> list[dict]:
     rich_text: list[dict] = []
+    has_content = False
     for segment in segments:
         text = segment.get("text", "")
-        if not text or (text.isspace() and "\u00a0" not in text):
+        if not text:
+            continue
+        is_whitespace_only = text.isspace() and "\u00a0" not in text
+        if is_whitespace_only and "\n" not in text:
+            continue
+        if is_whitespace_only and "\n" in text and not has_content:
             continue
         annotations = segment.get("annotations", DEFAULT_ANNOTATIONS)
         link = segment.get("link")
@@ -981,6 +1095,7 @@ def build_rich_text_from_segments(segments: list[dict]) -> list[dict]:
                     "annotations": annotations,
                 }
             )
+            has_content = True
     return rich_text
 
 
@@ -1123,6 +1238,22 @@ def build_embed_block(url: str) -> dict:
         "object": "block",
         "type": "embed",
         "embed": {"url": url},
+    }
+
+
+def build_file_block(upload_id: str) -> dict:
+    return {
+        "object": "block",
+        "type": "file",
+        "file": {"type": "file_upload", "file_upload": {"id": upload_id}},
+    }
+
+
+def build_pdf_block(upload_id: str) -> dict:
+    return {
+        "object": "block",
+        "type": "pdf",
+        "pdf": {"type": "file_upload", "file_upload": {"id": upload_id}},
     }
 
 
@@ -2922,7 +3053,10 @@ def upload_external_file_to_notion(
     payload, content_type = download_file_bytes(url)
     if not payload:
         return None
-    content_type = content_type or mimetypes.guess_type(url)[0] or "application/octet-stream"
+    filename = sanitize_filename(
+        filename_hint or derive_filename_from_url(url, fallback="file")
+    )
+    content_type = normalize_content_type(content_type, filename, url)
     if expect_image and not content_type.lower().startswith("image/"):
         LOGGER.info("이미지 업로드 스킵: content_type=%s (%s)", content_type, url)
         return None
@@ -2940,9 +3074,8 @@ def upload_external_file_to_notion(
         LOGGER.info("업로드 스킵(멀티파트 필요): %s bytes", file_size)
         return None
 
-    filename = sanitize_filename(
-        filename_hint or derive_filename_from_url(url, fallback="image")
-    )
+    if not filename:
+        filename = sanitize_filename(derive_filename_from_url(url, fallback="file"))
     if "." not in filename:
         ext = mimetypes.guess_extension(content_type) or ""
         if ext:
@@ -3007,30 +3140,51 @@ def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> list[dict]:
         return blocks
     updated: list[dict] = []
     for block in blocks:
-        if block.get("type") != "image":
-            updated.append(block)
+        block_type = block.get("type")
+        if block_type == "image":
+            image = block.get("image", {})
+            if image.get("type") != "external":
+                updated.append(block)
+                continue
+            url = image.get("external", {}).get("url") or ""
+            if not url:
+                updated.append(block)
+                continue
+            filename = derive_filename_from_url(url, fallback="image")
+            upload_id = upload_external_file_to_notion(
+                token, url, filename, expect_image=True
+            )
+            if not upload_id:
+                updated.append(block)
+                continue
+            new_block = {
+                "object": "block",
+                "type": "image",
+                "image": {"type": "file_upload", "file_upload": {"id": upload_id}},
+            }
+            if image.get("caption"):
+                new_block["image"]["caption"] = image["caption"]
+            updated.append(new_block)
             continue
-        image = block.get("image", {})
-        if image.get("type") != "external":
-            updated.append(block)
+        if block_type == "embed":
+            embed = block.get("embed", {})
+            url = embed.get("url") or ""
+            if not url or not is_embed_file_candidate(url):
+                updated.append(block)
+                continue
+            filename = derive_filename_from_url(url, fallback="file")
+            upload_id = upload_external_file_to_notion(
+                token, url, filename, expect_image=False
+            )
+            if not upload_id:
+                updated.append(block)
+                continue
+            if is_pdf_name_or_url(filename, url):
+                updated.append(build_pdf_block(upload_id))
+            else:
+                updated.append(build_file_block(upload_id))
             continue
-        url = image.get("external", {}).get("url") or ""
-        if not url:
-            updated.append(block)
-            continue
-        filename = derive_filename_from_url(url, fallback="image")
-        upload_id = upload_external_file_to_notion(token, url, filename, expect_image=True)
-        if not upload_id:
-            updated.append(block)
-            continue
-        new_block = {
-            "object": "block",
-            "type": "image",
-            "image": {"type": "file_upload", "file_upload": {"id": upload_id}},
-        }
-        if image.get("caption"):
-            new_block["image"]["caption"] = image["caption"]
-        updated.append(new_block)
+        updated.append(block)
     return updated
 
 
@@ -3903,6 +4057,7 @@ def main() -> None:
 
     created = 0
     updated = 0
+    body_updated = 0
 
     current_top_urls: set[str] = set()
     current_top_dates: dict[str, set[str]] = {}
@@ -3956,7 +4111,8 @@ def main() -> None:
                 image_mode = ""
                 if upload_files and has_image_blocks(body_blocks):
                     image_mode = BODY_HASH_IMAGE_MODE_UPLOAD
-                body_hash = compute_body_hash(body_blocks, image_mode=image_mode)
+                hash_blocks = normalize_body_blocks_for_hash(body_blocks, upload_files)
+                body_hash = compute_body_hash(hash_blocks, image_mode=image_mode)
                 if body_hash != existing_hash:
                     blocks_for_sync = prepare_body_blocks_for_sync(
                         notion_token, body_blocks
@@ -3964,6 +4120,7 @@ def main() -> None:
                     sync_page_body_blocks(
                         notion_token, page_id, blocks_for_sync, sync_mode=sync_mode
                     )
+                    body_updated += 1
                     update_page(
                         notion_token,
                         page_id,
@@ -3984,6 +4141,7 @@ def main() -> None:
                 sync_page_body_blocks(
                     notion_token, page_id, blocks_for_sync, sync_mode=sync_mode
                 )
+                body_updated += 1
 
     LOGGER.info("기존 TOP 정리 시작")
     disabled = disable_missing_top(notion_token, database_id, current_top_urls, current_top_dates)
@@ -3992,6 +4150,7 @@ def main() -> None:
     LOGGER.info("수집 항목 수: %s", len(items))
     LOGGER.info("생성: %s", created)
     LOGGER.info("업데이트: %s", updated)
+    LOGGER.info("본문 변경: %s", body_updated)
 
 
 if __name__ == "__main__":
