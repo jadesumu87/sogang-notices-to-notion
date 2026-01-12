@@ -4086,10 +4086,12 @@ def main() -> None:
         if is_top:
             current_top_dates.setdefault(item["title"], set()).add(date_key)
         LOGGER.info("처리 시작: %s", label)
+        attachment_count = len(item.get("attachments") or [])
         if upload_files and has_attachments_property and item.get("attachments"):
             item["attachments"] = prepare_attachments_for_sync(
                 notion_token, item["attachments"]
             )
+            attachment_count = len(item.get("attachments") or [])
         properties = build_properties(
             item,
             has_views_property,
@@ -4109,14 +4111,14 @@ def main() -> None:
             existing_hash = extract_rich_text_value(
                 existing_page.get("properties", {}), BODY_HASH_PROPERTY
             )
+        action = "업데이트" if page_id else "생성"
         if page_id:
             update_page(notion_token, page_id, properties)
             updated += 1
-            LOGGER.info("업데이트 완료: %s", label)
         else:
             page_id = create_page(notion_token, database_id, properties)
             created += 1
-            LOGGER.info("생성 완료: %s", label)
+        body_state = "없음"
         body_blocks = item.get("body_blocks", [])
         if page_id and body_blocks:
             if has_body_hash_property:
@@ -4133,6 +4135,7 @@ def main() -> None:
                         notion_token, page_id, blocks_for_sync, sync_mode=sync_mode
                     )
                     body_updated += 1
+                    body_state = "변경"
                     update_page(
                         notion_token,
                         page_id,
@@ -4145,7 +4148,7 @@ def main() -> None:
                         },
                     )
                 else:
-                    LOGGER.info("본문 변경 없음: %s", label)
+                    body_state = "유지"
             else:
                 blocks_for_sync = prepare_body_blocks_for_sync(
                     notion_token, body_blocks
@@ -4154,6 +4157,14 @@ def main() -> None:
                     notion_token, page_id, blocks_for_sync, sync_mode=sync_mode
                 )
                 body_updated += 1
+                body_state = "동기화"
+        LOGGER.info(
+            "처리 완료: %s (상태=%s, 본문=%s, 첨부=%s)",
+            label,
+            action,
+            body_state,
+            attachment_count,
+        )
 
     LOGGER.info("기존 TOP 정리 시작")
     disabled = disable_missing_top(notion_token, database_id, current_top_urls, current_top_dates)
