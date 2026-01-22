@@ -24,6 +24,7 @@ python -m playwright install --with-deps
 ## 설정
 
 `main.py`는 `.env`를 자동으로 읽는다.
+동일한 키의 환경 변수가 이미 설정되어 있으면 `.env` 값은 덮어쓰지 않고 기존 값이 우선된다.
 
 ```ini
 NOTION_TOKEN=your_notion_token
