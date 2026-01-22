@@ -1,9 +1,9 @@
-name: scholarship-crawler
+name: notices-crawler
 
 on:
   schedule:
-    - cron: "0 * * * *"    # 1시간마다(UTC; KST도 동일 주기)
-  workflow_dispatch:       # 수동 실행 버튼도 같이 제공
+    - cron: "0 * * * *"    # 1?�간마다(UTC; KST???�일 주기)
+  workflow_dispatch:       # ?�동 ?�행 버튼??같이 ?�공
 
 jobs:
   run:
@@ -13,7 +13,7 @@ jobs:
       TZ: Asia/Seoul
 
     concurrency:
-      group: scholarship-crawler
+      group: notices-crawler
       cancel-in-progress: true
 
     steps:
