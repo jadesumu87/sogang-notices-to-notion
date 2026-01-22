@@ -56,8 +56,11 @@ NOTION_DB_ID=your_database_id
 
 자주 쓰는 옵션
 
+- `NOTION_API_VERSION`: Notion API 버전, 기본값은 `2022-06-28`
+- `BBS_CONFIG_FK`: 단일 게시판 설정 ID, 기본값은 `141`
 - `BBS_CONFIG_FKS`: 게시판 설정 ID 목록, 기본값은 `141,2`
 - `BBS_CONFIG_CLASSIFY`: 게시판 ID별 분류 매핑, 기본값은 `141:장학공지,2:학사공지`
+- `BBS_CONFIG_LIST_URLS`: 게시판 ID별 목록 URL 매핑, 기본값은 `141:https://www.sogang.ac.kr/ko/scholarship-notice,2:https://www.sogang.ac.kr/ko/academic-support/notices`
 - `BBS_PAGE_SIZE`: 페이지당 목록 수, 기본값은 `20`
 - `INCLUDE_NON_TOP`: 일반 공지 포함 여부, 기본값은 `1`
 - `NON_TOP_MAX_PAGES`: 일반 공지 최대 페이지, 기본값은 `3`이며 `0`이면 제한 없음
