@@ -2,8 +2,8 @@ name: notices-crawler
 
 on:
   schedule:
-    - cron: "0 * * * *"    # 1?�간마다(UTC; KST???�일 주기)
-  workflow_dispatch:       # ?�동 ?�행 버튼??같이 ?�공
+    - cron: "0 * * * *"
+  workflow_dispatch:
 
 jobs:
   run:
