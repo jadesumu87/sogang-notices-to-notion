@@ -3871,6 +3871,106 @@ def extract_rich_text_value(properties: dict, property_name: str) -> str:
     return "".join(part.get("plain_text", "") for part in rich_text).strip()
 
 
+def archive_page(token: str, page_id: str) -> None:
+    notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}", token, {"archived": True})
+
+
+def pick_primary_page(pages: list[dict]) -> Optional[dict]:
+    if not pages:
+        return None
+    return max(
+        pages,
+        key=lambda page: (
+            page.get("last_edited_time") or "",
+            page.get("created_time") or "",
+            page.get("id") or "",
+        ),
+    )
+
+
+def dedupe_pages(
+    token: str,
+    pages: list[dict],
+    reason: str,
+    archive_duplicates: bool = True,
+) -> Optional[dict]:
+    primary = pick_primary_page(pages)
+    if not primary:
+        return None
+    keep_id = primary.get("id")
+    archived = 0
+    if archive_duplicates:
+        for page in pages:
+            page_id = page.get("id")
+            if not page_id or page_id == keep_id:
+                continue
+            if page.get("archived"):
+                continue
+            try:
+                archive_page(token, page_id)
+                archived += 1
+            except NotionRequestError as exc:
+                LOGGER.info("중복 페이지 아카이브 실패: %s (%s)", page_id, exc)
+    LOGGER.info(
+        "중복 페이지 정리: %s (유지=%s, 제거=%s, 총=%s)",
+        reason,
+        keep_id,
+        archived,
+        len(pages),
+    )
+    return primary
+
+
+def iter_database_pages(token: str, database_id: str) -> list[dict]:
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    payload: dict = {"page_size": 100}
+    results: list[dict] = []
+    while True:
+        data = notion_request("POST", url, token, payload)
+        results.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        payload["start_cursor"] = data.get("next_cursor")
+    return results
+
+
+def should_dedupe_on_start() -> bool:
+    raw = os.environ.get("NOTION_DEDUPE_ON_START", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def dedupe_database_by_url(token: str, database_id: str) -> int:
+    pages = iter_database_pages(token, database_id)
+    grouped: dict[str, list[dict]] = {}
+    for page in pages:
+        props = page.get("properties", {})
+        url = extract_url(props)
+        if not url:
+            continue
+        grouped.setdefault(url, []).append(page)
+    archived = 0
+    for url, group in grouped.items():
+        if len(group) < 2:
+            continue
+        primary = pick_primary_page(group)
+        if not primary:
+            continue
+        keep_id = primary.get("id")
+        for page in group:
+            page_id = page.get("id")
+            if not page_id or page_id == keep_id:
+                continue
+            if page.get("archived"):
+                continue
+            try:
+                archive_page(token, page_id)
+                archived += 1
+            except NotionRequestError as exc:
+                LOGGER.info("중복 페이지 아카이브 실패: %s (%s)", page_id, exc)
+        LOGGER.info("URL 중복 정리: %s (유지=%s, 중복=%s)", url, keep_id, len(group) - 1)
+    return archived
+
+
 def find_existing_page(
     token: str,
     database_id: str,
@@ -3887,8 +3987,7 @@ def find_existing_page(
         if len(results) == 1:
             return results[0]
         if len(results) > 1:
-            LOGGER.info("URL 중복 감지: %s", detail_url)
-            return None
+            return dedupe_pages(token, results, f"URL={detail_url}", archive_duplicates=True)
 
     if title and date_iso:
         results = query_database(
@@ -3904,8 +4003,12 @@ def find_existing_page(
         if len(results) == 1:
             return results[0]
         if len(results) > 1:
-            LOGGER.info("제목+작성일 중복 감지: %s (%s)", title, date_iso)
-            return None
+            return dedupe_pages(
+                token,
+                results,
+                f"제목+작성일={title} ({date_iso})",
+                archive_duplicates=True,
+            )
 
     if title:
         results = query_database(
@@ -3915,6 +4018,16 @@ def find_existing_page(
         )
         if len(results) == 1:
             return results[0]
+        if len(results) > 1:
+            primary = pick_primary_page(results)
+            if primary:
+                LOGGER.info(
+                    "제목 중복 감지(삭제 생략): %s (유지=%s, 총=%s)",
+                    title,
+                    primary.get("id"),
+                    len(results),
+                )
+                return primary
     return None
 
 
@@ -4037,6 +4150,10 @@ def main() -> None:
     database = ensure_attachment_property(notion_token, database_id, database)
     database = ensure_body_hash_property(notion_token, database_id, database)
     validate_required_properties(database)
+    if should_dedupe_on_start():
+        archived = dedupe_database_by_url(notion_token, database_id)
+        if archived:
+            LOGGER.info("URL 중복 정리 수: %s", archived)
     author_options = get_select_options(database, AUTHOR_PROPERTY)
     type_options = get_select_options(database, TYPE_PROPERTY)
     has_classification_property = validate_optional_property_type(
