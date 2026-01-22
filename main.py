@@ -3294,6 +3294,90 @@ def update_database(token: str, database_id: str, properties: dict) -> dict:
     return notion_request("PATCH", url, token, payload)
 
 
+def ensure_title_property(token: str, database_id: str, database: dict) -> dict:
+    properties = database.get("properties", {})
+    if TITLE_PROPERTY in properties:
+        prop = properties.get(TITLE_PROPERTY) or {}
+        if prop.get("type") != "title":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {TITLE_PROPERTY} (title 아님)"
+            )
+        return database
+    title_name = None
+    for name, prop in properties.items():
+        if prop.get("type") == "title":
+            title_name = name
+            break
+    if not title_name:
+        raise RuntimeError("Notion title 속성을 찾을 수 없습니다")
+    LOGGER.info("Notion 속성 이름 변경: %s -> %s", title_name, TITLE_PROPERTY)
+    return update_database(token, database_id, {title_name: {"name": TITLE_PROPERTY}})
+
+
+def ensure_top_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(TOP_PROPERTY)
+    if prop:
+        if prop.get("type") != "checkbox":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {TOP_PROPERTY} (checkbox 아님)"
+            )
+        return database
+    LOGGER.info("Notion 속성 추가: %s", TOP_PROPERTY)
+    return update_database(token, database_id, {TOP_PROPERTY: {"checkbox": {}}})
+
+
+def ensure_date_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(DATE_PROPERTY)
+    if prop:
+        if prop.get("type") != "date":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {DATE_PROPERTY} (date 아님)"
+            )
+        return database
+    LOGGER.info("Notion 속성 추가: %s", DATE_PROPERTY)
+    return update_database(token, database_id, {DATE_PROPERTY: {"date": {}}})
+
+
+def ensure_author_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(AUTHOR_PROPERTY)
+    if prop:
+        if prop.get("type") != "select":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {AUTHOR_PROPERTY} (select 아님)"
+            )
+        return database
+    LOGGER.info("Notion 속성 추가: %s", AUTHOR_PROPERTY)
+    return update_database(
+        token, database_id, {AUTHOR_PROPERTY: {"select": {"options": []}}}
+    )
+
+
+def ensure_classification_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(CLASSIFICATION_PROPERTY)
+    if prop:
+        if prop.get("type") != "select":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {CLASSIFICATION_PROPERTY} (select 아님)"
+            )
+        return database
+    LOGGER.info("Notion 속성 추가: %s", CLASSIFICATION_PROPERTY)
+    return update_database(
+        token, database_id, {CLASSIFICATION_PROPERTY: {"select": {"options": []}}}
+    )
+
+
+def ensure_views_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(VIEWS_PROPERTY)
+    if prop:
+        if prop.get("type") != "number":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {VIEWS_PROPERTY} (number 아님)"
+            )
+        return database
+    LOGGER.info("Notion 속성 추가: %s", VIEWS_PROPERTY)
+    return update_database(token, database_id, {VIEWS_PROPERTY: {"number": {}}})
+
+
 def ensure_url_property(token: str, database_id: str, database: dict) -> dict:
     prop = database.get("properties", {}).get(URL_PROPERTY)
     if prop:
@@ -3339,26 +3423,14 @@ def ensure_body_hash_property(token: str, database_id: str, database: dict) -> d
     return update_database(token, database_id, {BODY_HASH_PROPERTY: {"rich_text": {}}})
 
 
-def require_property_type(database: dict, property_name: str, expected_type: str) -> None:
-    prop = database.get("properties", {}).get(property_name)
-    if not prop:
-        raise RuntimeError(
-            f"Notion 속성 누락: {property_name} (필수 타입: {expected_type})"
-        )
-    actual = prop.get("type")
-    if actual != expected_type:
-        raise RuntimeError(
-            f"Notion 속성 타입 불일치: {property_name} (기대 {expected_type}, 실제 {actual})"
-        )
-
-
-def validate_required_properties(database: dict) -> None:
-    require_property_type(database, TITLE_PROPERTY, "title")
-    require_property_type(database, TOP_PROPERTY, "checkbox")
-    require_property_type(database, DATE_PROPERTY, "date")
-    require_property_type(database, AUTHOR_PROPERTY, "select")
-    require_property_type(database, URL_PROPERTY, "url")
-    require_property_type(database, TYPE_PROPERTY, "select")
+def ensure_required_properties(token: str, database_id: str, database: dict) -> dict:
+    database = ensure_title_property(token, database_id, database)
+    database = ensure_top_property(token, database_id, database)
+    database = ensure_date_property(token, database_id, database)
+    database = ensure_author_property(token, database_id, database)
+    database = ensure_url_property(token, database_id, database)
+    database = ensure_type_property(token, database_id, database)
+    return database
 
 
 def extract_type_from_title(title: str) -> str:
@@ -4145,27 +4217,24 @@ def main() -> None:
             classification_values.add(item["classification"])
 
     database = fetch_database(notion_token, database_id)
-    database = ensure_url_property(notion_token, database_id, database)
-    database = ensure_type_property(notion_token, database_id, database)
+    database = ensure_required_properties(notion_token, database_id, database)
     database = ensure_attachment_property(notion_token, database_id, database)
     database = ensure_body_hash_property(notion_token, database_id, database)
-    validate_required_properties(database)
+    database = ensure_classification_property(notion_token, database_id, database)
+    database = ensure_views_property(notion_token, database_id, database)
     if should_dedupe_on_start():
         archived = dedupe_database_by_url(notion_token, database_id)
         if archived:
             LOGGER.info("URL 중복 정리 수: %s", archived)
     author_options = get_select_options(database, AUTHOR_PROPERTY)
     type_options = get_select_options(database, TYPE_PROPERTY)
-    has_classification_property = validate_optional_property_type(
-        database, CLASSIFICATION_PROPERTY, "select"
-    )
     author_options = ensure_select_options_batch(
         notion_token, database_id, AUTHOR_PROPERTY, author_options, author_values
     )
     type_options = ensure_select_options_batch(
         notion_token, database_id, TYPE_PROPERTY, type_options, type_values
     )
-    if has_classification_property and classification_values:
+    if classification_values:
         classification_options = get_select_options(database, CLASSIFICATION_PROPERTY)
         classification_options = ensure_select_options_batch(
             notion_token,
@@ -4174,13 +4243,10 @@ def main() -> None:
             classification_options,
             classification_values,
         )
-    has_views_property = validate_optional_property_type(database, VIEWS_PROPERTY, "number")
-    has_attachments_property = validate_optional_property_type(
-        database, ATTACHMENT_PROPERTY, "files"
-    )
-    has_body_hash_property = validate_optional_property_type(
-        database, BODY_HASH_PROPERTY, "rich_text"
-    )
+    has_classification_property = True
+    has_views_property = True
+    has_attachments_property = True
+    has_body_hash_property = True
     sync_mode = get_sync_mode()
     upload_files = should_upload_files_to_notion()
 
