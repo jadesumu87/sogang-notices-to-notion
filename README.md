@@ -1,14 +1,16 @@
 # Sogang Notices to Notion
 
-Syncs Sogang University scholarship and academic notices into a Notion database.
+서강대학교 장학/학사 공지를 노션 데이터베이스로 동기화하여 새 공지 등록 시 자동 알림을 받도록 합니다.
 
-## Overview
-- Purpose: Keep scholarship and academic notices centralized and searchable in Notion.
-- Audience: Personal use by the maintainer; adaptable for students or admins who want a Notion sync.
-- Scope: Crawl notice boards, parse detail pages and attachments, and create or update Notion pages. Out of scope: UI, notifications, and multi-tenant management.
+## 개요
+- 목적: 기존 공지 시스템의 알림 부재 문제 해결
+- 대상: 개인용
+- 범위: 공지 수집, 상세/첨부 파싱, Notion 페이지 생성·업데이트
+    - 제외: UI, 멀티테넌트 운영
+    - 알림은 노션 데이터베이스 자동화에 의존
 
-## Demo
-- Run output (actual):
+## 데모
+- 실행 로그(실제):
 ```text
 2026-02-02 21:20:13 [INFO] 환경: Python=3.13.6, Playwright=설치됨
 2026-02-02 21:20:13 [INFO] 환경: BROWSER=chromium, HEADLESS=1, BBS_CONFIG_FKS=141,2, SYNC_MODE=overwrite
@@ -21,12 +23,12 @@ Syncs Sogang University scholarship and academic notices into a Notion database.
 ... (continued)
 ```
 
-## Tech Stack
-- Language: Python 3.11+
-- Framework: None (CLI script)
-- Infra/Tools: Playwright, Notion API, GitHub Actions
+## 기술 스택
+- 언어: Python 3.11+
+- 프레임워크: 없음(CLI 스크립트)
+- 인프라/도구: Playwright, Notion API, GitHub Actions
 
-## Project Structure
+## 프로젝트 구조
 ```text
 .
 ├─ .github/
@@ -34,34 +36,35 @@ Syncs Sogang University scholarship and academic notices into a Notion database.
 │     └─ crawler.yml
 ├─ main.py
 ├─ requirements.txt
-└─ README.md
+├─ README.md
+└─ README.ko.md
 ```
 
-## Quick Start
+## 빠른 시작
 
-### Requirements
+### 요구 사항
 
 * Python 3.11+
-* Playwright browsers (`python -m playwright install --with-deps`)
-* Optional: virtual environment
+* Playwright 브라우저(`python -m playwright install --with-deps`)
+* 선택: 가상환경
 
-### Optional: Virtual Environment
+### 선택: 가상환경
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 ```
 
-### Install
+### 설치
 
 ```bash
 pip install -r requirements.txt
 python -m playwright install --with-deps
 ```
 
-### Configure
+### 설정
 
-Create a `.env` file with the required variables.
+필수 변수를 담은 `.env` 파일을 생성합니다.
 
 ```bash
 cat > .env <<'EOF'
@@ -70,36 +73,36 @@ NOTION_DB_ID=your_database_id
 EOF
 ```
 
-### Run
+### 실행
 
 ```bash
 python main.py
 ```
 
-## Usage
+## 사용법
 
-* Example:
+* 예시:
 
 ```bash
 HTML_PATH=sample.html python main.py
 ```
 
-## Configuration
+## 설정
 
-* Environment variables: `.env`
+* 환경 변수: `.env`
 
-### Required
+### 필수
 
 ```bash
 NOTION_TOKEN=your_notion_token
 NOTION_DB_ID=your_database_id
 ```
 
-Notes:
-- The script will rename the existing title property to `공지사항` if needed.
-- If a non-title property already uses the name `공지사항`, or if no title property exists, the run will fail.
+참고:
+- 기존 title 속성의 이름이 `공지사항`으로 변경됩니다.
+- `공지사항`이라는 이름의 비-title 속성이 있거나 title 속성이 없으면 실행이 실패합니다.
 
-### Common optional
+### 자주 쓰는 옵션
 
 ```bash
 BBS_CONFIG_FKS=141,2
@@ -114,7 +117,7 @@ BROWSER=chromium
 HEADLESS=1
 ```
 
-### Advanced
+### 고급
 
 ```bash
 NOTION_API_VERSION=2022-06-28
@@ -127,31 +130,33 @@ ATTACHMENT_SELFTEST=
 USER_AGENT=Mozilla/5.0 (compatible; ScholarshipCrawler/1.0)
 ```
 
-## Testing
+## 테스트
 
 ```bash
-# no automated tests yet
+# 자동화된 테스트 없음
 ```
 
-## Deployment
+## 배포
 
-* How to deploy: GitHub Actions
-* Notes: Configure repository secrets `NOTION_TOKEN` and `NOTION_DB_ID`. The workflow in `.github/workflows/crawler.yml` runs every hour.
+* 배포 방식: GitHub Actions
+* 참고:
+    - Secrets에 `NOTION_TOKEN`, `NOTION_DB_ID`를 등록해야 합니다.
+    - `.github/workflows/crawler.yml`이 매시 실행됩니다.
 
-## Roadmap
+## 로드맵
 
-* [ ] v1: Reliable scholarship and academic notice sync with attachments
-* [ ] v2: Add filtering rules, richer parsing, and optional notifications
+* [ ] v1: 첨부파일 포함 장학/학사 공지 안정적 동기화
+* [ ] v2: 필터링 규칙, 파싱 고도화, 선택적 알림
 
-## Contributing
+## 기여
 
-* Issues/PR rules: Issues and PRs are welcome, but maintainership is selective and not guaranteed.
-* Commit message: `type(scope): subject` (Conventional Commits)
+* 이슈/PR 규칙: 이슈와 PR은 환영하지만 유지관리는 선택적으로 진행되며 반영이 보장되지 않습니다.
+* 커밋 메시지: `type(scope): subject` (Conventional Commits)
 
-## License
+## 라이선스
 
 * MIT
 
-## Security
+## 보안
 
-* Vulnerability reporting: Please use GitHub Security Advisories (Private Vulnerability Reporting).
+* 취약점 제보: GitHub Security Advisories의 비공개 제보(Private Vulnerability Reporting)를 사용합니다.
