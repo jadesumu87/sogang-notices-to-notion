@@ -143,11 +143,6 @@ USER_AGENT=Mozilla/5.0 (compatible; ScholarshipCrawler/1.0)
     - Secrets에 `NOTION_TOKEN`, `NOTION_DB_ID`를 등록해야 합니다.
     - `.github/workflows/crawler.yml`이 매시 실행됩니다.
 
-## 로드맵
-
-* [ ] v1: 첨부파일 포함 장학/학사 공지 안정적 동기화
-* [ ] v2: 필터링 규칙, 파싱 고도화, 선택적 알림
-
 ## 기여
 
 * 이슈/PR 규칙: 이슈와 PR은 환영하지만 유지관리는 선택적으로 진행되며 반영이 보장되지 않습니다.
