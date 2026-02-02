@@ -16,7 +16,7 @@
 2026-02-02 21:20:13 [INFO] 환경: BROWSER=chromium, HEADLESS=1, BBS_CONFIG_FKS=141,2, SYNC_MODE=overwrite
 2026-02-02 21:20:13 [INFO] 환경: BBS_CONFIG_CLASSIFY=141:장학공지, 2:학사공지
 2026-02-02 21:20:13 [INFO] 환경: NOTION_VERSION=2022-06-28, NOTION_UPLOAD_FILES=1
-2026-02-02 21:20:13 [INFO] 비TOP 포함 모드: 최대 페이지=3
+2026-02-02 21:20:13 [INFO] 비TOP 포함 모드: 최대 페이지=2
 2026-02-02 21:20:13 [INFO] 수집 설정: bbsConfigFk=141, 분류=장학공지
 2026-02-02 21:20:13 [INFO] 페이지 로드 시작(API): 1
 2026-02-02 21:20:13 [INFO] 페이지 1 항목 수(API): 20
@@ -34,10 +34,16 @@
 ├─ .github/
 │  └─ workflows/
 │     └─ crawler.yml
+├─ bbs_parser.py
+├─ crawler.py
+├─ log.py
 ├─ main.py
+├─ notion_client.py
 ├─ requirements.txt
 ├─ README.md
-└─ README.ko.md
+├─ settings.py
+├─ sync.py
+└─ utils.py
 ```
 
 ## 빠른 시작
@@ -110,7 +116,7 @@ BBS_CONFIG_CLASSIFY=141:Scholarship,2:Academic
 BBS_CONFIG_LIST_URLS=141:https://www.sogang.ac.kr/ko/scholarship-notice,2:https://www.sogang.ac.kr/ko/academic-support/notices
 BBS_PAGE_SIZE=20
 INCLUDE_NON_TOP=1
-NON_TOP_MAX_PAGES=3
+NON_TOP_MAX_PAGES=2
 SYNC_MODE=overwrite
 NOTION_UPLOAD_FILES=1
 BROWSER=chromium
