@@ -403,6 +403,7 @@ def dedupe_pages(
         archived,
         len(pages),
     )
+    return primary
 def iter_database_pages(token: str, database_id: str) -> list[dict]:
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
     payload: dict = {"page_size": 100}
