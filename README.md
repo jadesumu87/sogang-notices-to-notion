@@ -148,16 +148,3 @@ USER_AGENT=Mozilla/5.0 (compatible; ScholarshipCrawler/1.0)
 * 참고:
     - Secrets에 `NOTION_TOKEN`, `NOTION_DB_ID`를 등록해야 합니다.
     - `.github/workflows/crawler.yml`이 매시 실행됩니다.
-
-## 기여
-
-* 이슈/PR 규칙: 이슈와 PR은 환영하지만 유지관리는 선택적으로 진행되며 반영이 보장되지 않습니다.
-* 커밋 메시지: `type(scope): subject` (Conventional Commits)
-
-## 라이선스
-
-* MIT
-
-## 보안
-
-* 취약점 제보: GitHub Security Advisories의 비공개 제보(Private Vulnerability Reporting)를 사용합니다.
