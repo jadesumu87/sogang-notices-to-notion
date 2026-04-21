@@ -9,7 +9,7 @@ import urllib.request
 import uuid
 from io import BytesIO
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from log import LOGGER
 from settings import (
@@ -52,10 +52,85 @@ class NotionRequestError(RuntimeError):
         message: str,
         status_code: Optional[int] = None,
         reason: Optional[str] = None,
+        method: Optional[str] = None,
+        target: Optional[str] = None,
+        notion_code: Optional[str] = None,
+        request_id: Optional[str] = None,
+        hint: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.reason = reason
+        self.method = method
+        self.target = target
+        self.notion_code = notion_code
+        self.request_id = request_id
+        self.hint = hint
+
+
+# Notion 오류는 응답 JSON 형태가 일정해서, 상위 로그에 바로 도움이 되는 정보만 추려둔다.
+def summarize_request_target(url: str) -> str:
+    parsed = urlsplit(url)
+    return parsed.path or "/"
+
+
+def truncate_error_text(text: str, limit: int = 240) -> str:
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: limit - 3]}..."
+
+
+def parse_notion_error_payload(body_text: str) -> dict:
+    try:
+        payload = json.loads(body_text)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def build_notion_error_hint(
+    status_code: Optional[int],
+    notion_code: Optional[str],
+) -> str:
+    if status_code == 401:
+        return "토큰 값과 만료 여부를 확인"
+    if status_code == 403:
+        return "integration 권한과 데이터베이스 공유 상태를 확인"
+    if status_code == 404 and notion_code == "object_not_found":
+        return "대상 ID, integration 공유 상태, 토큰이 연결된 워크스페이스를 확인"
+    if status_code == 400:
+        return "속성 이름, 속성 타입, 요청 payload를 확인"
+    if status_code == 409:
+        return "동시 수정 충돌 가능성이 있어 잠시 후 재시도"
+    if status_code == 429:
+        return "요청량 제한이 걸려 재시도가 필요"
+    return ""
+
+
+def format_notion_error_message(
+    method: str,
+    target: str,
+    status_code: Optional[int],
+    notion_code: Optional[str],
+    reason: str,
+    request_id: Optional[str],
+    hint: Optional[str],
+) -> str:
+    parts = [f"Notion API error: {method} {target}"]
+    if status_code is not None:
+        parts.append(f"HTTP {status_code}")
+    if notion_code:
+        parts.append(notion_code)
+    if reason:
+        parts.append(f"message={truncate_error_text(reason)}")
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    if hint:
+        parts.append(f"hint={hint}")
+    return " | ".join(parts)
 
 def download_file_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
     req = urllib.request.Request(url, headers=build_site_headers())
@@ -192,6 +267,7 @@ def notion_request(
         data = json.dumps(payload).encode("utf-8")
     max_retries = 3
     backoff = 1.0
+    request_target = summarize_request_target(url)
 
     for attempt in range(max_retries + 1):
         req = urllib.request.Request(url, data=data, method=method)
@@ -204,6 +280,17 @@ def notion_request(
                 return json.load(resp)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
+            error_payload = parse_notion_error_payload(body)
+            notion_code = str(error_payload.get("code") or "").strip() or None
+            notion_message = str(error_payload.get("message") or "").strip()
+            reason_text = notion_message or body
+            request_id = (
+                exc.headers.get("x-request-id")
+                or exc.headers.get("X-Request-Id")
+                or str(error_payload.get("request_id") or "").strip()
+                or None
+            )
+            hint = build_notion_error_hint(exc.code, notion_code)
             retryable = exc.code in {429, 500, 502, 503, 504}
             if retryable and attempt < max_retries:
                 retry_after = exc.headers.get("Retry-After")
@@ -212,40 +299,70 @@ def notion_request(
                 else:
                     sleep_s = backoff
                 LOGGER.info(
-                    "Notion API 재시도(%s/%s): HTTP %s",
+                    "Notion API 재시도(%s/%s): %s %s -> HTTP %s%s",
                     attempt + 1,
                     max_retries,
+                    method,
+                    request_target,
                     exc.code,
+                    f" {notion_code}" if notion_code else "",
                 )
                 time.sleep(sleep_s)
                 backoff = min(backoff * 2, 8.0)
                 continue
             raise NotionRequestError(
-                f"Notion API error: HTTP {exc.code}: {body}",
+                format_notion_error_message(
+                    method,
+                    request_target,
+                    exc.code,
+                    notion_code,
+                    reason_text,
+                    request_id,
+                    hint,
+                ),
                 status_code=exc.code,
-                reason=body,
+                reason=reason_text,
+                method=method,
+                target=request_target,
+                notion_code=notion_code,
+                request_id=request_id,
+                hint=hint,
             ) from exc
         except (socket.timeout, TimeoutError) as exc:
             if attempt < max_retries:
                 LOGGER.info(
-                    "Notion API 재시도(%s/%s): timeout",
+                    "Notion API 재시도(%s/%s): %s %s -> timeout",
                     attempt + 1,
                     max_retries,
+                    method,
+                    request_target,
                 )
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 8.0)
                 continue
             raise NotionRequestError(
-                "Notion API error: timeout",
+                format_notion_error_message(
+                    method,
+                    request_target,
+                    None,
+                    None,
+                    "timeout",
+                    None,
+                    "",
+                ),
                 reason="timeout",
+                method=method,
+                target=request_target,
             ) from exc
         except urllib.error.URLError as exc:
             is_timeout = isinstance(exc.reason, socket.timeout)
             if attempt < max_retries:
                 LOGGER.info(
-                    "Notion API 재시도(%s/%s): %s",
+                    "Notion API 재시도(%s/%s): %s %s -> %s",
                     attempt + 1,
                     max_retries,
+                    method,
+                    request_target,
                     "timeout" if is_timeout else exc.reason,
                 )
                 time.sleep(backoff)
@@ -253,12 +370,32 @@ def notion_request(
                 continue
             if is_timeout:
                 raise NotionRequestError(
-                    "Notion API error: timeout",
+                    format_notion_error_message(
+                        method,
+                        request_target,
+                        None,
+                        None,
+                        "timeout",
+                        None,
+                        "",
+                    ),
                     reason="timeout",
+                    method=method,
+                    target=request_target,
                 ) from exc
             raise NotionRequestError(
-                f"Notion API error: {exc.reason}",
+                format_notion_error_message(
+                    method,
+                    request_target,
+                    None,
+                    None,
+                    str(exc.reason),
+                    None,
+                    "",
+                ),
                 reason=str(exc.reason),
+                method=method,
+                target=request_target,
             ) from exc
 
 

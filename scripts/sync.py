@@ -360,6 +360,8 @@ def extract_rich_text_value(properties: dict, property_name: str) -> str:
     prop = properties.get(property_name, {})
     rich_text = prop.get("rich_text", [])
     return "".join(part.get("plain_text", "") for part in rich_text).strip()
+
+
 def pick_primary_page(pages: list[dict]) -> Optional[dict]:
     if not pages:
         return None
@@ -445,6 +447,32 @@ def dedupe_database_by_url(token: str, database_id: str) -> int:
                 LOGGER.info("중복 페이지 아카이브 실패: %s (%s)", page_id, exc)
         LOGGER.info("URL 중복 정리: %s (유지=%s, 중복=%s)", url, keep_id, len(group) - 1)
     return archived
+
+
+# 조회 단계명을 함께 남겨서 기존 페이지 탐색이 어디에서 실패했는지 바로 구분한다.
+def query_existing_pages_with_stage_log(
+    token: str,
+    database_id: str,
+    filter_payload: dict,
+    stage_name: str,
+    detail_url: Optional[str],
+    title: str,
+    date_iso: Optional[str],
+) -> list[dict]:
+    try:
+        return query_database(token, database_id, filter_payload)
+    except NotionRequestError as exc:
+        LOGGER.error(
+            "기존 페이지 조회 실패: 단계=%s, 제목=%s, 작성일=%s, url=%s (%s)",
+            stage_name,
+            title or "제목없음",
+            date_iso or "날짜없음",
+            detail_url or "없음",
+            exc,
+        )
+        raise
+
+
 def find_existing_page(
     token: str,
     database_id: str,
@@ -453,10 +481,14 @@ def find_existing_page(
     date_iso: Optional[str],
 ) -> Optional[dict]:
     if detail_url:
-        results = query_database(
+        results = query_existing_pages_with_stage_log(
             token,
             database_id,
             {"property": URL_PROPERTY, "url": {"equals": detail_url}},
+            "URL 일치 조회",
+            detail_url,
+            title,
+            date_iso,
         )
         if len(results) == 1:
             return results[0]
@@ -464,7 +496,7 @@ def find_existing_page(
             return dedupe_pages(token, results, f"URL={detail_url}", archive_duplicates=True)
 
     if title and date_iso:
-        results = query_database(
+        results = query_existing_pages_with_stage_log(
             token,
             database_id,
             {
@@ -473,6 +505,10 @@ def find_existing_page(
                     {"property": DATE_PROPERTY, "date": {"equals": date_iso}},
                 ]
             },
+            "제목+작성일 조회",
+            detail_url,
+            title,
+            date_iso,
         )
         if len(results) == 1:
             return results[0]
@@ -485,10 +521,14 @@ def find_existing_page(
             )
 
     if title:
-        results = query_database(
+        results = query_existing_pages_with_stage_log(
             token,
             database_id,
             {"property": TITLE_PROPERTY, "title": {"equals": title}},
+            "제목 단독 조회",
+            detail_url,
+            title,
+            date_iso,
         )
         if len(results) == 1:
             return results[0]
