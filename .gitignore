@@ -1,0 +1,152 @@
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.Spotlight-V100/
+.Trashes/
+ehthumbs.db
+
+# Editor settings
+.vscode/
+.idea/
+*.iml
+*.suo
+*.user
+*.userossc
+*.sln.docstates
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Logs and temp
+*.log
+*.out
+*.err
+*.pid
+*.pid.lock
+*.seed
+*.stackdump
+logs/
+log/
+
+# Common build directories
+build/
+dist/
+target/
+out/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Archives
+*.7z
+*.gz
+*.zip
+*.tar
+*.tgz
+*.bz2
+*.rar
+
+# Caches and coverage
+.cache/
+.cache-loader/
+coverage/
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.nox/
+.tox/
+.hypothesis/
+pytestdebug.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.pyo
+*.so
+.Python
+.eggs/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.npm/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.next/
+.nuxt/
+.svelte-kit/
+.parcel-cache/
+*.tsbuildinfo
+
+# Java and Kotlin
+.gradle/
+*.class
+
+# Go
+bin/
+.coverprofile
+
+# Rust
+
+# C and C++
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+makedep*
+libtool
+aclocal.m4
+m4/
+autom4te.cache/
+
+# Swift and Xcode
+.build/
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcuserdatad/
+*.xcuserstate
+
+# PHP
+vendor/
+
+# Ruby
+.bundle/
+*.gem
+
+# Project
+project/**
+!project/README.md
+
+# Local directories
+local/
+
+# Script output
+tmp/
+temp/
+*.tmp
+*.bak

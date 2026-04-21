@@ -53,4 +53,3 @@ def log_environment_info() -> None:
         "1" if upload_files else "0",
     )
 
-
