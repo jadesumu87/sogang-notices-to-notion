@@ -233,10 +233,11 @@ def main() -> None:
                     )
                     if page_id and existing_media_state and any(
                         not str(entry.get("block_id") or "").strip()
+                        or not str(entry.get("hosted_file_key") or "").strip()
                         for entry in existing_media_state
                     ):
-                        # block_id가 없던 구버전 상태도 현재 컨테이너 기준으로 보강해 두면,
-                        # 다음 실행부터는 read 응답이 file로 와도 본문 재사용 검증을 더 안정적으로 수행할 수 있다.
+                        # block_id만이 아니라 현재 hosted_file_key까지 같이 보강해 두면,
+                        # 다음 실행부터는 같은 block_id를 유지한 수동 파일 교체도 재사용 전에 더 안전하게 차단할 수 있다.
                         existing_media_state = enrich_body_media_state_with_block_ids(
                             notion_token,
                             page_id,

@@ -649,6 +649,38 @@ def run_attachment_policy_selftest() -> None:
             ):
                 raise RuntimeError("본문 업로드 셀프테스트 실패(수동 편집 stale block_id 차단)")
 
+            # 같은 block_id를 유지한 채 hosted 파일만 바뀐 경우도 수동 편집으로 보고 재사용을 꺼야,
+            # 내부 컨테이너를 사람이 수정했을 때 이전 upload_id를 조용히 재사용하는 문제를 막을 수 있다.
+            def fake_same_block_id_but_changed_hosted_file(_token: str, _page_id: str):
+                return [
+                    {
+                        "id": "image-current",
+                        "type": "image",
+                        "image": {
+                            "type": "file",
+                            "file": {
+                                "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image-current/changed.jpg?X-Amz-Signature=abc"
+                            },
+                        },
+                    }
+                ]
+
+            sync_module.list_block_children = fake_same_block_id_but_changed_hosted_file
+            if sync_module.extract_existing_uploaded_media_blocks(
+                "selftest-token",
+                "selftest-page",
+                [
+                    {
+                        "type": "image",
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                        "upload_id": "image-upload-current",
+                        "block_id": "image-current",
+                        "hosted_file_key": "s3.us-west-2.amazonaws.com/secure.notion-static.com/image-current/original.jpg",
+                    }
+                ],
+            ):
+                raise RuntimeError("본문 업로드 셀프테스트 실패(같은 block_id 다른 hosted 파일 차단)")
+
             # 첨부 재사용도 body와 마찬가지로, 저장된 상태만 믿지 말고 현재 첨부 속성에 실제로 남아 있는 upload_id만 허용해야 한다.
             valid_attachment_reuse = sync_module.extract_existing_uploaded_attachment_ids(
                 {
