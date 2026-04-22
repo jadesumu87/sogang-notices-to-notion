@@ -49,6 +49,9 @@ from sync import (
     extract_existing_uploaded_media_blocks,
     extract_rich_text_value,
     extract_type_from_title,
+    enrich_attachment_state_with_page,
+    enrich_attachment_state_with_properties,
+    enrich_body_media_state_with_block_ids,
     find_existing_page,
     normalize_item_attachments,
     sync_page_body_blocks,
@@ -214,15 +217,31 @@ def main() -> None:
                 page_id = existing_page.get("id") if existing_page else None
                 existing_hash = ""
                 existing_media_state: list[dict] = []
+                existing_media_state_raw = ""
                 existing_attachment_state: list[dict] = []
                 existing_attachment_state_raw = ""
                 if has_body_hash_property and existing_page:
                     existing_hash = extract_rich_text_value(
                         existing_page.get("properties", {}), BODY_HASH_PROPERTY
                     )
+                    existing_media_state_raw = extract_rich_text_value(
+                        existing_page.get("properties", {}),
+                        BODY_MEDIA_STATE_PROPERTY,
+                    )
                     existing_media_state = extract_body_media_state(
                         existing_page.get("properties", {})
                     )
+                    if page_id and existing_media_state and any(
+                        not str(entry.get("block_id") or "").strip()
+                        for entry in existing_media_state
+                    ):
+                        # block_id가 없던 구버전 상태도 현재 컨테이너 기준으로 보강해 두면,
+                        # 다음 실행부터는 read 응답이 file로 와도 본문 재사용 검증을 더 안정적으로 수행할 수 있다.
+                        existing_media_state = enrich_body_media_state_with_block_ids(
+                            notion_token,
+                            page_id,
+                            existing_media_state,
+                        )
                 if has_attachment_state_property and existing_page:
                     existing_attachment_state = extract_attachment_state(
                         existing_page.get("properties", {})
@@ -231,6 +250,16 @@ def main() -> None:
                         existing_page.get("properties", {}),
                         ATTACHMENT_STATE_PROPERTY,
                     )
+                    if existing_attachment_state and any(
+                        not str(entry.get("hosted_file_key") or "").strip()
+                        for entry in existing_attachment_state
+                    ):
+                        # page files read 응답이 file 중심으로 오는 환경에서는,
+                        # 현재 properties에서 hosted_file_key를 보강해 둬야 다음 실행 stale 상태를 구분할 수 있다.
+                        existing_attachment_state = enrich_attachment_state_with_properties(
+                            existing_page.get("properties", {}),
+                            existing_attachment_state,
+                        )
                 attachment_count = len(item.get("attachments") or [])
                 attachment_state: list[dict] = []
                 if upload_files and has_attachments_property:
@@ -265,7 +294,53 @@ def main() -> None:
                     page_id = create_page(notion_token, database_id, properties)
                     created += 1
                 post_update_properties: dict = {}
+                if (
+                    has_body_hash_property
+                    and existing_page
+                    and existing_media_state
+                    and json.dumps(
+                        existing_media_state,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    != existing_media_state_raw
+                ):
+                    post_update_properties[BODY_MEDIA_STATE_PROPERTY] = {
+                        "rich_text": build_rich_text_chunks(
+                            json.dumps(
+                                existing_media_state,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        )
+                    }
+                if (
+                    has_attachment_state_property
+                    and existing_page
+                    and existing_attachment_state
+                    and json.dumps(
+                        existing_attachment_state,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    != existing_attachment_state_raw
+                ):
+                    post_update_properties[ATTACHMENT_STATE_PROPERTY] = {
+                        "rich_text": build_rich_text_chunks(
+                            json.dumps(
+                                existing_attachment_state,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        )
+                    }
                 if has_attachment_state_property:
+                    if page_id and attachment_state:
+                        attachment_state = enrich_attachment_state_with_page(
+                            notion_token,
+                            page_id,
+                            attachment_state,
+                        )
                     attachment_state_raw = json.dumps(
                         attachment_state,
                         ensure_ascii=False,
@@ -314,6 +389,11 @@ def main() -> None:
                                     page_id,
                                     blocks_for_sync,
                                     sync_mode=sync_mode,
+                                )
+                                actual_media_state = enrich_body_media_state_with_block_ids(
+                                    notion_token,
+                                    page_id,
+                                    actual_media_state,
                                 )
                                 body_updated += 1
                                 body_state = (

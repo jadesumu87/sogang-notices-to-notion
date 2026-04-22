@@ -426,24 +426,30 @@ def run_attachment_policy_selftest() -> None:
                         "id": "file-1",
                         "type": "file",
                         "file": {
-                            "type": "file_upload",
-                            "file_upload": {"id": "file-upload-1"},
+                            "type": "file",
+                            "file": {
+                                "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/file-1/test.bin?X-Amz-Signature=abc"
+                            },
                         },
                     },
                     {
                         "id": "image-1",
                         "type": "image",
                         "image": {
-                            "type": "file_upload",
-                            "file_upload": {"id": "image-upload-1"},
+                            "type": "file",
+                            "file": {
+                                "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image-1/test.jpg?X-Amz-Signature=abc"
+                            },
                         },
                     },
                     {
                         "id": "pdf-1",
                         "type": "pdf",
                         "pdf": {
-                            "type": "file_upload",
-                            "file_upload": {"id": "pdf-upload-1"},
+                            "type": "file",
+                            "file": {
+                                "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/pdf-1/test.pdf?X-Amz-Signature=abc"
+                            },
                         },
                     },
                 ]
@@ -457,11 +463,13 @@ def run_attachment_policy_selftest() -> None:
                         "type": "image",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
                         "upload_id": "image-upload-state",
+                        "block_id": "image-1",
                     },
                     {
                         "type": "pdf",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf",
                         "upload_id": "pdf-upload-state",
+                        "block_id": "pdf-1",
                     },
                 ],
             ):
@@ -476,8 +484,10 @@ def run_attachment_policy_selftest() -> None:
                         "archived": False,
                         "created_time": "2026-04-22T00:00:00.000Z",
                         "image": {
-                            "type": "file_upload",
-                            "file_upload": {"id": "image-upload-sanitized"},
+                            "type": "file",
+                            "file": {
+                                "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image-raw/test.jpg?X-Amz-Signature=abc"
+                            },
                             "caption": [
                                 {"type": "text", "text": {"content": "caption kept"}}
                             ],
@@ -494,6 +504,7 @@ def run_attachment_policy_selftest() -> None:
                         "type": "image",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
                         "upload_id": "image-upload-sanitized",
+                        "block_id": "image-raw",
                     }
                 ],
             )
@@ -525,16 +536,20 @@ def run_attachment_policy_selftest() -> None:
                         "id": "image-b",
                         "type": "image",
                         "image": {
-                            "type": "file_upload",
-                            "file_upload": {"id": "image-upload-b"},
+                            "type": "file",
+                            "file": {
+                                "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image-b/B.jpg?X-Amz-Signature=abc"
+                            },
                         },
                     },
                     {
                         "id": "image-a",
                         "type": "image",
                         "image": {
-                            "type": "file_upload",
-                            "file_upload": {"id": "image-upload-a"},
+                            "type": "file",
+                            "file": {
+                                "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image-a/A.jpg?X-Amz-Signature=abc"
+                            },
                         },
                     },
                 ]
@@ -548,11 +563,13 @@ def run_attachment_policy_selftest() -> None:
                         "type": "image",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/A.jpg?sg=A.jpg",
                         "upload_id": "image-upload-a",
+                        "block_id": "image-a",
                     },
                     {
                         "type": "image",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/B.jpg?sg=B.jpg",
                         "upload_id": "image-upload-b",
+                        "block_id": "image-b",
                     },
                 ],
             )
@@ -593,16 +610,20 @@ def run_attachment_policy_selftest() -> None:
                         "id": "image-current",
                         "type": "image",
                         "image": {
-                            "type": "file_upload",
-                            "file_upload": {"id": "image-upload-current"},
+                            "type": "file",
+                            "file": {
+                                "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image-current/test.jpg?X-Amz-Signature=abc"
+                            },
                         },
                     },
                     {
                         "id": "pdf-current",
                         "type": "pdf",
                         "pdf": {
-                            "type": "file_upload",
-                            "file_upload": {"id": "pdf-upload-current"},
+                            "type": "file",
+                            "file": {
+                                "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/pdf-current/test.pdf?X-Amz-Signature=abc"
+                            },
                         },
                     },
                 ]
@@ -616,15 +637,17 @@ def run_attachment_policy_selftest() -> None:
                         "type": "image",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
                         "upload_id": "image-upload-stale",
+                        "block_id": "image-stale",
                     },
                     {
                         "type": "pdf",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf",
                         "upload_id": "pdf-upload-stale",
+                        "block_id": "pdf-stale",
                     },
                 ],
             ):
-                raise RuntimeError("본문 업로드 셀프테스트 실패(수동 편집 stale id 차단)")
+                raise RuntimeError("본문 업로드 셀프테스트 실패(수동 편집 stale block_id 차단)")
 
             # 첨부 재사용도 body와 마찬가지로, 저장된 상태만 믿지 말고 현재 첨부 속성에 실제로 남아 있는 upload_id만 허용해야 한다.
             valid_attachment_reuse = sync_module.extract_existing_uploaded_attachment_ids(
@@ -633,8 +656,10 @@ def run_attachment_policy_selftest() -> None:
                         "files": [
                             {
                                 "name": "sample.jpg",
-                                "type": "file_upload",
-                                "file_upload": {"id": "attachment-upload-1"},
+                                "type": "file",
+                                "file": {
+                                    "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/attachment-upload-1/sample.jpg?X-Amz-Signature=abc"
+                                },
                             }
                         ]
                     }
@@ -644,6 +669,7 @@ def run_attachment_policy_selftest() -> None:
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
                         "name": "sample.jpg",
                         "upload_id": "attachment-upload-1",
+                        "hosted_file_key": "s3.us-west-2.amazonaws.com/secure.notion-static.com/attachment-upload-1/sample.jpg",
                     }
                 ],
             )
@@ -662,8 +688,10 @@ def run_attachment_policy_selftest() -> None:
                         "files": [
                             {
                                 "name": "sample.jpg",
-                                "type": "file_upload",
-                                "file_upload": {"id": "attachment-upload-1"},
+                                "type": "file",
+                                "file": {
+                                    "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/attachment-upload-1/sample.jpg?X-Amz-Signature=abc"
+                                },
                             },
                             {
                                 "name": "sample.pdf",
@@ -680,6 +708,7 @@ def run_attachment_policy_selftest() -> None:
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
                         "name": "sample.jpg",
                         "upload_id": "attachment-upload-1",
+                        "hosted_file_key": "s3.us-west-2.amazonaws.com/secure.notion-static.com/attachment-upload-1/sample.jpg",
                     }
                 ],
             )
@@ -697,8 +726,10 @@ def run_attachment_policy_selftest() -> None:
                         "files": [
                             {
                                 "name": "sample.jpg",
-                                "type": "file_upload",
-                                "file_upload": {"id": "attachment-upload-current"},
+                                "type": "file",
+                                "file": {
+                                    "url": "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/attachment-upload-current/sample.jpg?X-Amz-Signature=abc"
+                                },
                             }
                         ]
                     }
@@ -708,6 +739,7 @@ def run_attachment_policy_selftest() -> None:
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
                         "name": "sample.jpg",
                         "upload_id": "attachment-upload-stale",
+                        "hosted_file_key": "s3.us-west-2.amazonaws.com/secure.notion-static.com/attachment-upload-stale/sample.jpg",
                     }
                 ],
             ):
