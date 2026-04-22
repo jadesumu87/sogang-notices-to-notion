@@ -2,6 +2,7 @@ import copy
 import json
 import re
 from typing import Optional
+from urllib.parse import urlparse
 
 from common import (
     ensure_item_title,
@@ -140,30 +141,32 @@ def find_sync_container_block(token: str, page_id: str) -> Optional[dict]:
     return None
 
 
-def is_uploaded_media_block(block: dict) -> bool:
+def is_notion_hosted_media_block(block: dict) -> bool:
     block_type = block.get("type")
     if block_type == "image":
-        return block.get("image", {}).get("type") == "file_upload"
+        return block.get("image", {}).get("type") in {"file", "file_upload"}
     if block_type in {"file", "pdf"}:
-        return block.get(block_type, {}).get("type") == "file_upload"
+        return block.get(block_type, {}).get("type") in {"file", "file_upload"}
     return False
 
 
-def sanitize_uploaded_media_block(block: dict) -> Optional[dict]:
+def sanitize_uploaded_media_block(block: dict, upload_id: str) -> Optional[dict]:
     block_type = block.get("type")
+    clean_upload_id = str(upload_id or "").strip()
+    if not clean_upload_id:
+        return None
     # list_block_children 응답에는 id, created_time 같은 읽기 전용 필드가 섞여 오므로,
     # 재사용할 때는 append 가능한 최소 payload만 다시 구성해야 잘못된 블록 상태가 전파되지 않는다.
+    # 실제 Notion read 응답은 file_upload 대신 file 타입으로 돌아올 수 있으므로,
+    # 쓰기용 payload는 현재 read shape가 아니라 저장해 둔 upload_id를 기준으로 다시 만든다.
     if block_type == "image":
         image = block.get("image", {})
-        if image.get("type") != "file_upload":
-            return None
-        upload_id = str(image.get("file_upload", {}).get("id") or "").strip()
-        if not upload_id:
+        if image.get("type") not in {"file", "file_upload"}:
             return None
         sanitized = {
             "object": "block",
             "type": "image",
-            "image": {"type": "file_upload", "file_upload": {"id": upload_id}},
+            "image": {"type": "file_upload", "file_upload": {"id": clean_upload_id}},
         }
         caption = image.get("caption")
         if caption:
@@ -171,31 +174,15 @@ def sanitize_uploaded_media_block(block: dict) -> Optional[dict]:
         return sanitized
     if block_type == "file":
         payload = block.get("file", {})
-        if payload.get("type") != "file_upload":
+        if payload.get("type") not in {"file", "file_upload"}:
             return None
-        upload_id = str(payload.get("file_upload", {}).get("id") or "").strip()
-        if not upload_id:
-            return None
-        return build_file_block(upload_id)
+        return build_file_block(clean_upload_id)
     if block_type == "pdf":
         payload = block.get("pdf", {})
-        if payload.get("type") != "file_upload":
+        if payload.get("type") not in {"file", "file_upload"}:
             return None
-        upload_id = str(payload.get("file_upload", {}).get("id") or "").strip()
-        if not upload_id:
-            return None
-        return build_pdf_block(upload_id)
+        return build_pdf_block(clean_upload_id)
     return None
-
-
-def extract_file_upload_id_from_sanitized_block(block: dict) -> str:
-    block_type = str(block.get("type") or "").strip()
-    if block_type not in {"image", "file", "pdf"}:
-        return ""
-    payload = block.get(block_type, {})
-    if payload.get("type") != "file_upload":
-        return ""
-    return str(payload.get("file_upload", {}).get("id") or "").strip()
 
 
 def extract_body_media_state(properties: dict) -> list[dict]:
@@ -217,11 +204,14 @@ def extract_body_media_state(properties: dict) -> list[dict]:
         media_type = str(entry.get("type") or "").strip()
         source_url = str(entry.get("source_url") or "").strip()
         upload_id = str(entry.get("upload_id") or "").strip()
+        block_id = str(entry.get("block_id") or "").strip()
         if media_type not in {"image", "file", "pdf"} or not source_url:
             continue
         normalized_entry = {"type": media_type, "source_url": source_url}
         if upload_id:
             normalized_entry["upload_id"] = upload_id
+        if block_id:
+            normalized_entry["block_id"] = block_id
         items.append(normalized_entry)
     return items
 
@@ -245,11 +235,14 @@ def extract_attachment_state(properties: dict) -> list[dict]:
         source_url = str(entry.get("source_url") or "").strip()
         upload_id = str(entry.get("upload_id") or "").strip()
         name = str(entry.get("name") or "").strip()
+        hosted_file_key = str(entry.get("hosted_file_key") or "").strip()
         if not source_url or not upload_id:
             continue
         normalized_entry = {"source_url": source_url, "upload_id": upload_id}
         if name:
             normalized_entry["name"] = name
+        if hosted_file_key:
+            normalized_entry["hosted_file_key"] = hosted_file_key
         items.append(normalized_entry)
     return items
 
@@ -258,6 +251,79 @@ def normalize_item_attachments(item: dict) -> None:
     # 수집기마다 첨부가 없을 때 attachments 키를 생략할 수 있으므로,
     # 동기화 직전에는 항상 list로 정규화해 files=[] clear payload가 실제 런타임에서도 빠지지 않게 한다.
     item["attachments"] = list(item.get("attachments") or [])
+
+
+def normalize_notion_hosted_file_key(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.path:
+        return ""
+    # signed query는 자주 바뀌므로, 현재 read 응답에서 비교 가능한 식별 힌트는 호스트+경로까지만 사용한다.
+    return f"{parsed.netloc}{parsed.path}"
+
+
+def enrich_attachment_state_with_properties(properties: dict, attachment_state: list[dict]) -> list[dict]:
+    if not attachment_state:
+        return attachment_state
+    files_prop = properties.get(ATTACHMENT_PROPERTY, {})
+    files = files_prop.get("files", [])
+    if not isinstance(files, list):
+        return attachment_state
+    current_uploaded_entries: list[dict] = []
+    for file_info in files:
+        if not isinstance(file_info, dict):
+            return attachment_state
+        file_type = str(file_info.get("type") or "").strip()
+        if file_type == "external":
+            continue
+        name = str(file_info.get("name") or "").strip()
+        if not name:
+            return attachment_state
+        if file_type == "file":
+            hosted_file_key = normalize_notion_hosted_file_key(
+                file_info.get("file", {}).get("url") or ""
+            )
+            if not hosted_file_key:
+                return attachment_state
+            current_uploaded_entries.append(
+                {"type": "file", "name": name, "hosted_file_key": hosted_file_key}
+            )
+            continue
+        if file_type == "file_upload":
+            upload_id = str(file_info.get("file_upload", {}).get("id") or "").strip()
+            if not upload_id:
+                return attachment_state
+            current_uploaded_entries.append(
+                {"type": "file_upload", "name": name, "upload_id": upload_id}
+            )
+            continue
+        return attachment_state
+    if len(current_uploaded_entries) != len(attachment_state):
+        return attachment_state
+    enriched: list[dict] = []
+    for state_entry, current_entry in zip(attachment_state, current_uploaded_entries):
+        state_name = str(state_entry.get("name") or "").strip()
+        if not state_name or state_name != current_entry["name"]:
+            return attachment_state
+        enriched_entry = dict(state_entry)
+        if current_entry["type"] == "file":
+            enriched_entry["hosted_file_key"] = current_entry["hosted_file_key"]
+        enriched.append(enriched_entry)
+    return enriched
+
+
+def enrich_attachment_state_with_page(
+    token: str,
+    page_id: str,
+    attachment_state: list[dict],
+) -> list[dict]:
+    if not page_id or not attachment_state:
+        return attachment_state
+    try:
+        page = notion_request("GET", f"https://api.notion.com/v1/pages/{page_id}", token)
+    except NotionRequestError as exc:
+        LOGGER.info("첨부 상태 hosted_file_key 보강 스킵: 페이지 조회 실패 (%s)", exc)
+        return attachment_state
+    return enrich_attachment_state_with_properties(page.get("properties", {}), attachment_state)
 
 
 def extract_existing_uploaded_attachment_ids(
@@ -272,6 +338,10 @@ def extract_existing_uploaded_attachment_ids(
         LOGGER.info("기존 첨부 재사용 스킵: files 속성 형식 불일치")
         return {}
     current_upload_ids: set[str] = set()
+    current_uploaded_names: set[str] = set()
+    current_hosted_file_keys: set[str] = set()
+    current_uploaded_count = 0
+    saw_file_read_shape = False
     for file_info in files:
         if not isinstance(file_info, dict):
             LOGGER.info("기존 첨부 재사용 스킵: files 항목 형식 불일치")
@@ -281,28 +351,68 @@ def extract_existing_uploaded_attachment_ids(
         # mixed attachment 페이지에서도 업로드된 첨부만 부분 재사용할 수 있게 external은 무시한다.
         if file_type == "external":
             continue
+        current_uploaded_count += 1
+        name = str(file_info.get("name") or "").strip()
+        if not name:
+            LOGGER.info("기존 첨부 재사용 스킵: 현재 첨부 이름 누락")
+            return {}
         if file_type != "file_upload":
+            if file_type != "file":
+                LOGGER.info(
+                    "기존 첨부 재사용 스킵: 알 수 없는 첨부 타입 감지 (%s)",
+                    file_type or "unknown",
+                )
+                return {}
+            # page files 속성은 실제 read 응답에서 file_upload 대신 file 타입으로 돌아올 수 있으므로,
+            # 이런 경우에는 상태에 저장한 hosted_file_key를 현재 file.url과 비교해 stale 재사용을 막는다.
+            saw_file_read_shape = True
+            hosted_file_key = normalize_notion_hosted_file_key(
+                file_info.get("file", {}).get("url") or ""
+            )
+            if not hosted_file_key:
+                LOGGER.info("기존 첨부 재사용 스킵: 현재 첨부 hosted_file_key 누락")
+                return {}
+            if hosted_file_key in current_hosted_file_keys:
+                LOGGER.info(
+                    "기존 첨부 재사용 스킵: 현재 첨부 중복 hosted_file_key 감지 (%s)",
+                    hosted_file_key,
+                )
+                return {}
+            current_hosted_file_keys.add(hosted_file_key)
+        if name in current_uploaded_names:
             LOGGER.info(
-                "기존 첨부 재사용 스킵: 알 수 없는 첨부 타입 감지 (%s)",
-                file_type or "unknown",
+                "기존 첨부 재사용 스킵: 현재 첨부 중복 이름 감지 (%s)",
+                name,
             )
             return {}
-        upload_id = str(file_info.get("file_upload", {}).get("id") or "").strip()
-        if not upload_id:
-            LOGGER.info("기존 첨부 재사용 스킵: 현재 첨부 upload_id 누락")
-            return {}
-        if upload_id in current_upload_ids:
-            LOGGER.info(
-                "기존 첨부 재사용 스킵: 현재 첨부 중복 upload_id 감지 (%s)",
-                upload_id,
-            )
-            return {}
-        current_upload_ids.add(upload_id)
+        current_uploaded_names.add(name)
+        if file_type == "file_upload":
+            upload_id = str(file_info.get("file_upload", {}).get("id") or "").strip()
+            if not upload_id:
+                LOGGER.info("기존 첨부 재사용 스킵: 현재 첨부 upload_id 누락")
+                return {}
+            if upload_id in current_upload_ids:
+                LOGGER.info(
+                    "기존 첨부 재사용 스킵: 현재 첨부 중복 upload_id 감지 (%s)",
+                    upload_id,
+                )
+                return {}
+            current_upload_ids.add(upload_id)
+    if current_uploaded_count != len(attachment_state):
+        LOGGER.info(
+            "기존 첨부 재사용 스킵: 업로드 첨부 개수 불일치 (state=%s, current=%s)",
+            len(attachment_state),
+            current_uploaded_count,
+        )
+        return {}
     reusable: dict[str, list[str]] = {}
     seen_upload_ids: set[str] = set()
+    seen_names: set[str] = set()
     for entry in attachment_state:
         source_url = str(entry.get("source_url") or "").strip()
         upload_id = str(entry.get("upload_id") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        hosted_file_key = str(entry.get("hosted_file_key") or "").strip()
         if not source_url or not upload_id:
             LOGGER.info("기존 첨부 재사용 스킵: 상태 값 누락")
             return {}
@@ -312,13 +422,33 @@ def extract_existing_uploaded_attachment_ids(
                 upload_id,
             )
             return {}
-        if upload_id not in current_upload_ids:
+        if not name:
+            LOGGER.info("기존 첨부 재사용 스킵: 상태 첨부 이름 누락")
+            return {}
+        if name in seen_names:
+            LOGGER.info("기존 첨부 재사용 스킵: 상태 중복 이름 감지 (%s)", name)
+            return {}
+        if name not in current_uploaded_names:
+            LOGGER.info("기존 첨부 재사용 스킵: 현재 첨부 속성에 없는 이름 (%s)", name)
+            return {}
+        if saw_file_read_shape:
+            if not hosted_file_key:
+                LOGGER.info("기존 첨부 재사용 스킵: 상태 hosted_file_key 누락")
+                return {}
+            if hosted_file_key not in current_hosted_file_keys:
+                LOGGER.info(
+                    "기존 첨부 재사용 스킵: 현재 첨부 속성에 없는 hosted_file_key (%s)",
+                    hosted_file_key,
+                )
+                return {}
+        elif upload_id not in current_upload_ids:
             LOGGER.info(
                 "기존 첨부 재사용 스킵: 현재 첨부 속성에 없는 upload_id (%s)",
                 upload_id,
             )
             return {}
         seen_upload_ids.add(upload_id)
+        seen_names.add(name)
         reusable.setdefault(source_url, []).append(upload_id)
     return reusable
 
@@ -347,40 +477,83 @@ def extract_existing_uploaded_media_blocks(
     except NotionRequestError as exc:
         LOGGER.info("기존 본문 미디어 조회 실패: %s (%s)", container_id, exc)
         return {}
-    uploaded_blocks_by_id: dict[str, dict] = {}
-    for block in children:
-        if not is_uploaded_media_block(block):
-            continue
-        sanitized = sanitize_uploaded_media_block(block)
-        if not sanitized:
-            LOGGER.info(
-                "기존 본문 미디어 재사용 스킵: 생성용 블록 정리 실패 (%s)",
-                block.get("type"),
-            )
-            return {}
-        upload_id = extract_file_upload_id_from_sanitized_block(sanitized)
-        if not upload_id:
-            LOGGER.info("기존 본문 미디어 재사용 스킵: upload_id 누락")
-            return {}
-        if upload_id in uploaded_blocks_by_id:
-            LOGGER.info(
-                "기존 본문 미디어 재사용 스킵: 중복 upload_id 감지 (%s)",
-                upload_id,
-            )
-            return {}
-        uploaded_blocks_by_id[upload_id] = sanitized
-    # media_state와 현재 컨테이너의 실제 upload_id 집합이 조금이라도 다르면 재사용을 포기해,
-    # 순서가 같아 보여도 수동 편집으로 다른 업로드 블록이 들어온 경우를 안전하게 차단한다.
-    if len(uploaded_blocks_by_id) != len(media_state):
+    hosted_blocks_in_order = [block for block in children if is_notion_hosted_media_block(block)]
+    if len(hosted_blocks_in_order) != len(media_state):
         LOGGER.info(
             "기존 본문 미디어 재사용 스킵: 미디어 개수 불일치 (state=%s, blocks=%s)",
             len(media_state),
-            len(uploaded_blocks_by_id),
+            len(hosted_blocks_in_order),
         )
         return {}
+    blocks_by_id: dict[str, dict] = {}
+    for block in hosted_blocks_in_order:
+        block_id = str(block.get("id") or "").strip()
+        if not block_id:
+            LOGGER.info("기존 본문 미디어 재사용 스킵: 현재 블록 id 누락")
+            return {}
+        if block_id in blocks_by_id:
+            LOGGER.info("기존 본문 미디어 재사용 스킵: 현재 블록 id 중복 (%s)", block_id)
+            return {}
+        blocks_by_id[block_id] = block
     reusable: dict[tuple[str, str], list[dict]] = {}
     seen_upload_ids: set[str] = set()
-    for meta in media_state:
+    state_has_block_ids = all(str(meta.get("block_id") or "").strip() for meta in media_state)
+    if state_has_block_ids:
+        # file_upload는 write-only일 수 있으므로, 현재 read 응답에서는 block_id로 동일 블록을 찾고
+        # append payload는 저장된 upload_id로 다시 만든다.
+        for meta in media_state:
+            upload_id = str(meta.get("upload_id") or "").strip()
+            block_id = str(meta.get("block_id") or "").strip()
+            if not upload_id or not block_id:
+                LOGGER.info("기존 본문 미디어 재사용 스킵: 상태 값 누락")
+                return {}
+            if upload_id in seen_upload_ids:
+                LOGGER.info(
+                    "기존 본문 미디어 재사용 스킵: 상태 중복 upload_id 감지 (%s)",
+                    upload_id,
+                )
+                return {}
+            seen_upload_ids.add(upload_id)
+            block = blocks_by_id.get(block_id)
+            if not block:
+                LOGGER.info(
+                    "기존 본문 미디어 재사용 스킵: 현재 컨테이너에 없는 block_id (%s)",
+                    block_id,
+                )
+                return {}
+            if str(block.get("type") or "") != meta["type"]:
+                LOGGER.info(
+                    "기존 본문 미디어 재사용 스킵: block_id 타입 불일치 (%s, state=%s, block=%s)",
+                    block_id,
+                    meta["type"],
+                    block.get("type"),
+                )
+                return {}
+            sanitized = sanitize_uploaded_media_block(block, upload_id)
+            if not sanitized:
+                LOGGER.info(
+                    "기존 본문 미디어 재사용 스킵: 생성용 블록 정리 실패 (%s)",
+                    block.get("type"),
+                )
+                return {}
+            key = (meta["type"], meta["source_url"])
+            reusable.setdefault(key, []).append(copy.deepcopy(sanitized))
+        return reusable
+    # block_id가 없는 예전 상태는 read 응답이 file/file_upload 중 무엇이든 올 수 있으므로,
+    # 같은 타입이 반복되지 않는 경우에만 현재 블록 순서와 타입 시퀀스를 보수적으로 맞춰 재사용한다.
+    state_types = [str(meta.get("type") or "").strip() for meta in media_state]
+    block_types = [str(block.get("type") or "").strip() for block in hosted_blocks_in_order]
+    if state_types != block_types:
+        LOGGER.info(
+            "기존 본문 미디어 재사용 스킵: 타입 시퀀스 불일치 (state=%s, blocks=%s)",
+            state_types,
+            block_types,
+        )
+        return {}
+    if len(set(state_types)) != len(state_types):
+        LOGGER.info("기존 본문 미디어 재사용 스킵: block_id 없는 동일 타입 반복 상태")
+        return {}
+    for meta, block in zip(media_state, hosted_blocks_in_order):
         upload_id = str(meta.get("upload_id") or "").strip()
         if not upload_id:
             LOGGER.info("기존 본문 미디어 재사용 스킵: 상태 upload_id 누락")
@@ -392,24 +565,58 @@ def extract_existing_uploaded_media_blocks(
             )
             return {}
         seen_upload_ids.add(upload_id)
-        block = uploaded_blocks_by_id.get(upload_id)
-        if not block:
+        sanitized = sanitize_uploaded_media_block(block, upload_id)
+        if not sanitized:
             LOGGER.info(
-                "기존 본문 미디어 재사용 스킵: 현재 컨테이너에 없는 upload_id (%s)",
-                upload_id,
-            )
-            return {}
-        if str(block.get("type") or "") != meta["type"]:
-            LOGGER.info(
-                "기존 본문 미디어 재사용 스킵: upload_id 타입 불일치 (%s, state=%s, block=%s)",
-                upload_id,
-                meta["type"],
+                "기존 본문 미디어 재사용 스킵: 생성용 블록 정리 실패 (%s)",
                 block.get("type"),
             )
             return {}
         key = (meta["type"], meta["source_url"])
-        reusable.setdefault(key, []).append(copy.deepcopy(block))
+        reusable.setdefault(key, []).append(copy.deepcopy(sanitized))
     return reusable
+
+
+def enrich_body_media_state_with_block_ids(
+    token: str,
+    page_id: str,
+    media_state: list[dict],
+) -> list[dict]:
+    if not page_id or not media_state:
+        return media_state
+    try:
+        container = find_sync_container_block(token, page_id)
+    except NotionRequestError as exc:
+        LOGGER.info("본문 미디어 상태 block_id 보강 스킵: 컨테이너 조회 실패 (%s)", exc)
+        return media_state
+    if not container:
+        return media_state
+    container_id = str(container.get("id") or "").strip()
+    if not container_id:
+        return media_state
+    try:
+        children = list_block_children(token, container_id)
+    except NotionRequestError as exc:
+        LOGGER.info("본문 미디어 상태 block_id 보강 스킵: 하위 블록 조회 실패 (%s)", exc)
+        return media_state
+    hosted_blocks_in_order = [block for block in children if is_notion_hosted_media_block(block)]
+    if len(hosted_blocks_in_order) != len(media_state):
+        return media_state
+    state_types = [str(meta.get("type") or "").strip() for meta in media_state]
+    block_types = [str(block.get("type") or "").strip() for block in hosted_blocks_in_order]
+    if state_types != block_types:
+        return media_state
+    enriched: list[dict] = []
+    seen_block_ids: set[str] = set()
+    for meta, block in zip(media_state, hosted_blocks_in_order):
+        block_id = str(block.get("id") or "").strip()
+        if not block_id or block_id in seen_block_ids:
+            return media_state
+        enriched_entry = dict(meta)
+        enriched_entry["block_id"] = block_id
+        enriched.append(enriched_entry)
+        seen_block_ids.add(block_id)
+    return enriched
 
 
 def update_quote_block(token: str, block_id: str, rich_text: list[dict]) -> None:
