@@ -1,4 +1,5 @@
 import os
+import json
 
 from common import ensure_item_title
 from crawler import crawl_top_items, run_attachment_policy_selftest
@@ -8,6 +9,7 @@ from notion_client import (
     create_page,
     ensure_attachment_property,
     ensure_body_hash_property,
+    ensure_body_media_state_property,
     ensure_classification_property,
     ensure_required_properties,
     ensure_select_options_batch,
@@ -23,6 +25,7 @@ from settings import (
     AUTHOR_PROPERTY,
     BODY_HASH_IMAGE_MODE_UPLOAD,
     BODY_HASH_PROPERTY,
+    BODY_MEDIA_STATE_PROPERTY,
     CLASSIFICATION_PROPERTY,
     TYPE_PROPERTY,
     get_bbs_config_fk,
@@ -38,12 +41,20 @@ from sync import (
     build_properties,
     dedupe_database_by_url,
     disable_missing_top,
+    extract_body_media_state,
+    extract_existing_uploaded_media_blocks,
     extract_rich_text_value,
     extract_type_from_title,
     find_existing_page,
     sync_page_body_blocks,
 )
-from utils import compute_body_hash, has_image_blocks, normalize_body_blocks_for_hash
+from utils import (
+    build_rich_text_chunks,
+    collect_uploaded_media_state,
+    compute_body_hash,
+    has_image_blocks,
+    normalize_body_blocks_for_hash,
+)
 from utils import normalize_date_key, normalize_detail_url
 
 
@@ -116,6 +127,7 @@ def main() -> None:
         database = ensure_required_properties(notion_token, database_id, database)
         database = ensure_attachment_property(notion_token, database_id, database)
         database = ensure_body_hash_property(notion_token, database_id, database)
+        database = ensure_body_media_state_property(notion_token, database_id, database)
         database = ensure_classification_property(notion_token, database_id, database)
         database = ensure_views_property(notion_token, database_id, database)
         current_stage = "시작 URL 중복 정리"
@@ -203,9 +215,13 @@ def main() -> None:
                 )
                 page_id = existing_page.get("id") if existing_page else None
                 existing_hash = ""
+                existing_media_state: list[dict] = []
                 if has_body_hash_property and existing_page:
                     existing_hash = extract_rich_text_value(
                         existing_page.get("properties", {}), BODY_HASH_PROPERTY
+                    )
+                    existing_media_state = extract_body_media_state(
+                        existing_page.get("properties", {})
                     )
                 action = "업데이트" if page_id else "생성"
                 if page_id:
@@ -229,13 +245,22 @@ def main() -> None:
                             desired_hash_blocks, image_mode=image_mode
                         )
                         if desired_body_hash != existing_hash:
+                            # 부분 성공 뒤 다시 돌 때는, 이전 실행에서 이미 올라간 미디어 블록을 그대로 재사용해 중복 업로드를 줄인다.
+                            reusable_uploaded_media = extract_existing_uploaded_media_blocks(
+                                notion_token,
+                                page_id,
+                                existing_media_state,
+                            )
                             blocks_for_sync, actual_hash_blocks = prepare_body_blocks_for_sync(
-                                notion_token, body_blocks
+                                notion_token,
+                                body_blocks,
+                                reusable_uploaded_media=reusable_uploaded_media,
                             )
                             actual_body_hash = compute_body_hash(
                                 actual_hash_blocks, image_mode=image_mode
                             )
                             if actual_body_hash != existing_hash:
+                                media_state = collect_uploaded_media_state(actual_hash_blocks)
                                 sync_page_body_blocks(
                                     notion_token,
                                     page_id,
@@ -253,13 +278,19 @@ def main() -> None:
                                     page_id,
                                     {
                                         BODY_HASH_PROPERTY: {
-                                            "rich_text": [
-                                                {
-                                                    "type": "text",
-                                                    "text": {"content": actual_body_hash},
-                                                }
-                                            ]
-                                        }
+                                            "rich_text": build_rich_text_chunks(
+                                                actual_body_hash
+                                            )
+                                        },
+                                        BODY_MEDIA_STATE_PROPERTY: {
+                                            "rich_text": build_rich_text_chunks(
+                                                json.dumps(
+                                                    media_state,
+                                                    ensure_ascii=False,
+                                                    separators=(",", ":"),
+                                                )
+                                            )
+                                        },
                                     },
                                 )
                             else:

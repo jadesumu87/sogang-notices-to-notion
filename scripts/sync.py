@@ -1,3 +1,5 @@
+import copy
+import json
 import re
 from typing import Optional
 
@@ -14,6 +16,7 @@ from notion_client import (
     archive_page,
     delete_block,
     list_block_children,
+    notion_request,
     query_database,
     query_database_page,
     update_page,
@@ -21,6 +24,7 @@ from notion_client import (
 from settings import (
     ATTACHMENT_PROPERTY,
     AUTHOR_PROPERTY,
+    BODY_MEDIA_STATE_PROPERTY,
     CLASSIFICATION_PROPERTY,
     DATE_PROPERTY,
     FALLBACK_TYPE,
@@ -35,6 +39,8 @@ from settings import (
 from utils import (
     DEFAULT_ANNOTATIONS,
     build_container_block,
+    build_file_block,
+    build_pdf_block,
     build_space_rich_text,
     chunks,
     normalize_date_key,
@@ -113,6 +119,153 @@ def find_sync_container_id(token: str, page_id: str) -> Optional[str]:
             except NotionRequestError as exc:
                 LOGGER.info("하위 블록 조회 실패: %s (%s)", block_id, exc)
     return None
+
+
+# preserve/overwrite 공통으로 지금 페이지가 관리 중인 컨테이너를 찾는다.
+def find_sync_container_block(token: str, page_id: str) -> Optional[dict]:
+    top_blocks = list_block_children(token, page_id)
+    quote_blocks: list[dict] = []
+    for block in top_blocks:
+        if block.get("type") != "quote":
+            continue
+        quote_blocks.append(block)
+        rich_text = block.get("quote", {}).get("rich_text", [])
+        if has_sync_marker(rich_text):
+            return block
+    # overwrite 모드에는 마커가 없으므로, 최상위 블록이 quote 하나뿐일 때만 컨테이너로 간주한다.
+    # 여러 최상위 블록이 섞여 있으면 사용자가 수동으로 추가한 quote를 잘못 재사용할 수 있으니 보수적으로 포기한다.
+    if len(top_blocks) == 1 and len(quote_blocks) == 1:
+        return quote_blocks[0]
+    return None
+
+
+def is_uploaded_media_block(block: dict) -> bool:
+    block_type = block.get("type")
+    if block_type == "image":
+        return block.get("image", {}).get("type") == "file_upload"
+    if block_type in {"file", "pdf"}:
+        return block.get(block_type, {}).get("type") == "file_upload"
+    return False
+
+
+def sanitize_uploaded_media_block(block: dict) -> Optional[dict]:
+    block_type = block.get("type")
+    # list_block_children 응답에는 id, created_time 같은 읽기 전용 필드가 섞여 오므로,
+    # 재사용할 때는 append 가능한 최소 payload만 다시 구성해야 잘못된 블록 상태가 전파되지 않는다.
+    if block_type == "image":
+        image = block.get("image", {})
+        if image.get("type") != "file_upload":
+            return None
+        upload_id = str(image.get("file_upload", {}).get("id") or "").strip()
+        if not upload_id:
+            return None
+        sanitized = {
+            "object": "block",
+            "type": "image",
+            "image": {"type": "file_upload", "file_upload": {"id": upload_id}},
+        }
+        caption = image.get("caption")
+        if caption:
+            sanitized["image"]["caption"] = copy.deepcopy(caption)
+        return sanitized
+    if block_type == "file":
+        payload = block.get("file", {})
+        if payload.get("type") != "file_upload":
+            return None
+        upload_id = str(payload.get("file_upload", {}).get("id") or "").strip()
+        if not upload_id:
+            return None
+        return build_file_block(upload_id)
+    if block_type == "pdf":
+        payload = block.get("pdf", {})
+        if payload.get("type") != "file_upload":
+            return None
+        upload_id = str(payload.get("file_upload", {}).get("id") or "").strip()
+        if not upload_id:
+            return None
+        return build_pdf_block(upload_id)
+    return None
+
+
+def extract_body_media_state(properties: dict) -> list[dict]:
+    raw = extract_rich_text_value(properties, BODY_MEDIA_STATE_PROPERTY)
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        LOGGER.info("본문 미디어 상태 파싱 실패: JSON decode error")
+        return []
+    if not isinstance(payload, list):
+        LOGGER.info("본문 미디어 상태 파싱 실패: list 아님")
+        return []
+    items: list[dict] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        media_type = str(entry.get("type") or "").strip()
+        source_url = str(entry.get("source_url") or "").strip()
+        if media_type not in {"image", "file", "pdf"} or not source_url:
+            continue
+        items.append({"type": media_type, "source_url": source_url})
+    return items
+
+
+# 이전 sync에서 이미 성공한 업로드 블록을 source_url 기준으로 재사용해, 부분 성공 뒤 다음 실행에서 같은 파일을 또 올리지 않게 한다.
+def extract_existing_uploaded_media_blocks(
+    token: str,
+    page_id: str,
+    media_state: list[dict],
+) -> dict[tuple[str, str], list[dict]]:
+    if not page_id or not media_state:
+        return {}
+    container = find_sync_container_block(token, page_id)
+    if not container:
+        return {}
+    container_id = container.get("id")
+    if not container_id:
+        return {}
+    try:
+        children = list_block_children(token, container_id)
+    except NotionRequestError as exc:
+        LOGGER.info("기존 본문 미디어 조회 실패: %s (%s)", container_id, exc)
+        return {}
+    uploaded_blocks: list[dict] = []
+    uploaded_types: list[str] = []
+    for block in children:
+        if not is_uploaded_media_block(block):
+            continue
+        sanitized = sanitize_uploaded_media_block(block)
+        if not sanitized:
+            LOGGER.info(
+                "기존 본문 미디어 재사용 스킵: 생성용 블록 정리 실패 (%s)",
+                block.get("type"),
+            )
+            return {}
+        uploaded_blocks.append(sanitized)
+        uploaded_types.append(str(sanitized.get("type") or ""))
+    state_types = [meta["type"] for meta in media_state]
+    # media_state와 실제 업로드 블록이 조금이라도 어긋나면 재사용을 포기해,
+    # 잘못된 블록이 source_url과 섞여 들어가며 해시와 실제 본문이 갈라지는 상황을 막는다.
+    if len(uploaded_blocks) != len(media_state):
+        LOGGER.info(
+            "기존 본문 미디어 재사용 스킵: 미디어 개수 불일치 (state=%s, blocks=%s)",
+            len(media_state),
+            len(uploaded_blocks),
+        )
+        return {}
+    if uploaded_types != state_types:
+        LOGGER.info(
+            "기존 본문 미디어 재사용 스킵: 미디어 타입 시퀀스 불일치 (state=%s, blocks=%s)",
+            state_types,
+            uploaded_types,
+        )
+        return {}
+    reusable: dict[tuple[str, str], list[dict]] = {}
+    for meta, block in zip(media_state, uploaded_blocks):
+        key = (meta["type"], meta["source_url"])
+        reusable.setdefault(key, []).append(block)
+    return reusable
 
 
 def update_quote_block(token: str, block_id: str, rich_text: list[dict]) -> None:

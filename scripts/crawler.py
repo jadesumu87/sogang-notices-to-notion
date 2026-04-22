@@ -107,7 +107,8 @@ def run_attachment_policy_selftest() -> None:
         # 본문 image/embed 경로도 allowlist와 업로드 결과가 해시에 반영되는지 함께 확인한다.
         import notion_client as notion_client_module
         from notion_client import prepare_body_blocks_for_sync
-        from utils import compute_body_hash, normalize_body_blocks_for_hash
+        import sync as sync_module
+        from utils import build_pdf_block, compute_body_hash, normalize_body_blocks_for_hash
 
         notion_upload_backup = notion_client_module.upload_external_file_to_notion
 
@@ -187,6 +188,86 @@ def run_attachment_policy_selftest() -> None:
         ):
             raise RuntimeError("본문 업로드 셀프테스트 실패(부분 실패 재시도)")
 
+        def fake_upload_should_not_run(
+            token: str,
+            url: str,
+            filename: str,
+            expect_image: bool = False,
+            filename_hint: Optional[str] = None,
+        ) -> Optional[str]:
+            raise RuntimeError("재사용 가능한 업로드 블록이 있는데 업로드가 다시 호출됨")
+
+        notion_client_module.upload_external_file_to_notion = fake_upload_should_not_run
+        reusable_image = {
+            "object": "block",
+            "type": "image",
+            "image": {"type": "file_upload", "file_upload": {"id": "reused-test-image"}},
+        }
+        reusable_pdf = build_pdf_block("reused-test-pdf")
+        reused_blocks, reused_hash_blocks = prepare_body_blocks_for_sync(
+            "selftest-token",
+            allowed_blocks,
+            reusable_uploaded_media={
+                (
+                    "image",
+                    "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                ): [reusable_image],
+                (
+                    "pdf",
+                    "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf",
+                ): [reusable_pdf]
+            },
+        )
+        reused_hash = compute_body_hash(
+            reused_hash_blocks,
+            image_mode="upload-files-v1",
+        )
+        if (
+            reused_blocks[0].get("image", {}).get("file_upload", {}).get("id") != "reused-test-image"
+            or reused_blocks[0].get("image", {}).get("caption", [{}])[0].get("text", {}).get("content") != "sample"
+            or
+            reused_blocks[1].get("type") != "pdf"
+            or reused_blocks[1].get("pdf", {}).get("file_upload", {}).get("id") != "reused-test-pdf"
+            or reused_hash != desired_hash
+        ):
+            raise RuntimeError("본문 업로드 셀프테스트 실패(기존 업로드 재사용)")
+
+        captioned_reusable_image = {
+            "object": "block",
+            "type": "image",
+            "image": {
+                "type": "file_upload",
+                "file_upload": {"id": "caption-test-image"},
+                "caption": [{"type": "text", "text": {"content": "old caption"}}],
+            },
+        }
+        caption_removed_blocks, caption_removed_hash_blocks = prepare_body_blocks_for_sync(
+            "selftest-token",
+            [
+                {
+                    "object": "block",
+                    "type": "image",
+                    "image": {
+                        "type": "external",
+                        "external": {
+                            "url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg"
+                        },
+                    },
+                }
+            ],
+            reusable_uploaded_media={
+                (
+                    "image",
+                    "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                ): [captioned_reusable_image]
+            },
+        )
+        if (
+            "caption" in caption_removed_blocks[0].get("image", {})
+            or "caption" in caption_removed_hash_blocks[0].get("image", {})
+        ):
+            raise RuntimeError("본문 업로드 셀프테스트 실패(캡션 제거 반영)")
+
         notion_client_module.upload_external_file_to_notion = fake_upload_success
         blocked_blocks = [
             {
@@ -208,6 +289,144 @@ def run_attachment_policy_selftest() -> None:
         )
         if blocked_prepared != blocked_blocks or blocked_hash_blocks != blocked_blocks:
             raise RuntimeError("본문 업로드 셀프테스트 실패(차단 URL 유지)")
+        if get_detail_html_fallback_reason(
+            {
+                "title": "",
+                "regDate": "20260422103030",
+                "content": "<p>fragment body</p>",
+            },
+            entry_title="목록 제목",
+        ):
+            raise RuntimeError("상세 폴백 셀프테스트 실패(fragment body/title fallback)")
+        original_list_block_children = sync_module.list_block_children
+        try:
+            def fake_list_block_children(_token: str, _page_id: str):
+                return [
+                    {
+                        "id": "quote-user",
+                        "type": "quote",
+                        "quote": {
+                            "rich_text": [{"plain_text": "사용자 quote"}]
+                        },
+                    },
+                    {
+                        "id": "quote-sync",
+                        "type": "quote",
+                        "quote": {
+                            "rich_text": [{"plain_text": "본문 컨테이너"}]
+                        },
+                    },
+                ]
+
+            sync_module.list_block_children = fake_list_block_children
+            if sync_module.find_sync_container_block("selftest-token", "selftest-page"):
+                raise RuntimeError("본문 업로드 셀프테스트 실패(overwrite 컨테이너 추정)")
+        finally:
+            sync_module.list_block_children = original_list_block_children
+        original_find_sync_container_block = sync_module.find_sync_container_block
+        original_list_block_children = sync_module.list_block_children
+        try:
+            sync_module.find_sync_container_block = (
+                lambda _token, _page_id: {"id": "sync-container"}
+            )
+
+            def fake_misaligned_uploaded_children(_token: str, _page_id: str):
+                return [
+                    {
+                        "id": "file-1",
+                        "type": "file",
+                        "file": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "file-upload-1"},
+                        },
+                    },
+                    {
+                        "id": "image-1",
+                        "type": "image",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "image-upload-1"},
+                        },
+                    },
+                    {
+                        "id": "pdf-1",
+                        "type": "pdf",
+                        "pdf": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "pdf-upload-1"},
+                        },
+                    },
+                ]
+
+            sync_module.list_block_children = fake_misaligned_uploaded_children
+            if sync_module.extract_existing_uploaded_media_blocks(
+                "selftest-token",
+                "selftest-page",
+                [
+                    {
+                        "type": "image",
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                    },
+                    {
+                        "type": "pdf",
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf",
+                    },
+                ],
+            ):
+                raise RuntimeError("본문 업로드 셀프테스트 실패(재사용 fail-closed)")
+
+            def fake_uploaded_image_child(_token: str, _page_id: str):
+                return [
+                    {
+                        "id": "image-raw",
+                        "type": "image",
+                        "has_children": False,
+                        "archived": False,
+                        "created_time": "2026-04-22T00:00:00.000Z",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "image-upload-sanitized"},
+                            "caption": [
+                                {"type": "text", "text": {"content": "caption kept"}}
+                            ],
+                        },
+                    }
+                ]
+
+            sync_module.list_block_children = fake_uploaded_image_child
+            sanitized_reusable = sync_module.extract_existing_uploaded_media_blocks(
+                "selftest-token",
+                "selftest-page",
+                [
+                    {
+                        "type": "image",
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                    }
+                ],
+            )
+            expected_reusable = {
+                (
+                    "image",
+                    "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                ): [
+                    {
+                        "object": "block",
+                        "type": "image",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "image-upload-sanitized"},
+                            "caption": [
+                                {"type": "text", "text": {"content": "caption kept"}}
+                            ],
+                        },
+                    }
+                ]
+            }
+            if sanitized_reusable != expected_reusable:
+                raise RuntimeError("본문 업로드 셀프테스트 실패(재사용 sanitize)")
+        finally:
+            sync_module.find_sync_container_block = original_find_sync_container_block
+            sync_module.list_block_children = original_list_block_children
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -406,18 +625,25 @@ def fetch_bbs_detail(pk_id: str, config_fk: Optional[str] = None) -> Optional[di
 
 
 # 상세 API가 200을 돌려줘도 핵심 필드가 비면 HTML 보완 조회를 태워서 조용한 부분 실패를 줄인다.
-def get_detail_html_fallback_reason(detail: Optional[dict]) -> Optional[str]:
+def get_detail_html_fallback_reason(
+    detail: Optional[dict],
+    entry_title: str = "",
+) -> Optional[str]:
     if detail is None:
         return "api_missing"
     if not isinstance(detail, dict):
         return "api_invalid"
     reasons: list[str] = []
-    if not normalize_title_key(str(detail.get("title") or "")):
+    detail_title = normalize_title_key(str(detail.get("title") or ""))
+    list_title = normalize_title_key(entry_title)
+    if not detail_title and not list_title:
         reasons.append("title_missing")
     if not parse_compact_datetime(detail.get("regDate")):
         reasons.append("date_missing")
     content_html = str(detail.get("content") or "")
-    if not content_html or not detect_body_has_content(content_html):
+    # wrapper 없는 fragment도 실제 파서로는 읽을 수 있으니, 감지기보다 블록 추출 결과를 기준으로 폴백 여부를 맞춘다.
+    body_blocks = extract_body_blocks_from_html(content_html) if content_html else []
+    if not body_blocks:
         reasons.append("body_missing")
     attachments = extract_attachments_from_api_data(detail)
     if not attachments and content_html and ATTACHMENT_LINK_PATTERN.search(content_html):
@@ -715,7 +941,10 @@ def crawl_top_items_api(
             fallback_written_at: Optional[str] = None
             fallback_attachments: list[dict] = []
             fallback_body_blocks: list[dict] = []
-            fallback_reason = get_detail_html_fallback_reason(detail)
+            fallback_reason = get_detail_html_fallback_reason(
+                detail,
+                entry_title=str(entry.get("title") or ""),
+            )
             if fallback_reason:
                 detail = detail if isinstance(detail, dict) else {}
                 (
