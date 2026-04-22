@@ -44,6 +44,12 @@ from utils import (
 
 FILE_UPLOAD_CACHE: dict[str, str] = {}
 WORKSPACE_UPLOAD_LIMIT: Optional[int] = None
+# Notion 문서 기준 평균 3 req/s 수준을 넘지 않도록 프로세스 전체 요청 간격을 완만하게 제한한다.
+NOTION_MIN_REQUEST_INTERVAL_SECONDS = 0.35
+NOTION_MAX_RETRIES = 5
+NOTION_RATE_LIMIT_BASE_DELAY_SECONDS = 3.0
+NOTION_TRANSIENT_BASE_DELAY_SECONDS = 1.0
+NEXT_NOTION_REQUEST_AT = 0.0
 
 
 class NotionRequestError(RuntimeError):
@@ -131,6 +137,44 @@ def format_notion_error_message(
     if hint:
         parts.append(f"hint={hint}")
     return " | ".join(parts)
+
+
+# Retry-After 헤더는 초 단위 문자열이므로, 정수·실수 형태를 모두 안전하게 읽어둔다.
+def parse_retry_after_seconds(raw_value: Optional[str]) -> Optional[float]:
+    if raw_value is None:
+        return None
+    try:
+        seconds = float(str(raw_value).strip())
+    except ValueError:
+        return None
+    return max(0.0, seconds)
+
+
+# 요청 시작 시점을 일정 간격으로 벌려서 연속 조회와 본문 동기화가 한꺼번에 몰리지 않게 한다.
+def wait_for_notion_request_slot() -> None:
+    global NEXT_NOTION_REQUEST_AT
+    now = time.monotonic()
+    sleep_s = NEXT_NOTION_REQUEST_AT - now
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+        now = time.monotonic()
+    NEXT_NOTION_REQUEST_AT = now + NOTION_MIN_REQUEST_INTERVAL_SECONDS
+
+
+# 429는 일반 네트워크 오류보다 더 길게 기다려야 다시 성공하는 경우가 많아서 별도 backoff를 둔다.
+def get_retry_sleep_seconds(
+    attempt: int,
+    status_code: Optional[int] = None,
+    retry_after: Optional[str] = None,
+) -> float:
+    if status_code == 429:
+        header_delay = parse_retry_after_seconds(retry_after) or 0.0
+        backoff_delay = min(
+            NOTION_RATE_LIMIT_BASE_DELAY_SECONDS * (2**attempt),
+            30.0,
+        )
+        return max(header_delay, backoff_delay)
+    return min(NOTION_TRANSIENT_BASE_DELAY_SECONDS * (2**attempt), 8.0)
 
 def download_file_bytes(url: str) -> tuple[Optional[bytes], Optional[str]]:
     req = urllib.request.Request(url, headers=build_site_headers())
@@ -265,11 +309,11 @@ def notion_request(
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-    max_retries = 3
-    backoff = 1.0
+    max_retries = NOTION_MAX_RETRIES
     request_target = summarize_request_target(url)
 
     for attempt in range(max_retries + 1):
+        wait_for_notion_request_slot()
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Authorization", f"Bearer {token}")
         req.add_header("Notion-Version", get_notion_api_version())
@@ -294,21 +338,22 @@ def notion_request(
             retryable = exc.code in {429, 500, 502, 503, 504}
             if retryable and attempt < max_retries:
                 retry_after = exc.headers.get("Retry-After")
-                if retry_after and retry_after.isdigit():
-                    sleep_s = float(retry_after)
-                else:
-                    sleep_s = backoff
+                sleep_s = get_retry_sleep_seconds(
+                    attempt,
+                    status_code=exc.code,
+                    retry_after=retry_after,
+                )
                 LOGGER.info(
-                    "Notion API 재시도(%s/%s): %s %s -> HTTP %s%s",
+                    "Notion API 재시도(%s/%s): %s %s -> HTTP %s%s, 대기=%.1fs",
                     attempt + 1,
                     max_retries,
                     method,
                     request_target,
                     exc.code,
                     f" {notion_code}" if notion_code else "",
+                    sleep_s,
                 )
                 time.sleep(sleep_s)
-                backoff = min(backoff * 2, 8.0)
                 continue
             raise NotionRequestError(
                 format_notion_error_message(
@@ -330,15 +375,16 @@ def notion_request(
             ) from exc
         except (socket.timeout, TimeoutError) as exc:
             if attempt < max_retries:
+                sleep_s = get_retry_sleep_seconds(attempt)
                 LOGGER.info(
-                    "Notion API 재시도(%s/%s): %s %s -> timeout",
+                    "Notion API 재시도(%s/%s): %s %s -> timeout, 대기=%.1fs",
                     attempt + 1,
                     max_retries,
                     method,
                     request_target,
+                    sleep_s,
                 )
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 8.0)
+                time.sleep(sleep_s)
                 continue
             raise NotionRequestError(
                 format_notion_error_message(
@@ -357,16 +403,17 @@ def notion_request(
         except urllib.error.URLError as exc:
             is_timeout = isinstance(exc.reason, socket.timeout)
             if attempt < max_retries:
+                sleep_s = get_retry_sleep_seconds(attempt)
                 LOGGER.info(
-                    "Notion API 재시도(%s/%s): %s %s -> %s",
+                    "Notion API 재시도(%s/%s): %s %s -> %s, 대기=%.1fs",
                     attempt + 1,
                     max_retries,
                     method,
                     request_target,
                     "timeout" if is_timeout else exc.reason,
+                    sleep_s,
                 )
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 8.0)
+                time.sleep(sleep_s)
                 continue
             if is_timeout:
                 raise NotionRequestError(

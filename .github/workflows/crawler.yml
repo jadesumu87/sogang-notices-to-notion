@@ -12,7 +12,8 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Notion 429 대응으로 재시도와 대기 시간이 늘 수 있어 작업 제한 시간을 조금 더 여유 있게 둔다.
+    timeout-minutes: 20
     env:
       TZ: Asia/Seoul
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
