@@ -8,6 +8,7 @@ from notion_client import (
     NotionRequestError,
     create_page,
     ensure_attachment_property,
+    ensure_attachment_state_property,
     ensure_body_hash_property,
     ensure_body_media_state_property,
     ensure_classification_property,
@@ -22,6 +23,7 @@ from notion_client import (
 )
 from bbs_parser import parse_rows
 from settings import (
+    ATTACHMENT_STATE_PROPERTY,
     AUTHOR_PROPERTY,
     BODY_HASH_IMAGE_MODE_UPLOAD,
     BODY_HASH_PROPERTY,
@@ -41,7 +43,9 @@ from sync import (
     build_properties,
     dedupe_database_by_url,
     disable_missing_top,
+    extract_attachment_state,
     extract_body_media_state,
+    extract_existing_uploaded_attachment_ids,
     extract_existing_uploaded_media_blocks,
     extract_rich_text_value,
     extract_type_from_title,
@@ -50,7 +54,6 @@ from sync import (
 )
 from utils import (
     build_rich_text_chunks,
-    collect_uploaded_media_state,
     compute_body_hash,
     has_image_blocks,
     normalize_body_blocks_for_hash,
@@ -126,6 +129,7 @@ def main() -> None:
         database = fetch_database(notion_token, database_id)
         database = ensure_required_properties(notion_token, database_id, database)
         database = ensure_attachment_property(notion_token, database_id, database)
+        database = ensure_attachment_state_property(notion_token, database_id, database)
         database = ensure_body_hash_property(notion_token, database_id, database)
         database = ensure_body_media_state_property(notion_token, database_id, database)
         database = ensure_classification_property(notion_token, database_id, database)
@@ -167,6 +171,7 @@ def main() -> None:
         has_classification_property = True
         has_views_property = True
         has_attachments_property = True
+        has_attachment_state_property = True
         has_body_hash_property = True
         sync_mode = get_sync_mode()
         upload_files = should_upload_files_to_notion()
@@ -194,18 +199,6 @@ def main() -> None:
             detail_status = item.get("detail_fetch_status") or "api"
             LOGGER.info("처리 시작: %s (상세=%s)", label, detail_status)
             try:
-                attachment_count = len(item.get("attachments") or [])
-                if upload_files and has_attachments_property and item.get("attachments"):
-                    item["attachments"] = prepare_attachments_for_sync(
-                        notion_token, item["attachments"]
-                    )
-                    attachment_count = len(item.get("attachments") or [])
-                properties = build_properties(
-                    item,
-                    has_views_property,
-                    has_attachments_property,
-                    has_classification_property,
-                )
                 existing_page = find_existing_page(
                     notion_token,
                     database_id,
@@ -216,6 +209,8 @@ def main() -> None:
                 page_id = existing_page.get("id") if existing_page else None
                 existing_hash = ""
                 existing_media_state: list[dict] = []
+                existing_attachment_state: list[dict] = []
+                existing_attachment_state_raw = ""
                 if has_body_hash_property and existing_page:
                     existing_hash = extract_rich_text_value(
                         existing_page.get("properties", {}), BODY_HASH_PROPERTY
@@ -223,6 +218,40 @@ def main() -> None:
                     existing_media_state = extract_body_media_state(
                         existing_page.get("properties", {})
                     )
+                if has_attachment_state_property and existing_page:
+                    existing_attachment_state = extract_attachment_state(
+                        existing_page.get("properties", {})
+                    )
+                    existing_attachment_state_raw = extract_rich_text_value(
+                        existing_page.get("properties", {}),
+                        ATTACHMENT_STATE_PROPERTY,
+                    )
+                attachment_count = len(item.get("attachments") or [])
+                attachment_state: list[dict] = []
+                if upload_files and has_attachments_property and "attachments" in item:
+                    reusable_uploaded_attachments = (
+                        extract_existing_uploaded_attachment_ids(
+                            existing_page.get("properties", {}) if existing_page else {},
+                            existing_attachment_state,
+                        )
+                        if existing_page
+                        else {}
+                    )
+                    # 기존 페이지를 먼저 찾은 뒤 첨부를 준비해야, 이미 올린 이미지 첨부를 같은 실행 안에서 또 업로드하지 않을 수 있다.
+                    item["attachments"], attachment_state = prepare_attachments_for_sync(
+                        notion_token,
+                        item["attachments"],
+                        reusable_uploaded_attachments=(
+                            reusable_uploaded_attachments or None
+                        ),
+                    )
+                    attachment_count = len(item.get("attachments") or [])
+                properties = build_properties(
+                    item,
+                    has_views_property,
+                    has_attachments_property,
+                    has_classification_property,
+                )
                 action = "업데이트" if page_id else "생성"
                 if page_id:
                     update_page(notion_token, page_id, properties)
@@ -230,6 +259,17 @@ def main() -> None:
                 else:
                     page_id = create_page(notion_token, database_id, properties)
                     created += 1
+                post_update_properties: dict = {}
+                if has_attachment_state_property:
+                    attachment_state_raw = json.dumps(
+                        attachment_state,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if attachment_state_raw != existing_attachment_state_raw:
+                        post_update_properties[ATTACHMENT_STATE_PROPERTY] = {
+                            "rich_text": build_rich_text_chunks(attachment_state_raw)
+                        }
                 body_state = "없음"
                 body_blocks = item.get("body_blocks", [])
                 if page_id and body_blocks:
@@ -251,7 +291,11 @@ def main() -> None:
                                 page_id,
                                 existing_media_state,
                             )
-                            blocks_for_sync, actual_hash_blocks = prepare_body_blocks_for_sync(
+                            (
+                                blocks_for_sync,
+                                actual_hash_blocks,
+                                actual_media_state,
+                            ) = prepare_body_blocks_for_sync(
                                 notion_token,
                                 body_blocks,
                                 reusable_uploaded_media=reusable_uploaded_media,
@@ -260,7 +304,6 @@ def main() -> None:
                                 actual_hash_blocks, image_mode=image_mode
                             )
                             if actual_body_hash != existing_hash:
-                                media_state = collect_uploaded_media_state(actual_hash_blocks)
                                 sync_page_body_blocks(
                                     notion_token,
                                     page_id,
@@ -273,26 +316,18 @@ def main() -> None:
                                     if actual_body_hash == desired_body_hash
                                     else "변경(미디어보류)"
                                 )
-                                update_page(
-                                    notion_token,
-                                    page_id,
-                                    {
-                                        BODY_HASH_PROPERTY: {
-                                            "rich_text": build_rich_text_chunks(
-                                                actual_body_hash
-                                            )
-                                        },
-                                        BODY_MEDIA_STATE_PROPERTY: {
-                                            "rich_text": build_rich_text_chunks(
-                                                json.dumps(
-                                                    media_state,
-                                                    ensure_ascii=False,
-                                                    separators=(",", ":"),
-                                                )
-                                            )
-                                        },
-                                    },
-                                )
+                                post_update_properties[BODY_HASH_PROPERTY] = {
+                                    "rich_text": build_rich_text_chunks(actual_body_hash)
+                                }
+                                post_update_properties[BODY_MEDIA_STATE_PROPERTY] = {
+                                    "rich_text": build_rich_text_chunks(
+                                        json.dumps(
+                                            actual_media_state,
+                                            ensure_ascii=False,
+                                            separators=(",", ":"),
+                                        )
+                                    )
+                                }
                             else:
                                 # 업로드 재시도를 했지만 실제 반영 상태가 바뀌지 않았다면, 다음 실행에서 다시 도전할 수 있게 유지로 남긴다.
                                 body_state = "유지(미디어재시도)"
@@ -303,7 +338,7 @@ def main() -> None:
                         else:
                             body_state = "유지"
                     else:
-                        blocks_for_sync, _hash_blocks = prepare_body_blocks_for_sync(
+                        blocks_for_sync, _hash_blocks, _media_state = prepare_body_blocks_for_sync(
                             notion_token, body_blocks
                         )
                         sync_page_body_blocks(
@@ -311,6 +346,8 @@ def main() -> None:
                         )
                         body_updated += 1
                         body_state = "동기화"
+                if page_id and post_update_properties:
+                    update_page(notion_token, page_id, post_update_properties)
                 LOGGER.info(
                     "처리 완료: %s (상태=%s, 본문=%s, 첨부=%s, 상세=%s)",
                     label,

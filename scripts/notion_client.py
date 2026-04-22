@@ -14,6 +14,7 @@ from urllib.parse import urlencode, urlsplit
 from log import LOGGER
 from settings import (
     ATTACHMENT_PROPERTY,
+    ATTACHMENT_STATE_PROPERTY,
     AUTHOR_PROPERTY,
     BODY_HASH_PROPERTY,
     BODY_MEDIA_STATE_PROPERTY,
@@ -747,10 +748,80 @@ def upload_external_file_to_notion(
     return upload_id
 
 
-def prepare_attachments_for_sync(token: str, attachments: list[dict]) -> list[dict]:
+def extract_file_upload_id_from_block(block: Optional[dict]) -> str:
+    if not isinstance(block, dict):
+        return ""
+    block_type = str(block.get("type") or "").strip()
+    if block_type not in {"image", "file", "pdf"}:
+        return ""
+    payload = block.get(block_type, {})
+    if payload.get("type") != "file_upload":
+        return ""
+    return str(payload.get("file_upload", {}).get("id") or "").strip()
+
+
+def build_uploaded_media_state_entry(
+    media_type: str, source_url: str, upload_id: str
+) -> Optional[dict]:
+    clean_type = str(media_type or "").strip()
+    clean_source_url = str(source_url or "").strip()
+    clean_upload_id = str(upload_id or "").strip()
+    if clean_type not in {"image", "file", "pdf"}:
+        return None
+    if not clean_source_url or not clean_upload_id:
+        return None
+    # 재사용 기준을 source_url만 두면 수동 편집 뒤 같은 타입 블록을 잘못 엮을 수 있으므로,
+    # 실제 업로드 식별자까지 함께 저장해 다음 실행에서 동일 블록인지 검증한다.
+    return {
+        "type": clean_type,
+        "source_url": clean_source_url,
+        "upload_id": clean_upload_id,
+    }
+
+
+def build_uploaded_attachment_state_entry(
+    source_url: str, name: str, upload_id: str
+) -> Optional[dict]:
+    clean_source_url = str(source_url or "").strip()
+    clean_name = str(name or "").strip()
+    clean_upload_id = str(upload_id or "").strip()
+    if not clean_source_url or not clean_upload_id:
+        return None
+    # 첨부도 run 간 중복 업로드를 줄이려면 source_url과 실제 업로드 id를 같이 기억해야 한다.
+    return {
+        "source_url": clean_source_url,
+        "name": clean_name,
+        "upload_id": clean_upload_id,
+    }
+
+
+def pop_reusable_uploaded_attachment_id(
+    reusable_uploaded_attachments: Optional[dict[str, list[str]]],
+    source_url: str,
+) -> Optional[str]:
+    if not reusable_uploaded_attachments:
+        return None
+    key = str(source_url or "").strip()
+    if not key:
+        return None
+    candidates = reusable_uploaded_attachments.get(key) or []
+    if not candidates:
+        return None
+    upload_id = str(candidates.pop(0) or "").strip()
+    if not candidates:
+        reusable_uploaded_attachments.pop(key, None)
+    return upload_id or None
+
+
+def prepare_attachments_for_sync(
+    token: str,
+    attachments: list[dict],
+    reusable_uploaded_attachments: Optional[dict[str, list[str]]] = None,
+) -> tuple[list[dict], list[dict]]:
     if not attachments or not should_upload_files_to_notion():
-        return attachments
+        return attachments, []
     updated: list[dict] = []
+    state: list[dict] = []
     for attachment in attachments:
         if attachment.get("type") != "external":
             updated.append(attachment)
@@ -760,14 +831,34 @@ def prepare_attachments_for_sync(token: str, attachments: list[dict]) -> list[di
         if not is_image_name_or_url(name, url):
             updated.append(attachment)
             continue
+        reused_upload_id = pop_reusable_uploaded_attachment_id(
+            reusable_uploaded_attachments, url
+        )
+        if reused_upload_id:
+            updated.append(
+                {
+                    "name": name,
+                    "type": "file_upload",
+                    "file_upload": {"id": reused_upload_id},
+                }
+            )
+            state_entry = build_uploaded_attachment_state_entry(
+                url, name, reused_upload_id
+            )
+            if state_entry:
+                state.append(state_entry)
+            continue
         upload_id = upload_external_file_to_notion(token, url, name, expect_image=True)
         if upload_id:
             updated.append(
                 {"name": name, "type": "file_upload", "file_upload": {"id": upload_id}}
             )
+            state_entry = build_uploaded_attachment_state_entry(url, name, upload_id)
+            if state_entry:
+                state.append(state_entry)
         else:
             updated.append(attachment)
-    return updated
+    return updated, state
 
 
 def pop_reusable_uploaded_media_block(
@@ -803,11 +894,12 @@ def prepare_body_blocks_for_sync(
     token: str,
     blocks: list[dict],
     reusable_uploaded_media: Optional[dict[tuple[str, str], list[dict]]] = None,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[dict]]:
     if not blocks or not should_upload_files_to_notion():
-        return blocks, blocks
+        return blocks, blocks, []
     updated: list[dict] = []
     hash_blocks: list[dict] = []
+    media_state: list[dict] = []
     for block in blocks:
         block_type = block.get("type")
         if block_type == "image":
@@ -848,6 +940,13 @@ def prepare_body_blocks_for_sync(
                 hash_blocks.append(
                     build_uploaded_image_hash_block(url, image.get("caption"))
                 )
+                state_entry = build_uploaded_media_state_entry(
+                    "image",
+                    url,
+                    extract_file_upload_id_from_block(reused_block),
+                )
+                if state_entry:
+                    media_state.append(state_entry)
                 continue
             filename = derive_filename_from_url(url, fallback="image")
             upload_id = upload_external_file_to_notion(
@@ -869,6 +968,9 @@ def prepare_body_blocks_for_sync(
             hash_blocks.append(
                 build_uploaded_image_hash_block(url, image.get("caption"))
             )
+            state_entry = build_uploaded_media_state_entry("image", url, upload_id)
+            if state_entry:
+                media_state.append(state_entry)
             continue
         if block_type == "embed":
             embed = block.get("embed", {})
@@ -901,6 +1003,13 @@ def prepare_body_blocks_for_sync(
                 hash_blocks.append(
                     build_uploaded_file_hash_block(url, as_pdf=media_type == "pdf")
                 )
+                state_entry = build_uploaded_media_state_entry(
+                    media_type,
+                    url,
+                    extract_file_upload_id_from_block(reused_block),
+                )
+                if state_entry:
+                    media_state.append(state_entry)
                 continue
             upload_id = upload_external_file_to_notion(
                 token, url, filename, expect_image=False
@@ -916,10 +1025,13 @@ def prepare_body_blocks_for_sync(
             else:
                 updated.append(build_file_block(upload_id))
                 hash_blocks.append(build_uploaded_file_hash_block(url, as_pdf=False))
+            state_entry = build_uploaded_media_state_entry(media_type, url, upload_id)
+            if state_entry:
+                media_state.append(state_entry)
             continue
         updated.append(block)
         hash_blocks.append(block)
-    return updated, hash_blocks
+    return updated, hash_blocks, media_state
 def fetch_database(token: str, database_id: str) -> dict:
     url = f"https://api.notion.com/v1/databases/{database_id}"
     return run_database_request_with_object_not_found_retry(
@@ -1056,6 +1168,22 @@ def ensure_attachment_property(token: str, database_id: str, database: dict) -> 
         return database
     LOGGER.info("Notion 속성 추가: %s", ATTACHMENT_PROPERTY)
     return update_database(token, database_id, {ATTACHMENT_PROPERTY: {"files": {}}})
+
+
+def ensure_attachment_state_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(ATTACHMENT_STATE_PROPERTY)
+    if prop:
+        if prop.get("type") != "rich_text":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {ATTACHMENT_STATE_PROPERTY} (rich_text 아님)"
+            )
+        return database
+    LOGGER.info("Notion 속성 추가: %s", ATTACHMENT_STATE_PROPERTY)
+    return update_database(
+        token,
+        database_id,
+        {ATTACHMENT_STATE_PROPERTY: {"rich_text": {}}},
+    )
 
 
 def ensure_body_hash_property(token: str, database_id: str, database: dict) -> dict:
