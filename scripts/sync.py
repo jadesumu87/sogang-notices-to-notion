@@ -205,6 +205,7 @@ def extract_body_media_state(properties: dict) -> list[dict]:
         source_url = str(entry.get("source_url") or "").strip()
         upload_id = str(entry.get("upload_id") or "").strip()
         block_id = str(entry.get("block_id") or "").strip()
+        hosted_file_key = str(entry.get("hosted_file_key") or "").strip()
         if media_type not in {"image", "file", "pdf"} or not source_url:
             continue
         normalized_entry = {"type": media_type, "source_url": source_url}
@@ -212,6 +213,8 @@ def extract_body_media_state(properties: dict) -> list[dict]:
             normalized_entry["upload_id"] = upload_id
         if block_id:
             normalized_entry["block_id"] = block_id
+        if hosted_file_key:
+            normalized_entry["hosted_file_key"] = hosted_file_key
         items.append(normalized_entry)
     return items
 
@@ -259,6 +262,18 @@ def normalize_notion_hosted_file_key(url: str) -> str:
         return ""
     # signed query는 자주 바뀌므로, 현재 read 응답에서 비교 가능한 식별 힌트는 호스트+경로까지만 사용한다.
     return f"{parsed.netloc}{parsed.path}"
+
+
+def extract_notion_hosted_file_key_from_block(block: dict) -> str:
+    block_type = str(block.get("type") or "").strip()
+    if block_type not in {"image", "file", "pdf"}:
+        return ""
+    payload = block.get(block_type, {})
+    # body read 응답도 page files 속성과 마찬가지로 file 타입으로 돌아올 수 있으므로,
+    # 현재 블록이 실제로 어떤 hosted 파일을 가리키는지는 file.url의 호스트+경로로 비교한다.
+    if payload.get("type") != "file":
+        return ""
+    return normalize_notion_hosted_file_key(payload.get("file", {}).get("url") or "")
 
 
 def enrich_attachment_state_with_properties(properties: dict, attachment_state: list[dict]) -> list[dict]:
@@ -501,9 +516,11 @@ def extract_existing_uploaded_media_blocks(
     if state_has_block_ids:
         # file_upload는 write-only일 수 있으므로, 현재 read 응답에서는 block_id로 동일 블록을 찾고
         # append payload는 저장된 upload_id로 다시 만든다.
+        # 여기에 hosted_file_key까지 함께 맞춰 두면, 같은 block_id를 유지한 채 본문 파일만 수동 교체한 경우도 재사용 전에 차단할 수 있다.
         for meta in media_state:
             upload_id = str(meta.get("upload_id") or "").strip()
             block_id = str(meta.get("block_id") or "").strip()
+            hosted_file_key = str(meta.get("hosted_file_key") or "").strip()
             if not upload_id or not block_id:
                 LOGGER.info("기존 본문 미디어 재사용 스킵: 상태 값 누락")
                 return {}
@@ -529,6 +546,20 @@ def extract_existing_uploaded_media_blocks(
                     block.get("type"),
                 )
                 return {}
+            if hosted_file_key:
+                current_hosted_file_key = extract_notion_hosted_file_key_from_block(block)
+                if not current_hosted_file_key:
+                    LOGGER.info(
+                        "기존 본문 미디어 재사용 스킵: 현재 블록 hosted_file_key 누락 (%s)",
+                        block_id,
+                    )
+                    return {}
+                if current_hosted_file_key != hosted_file_key:
+                    LOGGER.info(
+                        "기존 본문 미디어 재사용 스킵: hosted_file_key 불일치 (%s)",
+                        block_id,
+                    )
+                    return {}
             sanitized = sanitize_uploaded_media_block(block, upload_id)
             if not sanitized:
                 LOGGER.info(
@@ -555,6 +586,7 @@ def extract_existing_uploaded_media_blocks(
         return {}
     for meta, block in zip(media_state, hosted_blocks_in_order):
         upload_id = str(meta.get("upload_id") or "").strip()
+        hosted_file_key = str(meta.get("hosted_file_key") or "").strip()
         if not upload_id:
             LOGGER.info("기존 본문 미디어 재사용 스킵: 상태 upload_id 누락")
             return {}
@@ -565,6 +597,14 @@ def extract_existing_uploaded_media_blocks(
             )
             return {}
         seen_upload_ids.add(upload_id)
+        if hosted_file_key:
+            current_hosted_file_key = extract_notion_hosted_file_key_from_block(block)
+            if not current_hosted_file_key:
+                LOGGER.info("기존 본문 미디어 재사용 스킵: 현재 블록 hosted_file_key 누락")
+                return {}
+            if current_hosted_file_key != hosted_file_key:
+                LOGGER.info("기존 본문 미디어 재사용 스킵: hosted_file_key 불일치")
+                return {}
         sanitized = sanitize_uploaded_media_block(block, upload_id)
         if not sanitized:
             LOGGER.info(
@@ -614,6 +654,11 @@ def enrich_body_media_state_with_block_ids(
             return media_state
         enriched_entry = dict(meta)
         enriched_entry["block_id"] = block_id
+        # 다음 실행에서 같은 block_id를 가진 다른 hosted 파일로 수동 교체된 경우도 잡을 수 있게,
+        # 현재 read 응답 기준 hosted_file_key를 함께 저장한다.
+        hosted_file_key = extract_notion_hosted_file_key_from_block(block)
+        if hosted_file_key:
+            enriched_entry["hosted_file_key"] = hosted_file_key
         enriched.append(enriched_entry)
         seen_block_ids.add(block_id)
     return enriched
