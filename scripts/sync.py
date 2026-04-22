@@ -254,6 +254,12 @@ def extract_attachment_state(properties: dict) -> list[dict]:
     return items
 
 
+def normalize_item_attachments(item: dict) -> None:
+    # 수집기마다 첨부가 없을 때 attachments 키를 생략할 수 있으므로,
+    # 동기화 직전에는 항상 list로 정규화해 files=[] clear payload가 실제 런타임에서도 빠지지 않게 한다.
+    item["attachments"] = list(item.get("attachments") or [])
+
+
 def extract_existing_uploaded_attachment_ids(
     properties: dict,
     attachment_state: list[dict],
@@ -270,9 +276,16 @@ def extract_existing_uploaded_attachment_ids(
         if not isinstance(file_info, dict):
             LOGGER.info("기존 첨부 재사용 스킵: files 항목 형식 불일치")
             return {}
-        if file_info.get("type") != "file_upload":
-            # 첨부 속성에 수동 편집으로 외부 파일 등이 섞였으면 현재 상태를 신뢰하지 않고 재사용을 끈다.
-            LOGGER.info("기존 첨부 재사용 스킵: file_upload가 아닌 첨부 감지")
+        file_type = str(file_info.get("type") or "").strip()
+        # 현재 정책상 이미지 첨부만 file_upload로 바꾸고 나머지는 external로 남길 수 있으므로,
+        # mixed attachment 페이지에서도 업로드된 첨부만 부분 재사용할 수 있게 external은 무시한다.
+        if file_type == "external":
+            continue
+        if file_type != "file_upload":
+            LOGGER.info(
+                "기존 첨부 재사용 스킵: 알 수 없는 첨부 타입 감지 (%s)",
+                file_type or "unknown",
+            )
             return {}
         upload_id = str(file_info.get("file_upload", {}).get("id") or "").strip()
         if not upload_id:

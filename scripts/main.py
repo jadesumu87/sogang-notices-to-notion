@@ -50,6 +50,7 @@ from sync import (
     extract_rich_text_value,
     extract_type_from_title,
     find_existing_page,
+    normalize_item_attachments,
     sync_page_body_blocks,
 )
 from utils import (
@@ -199,6 +200,10 @@ def main() -> None:
             detail_status = item.get("detail_fetch_status") or "api"
             LOGGER.info("처리 시작: %s (상세=%s)", label, detail_status)
             try:
+                if has_attachments_property:
+                    # 기존에 첨부가 있던 페이지에서 이번 수집 결과가 "첨부 없음"일 때도 clear payload를 만들 수 있게,
+                    # 실제 런타임 루프에서 attachments 키를 항상 빈 리스트까지 포함하도록 정규화한다.
+                    normalize_item_attachments(item)
                 existing_page = find_existing_page(
                     notion_token,
                     database_id,
@@ -228,7 +233,7 @@ def main() -> None:
                     )
                 attachment_count = len(item.get("attachments") or [])
                 attachment_state: list[dict] = []
-                if upload_files and has_attachments_property and "attachments" in item:
+                if upload_files and has_attachments_property:
                     reusable_uploaded_attachments = (
                         extract_existing_uploaded_attachment_ids(
                             existing_page.get("properties", {}) if existing_page else {},

@@ -654,6 +654,42 @@ def run_attachment_policy_selftest() -> None:
             }:
                 raise RuntimeError("첨부 업로드 셀프테스트 실패(현재 첨부 검증)")
 
+            # 현재 첨부 속성에 external과 file_upload가 섞여 있어도,
+            # 업로드된 이미지 첨부에 대해서는 부분 재사용이 가능해야 실제 운영 비용 절감 효과가 유지된다.
+            mixed_attachment_reuse = sync_module.extract_existing_uploaded_attachment_ids(
+                {
+                    "첨부파일": {
+                        "files": [
+                            {
+                                "name": "sample.jpg",
+                                "type": "file_upload",
+                                "file_upload": {"id": "attachment-upload-1"},
+                            },
+                            {
+                                "name": "sample.pdf",
+                                "type": "external",
+                                "external": {
+                                    "url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf"
+                                },
+                            },
+                        ]
+                    }
+                },
+                [
+                    {
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                        "name": "sample.jpg",
+                        "upload_id": "attachment-upload-1",
+                    }
+                ],
+            )
+            if mixed_attachment_reuse != {
+                "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg": [
+                    "attachment-upload-1"
+                ]
+            }:
+                raise RuntimeError("첨부 업로드 셀프테스트 실패(mixed 부분 재사용)")
+
             # 상태에 적힌 upload_id가 현재 첨부 속성에 없으면 stale 상태이므로 재사용을 끈다.
             if sync_module.extract_existing_uploaded_attachment_ids(
                 {
@@ -677,17 +713,23 @@ def run_attachment_policy_selftest() -> None:
             ):
                 raise RuntimeError("첨부 업로드 셀프테스트 실패(stale 상태 차단)")
 
-            # 원본에서 첨부가 사라진 경우에는 files=[] payload를 보내 예전 첨부가 남지 않게 해야 한다.
-            if sync_module.build_properties(
-                {
-                    "title": "첨부 제거 테스트",
-                    "top": False,
-                    "attachments": [],
-                },
-                has_views_property=False,
-                has_attachments_property=True,
-                has_classification_property=False,
-            ).get("첨부파일") != {"files": []}:
+            # 실제 런타임에서는 첨부가 없을 때 attachments 키가 생략될 수 있으므로,
+            # 동기화 직전 정규화만 거쳐도 files=[] clear payload가 생성되는지 확인한다.
+            attachment_removed_item = {
+                "title": "첨부 제거 테스트",
+                "top": False,
+            }
+            sync_module.normalize_item_attachments(attachment_removed_item)
+            if (
+                attachment_removed_item.get("attachments") != []
+                or sync_module.build_properties(
+                    attachment_removed_item,
+                    has_views_property=False,
+                    has_attachments_property=True,
+                    has_classification_property=False,
+                ).get("첨부파일")
+                != {"files": []}
+            ):
                 raise RuntimeError("첨부 업로드 셀프테스트 실패(빈 첨부 clear)")
 
             # 재사용 후보 조회는 최적화일 뿐이므로, 루트 컨테이너 조회 실패가 항목 전체 실패로 번지지 않고
