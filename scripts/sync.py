@@ -23,6 +23,7 @@ from notion_client import (
 )
 from settings import (
     ATTACHMENT_PROPERTY,
+    ATTACHMENT_STATE_PROPERTY,
     AUTHOR_PROPERTY,
     BODY_MEDIA_STATE_PROPERTY,
     CLASSIFICATION_PROPERTY,
@@ -187,6 +188,16 @@ def sanitize_uploaded_media_block(block: dict) -> Optional[dict]:
     return None
 
 
+def extract_file_upload_id_from_sanitized_block(block: dict) -> str:
+    block_type = str(block.get("type") or "").strip()
+    if block_type not in {"image", "file", "pdf"}:
+        return ""
+    payload = block.get(block_type, {})
+    if payload.get("type") != "file_upload":
+        return ""
+    return str(payload.get("file_upload", {}).get("id") or "").strip()
+
+
 def extract_body_media_state(properties: dict) -> list[dict]:
     raw = extract_rich_text_value(properties, BODY_MEDIA_STATE_PROPERTY)
     if not raw:
@@ -205,13 +216,102 @@ def extract_body_media_state(properties: dict) -> list[dict]:
             continue
         media_type = str(entry.get("type") or "").strip()
         source_url = str(entry.get("source_url") or "").strip()
+        upload_id = str(entry.get("upload_id") or "").strip()
         if media_type not in {"image", "file", "pdf"} or not source_url:
             continue
-        items.append({"type": media_type, "source_url": source_url})
+        normalized_entry = {"type": media_type, "source_url": source_url}
+        if upload_id:
+            normalized_entry["upload_id"] = upload_id
+        items.append(normalized_entry)
     return items
 
 
-# 이전 sync에서 이미 성공한 업로드 블록을 source_url 기준으로 재사용해, 부분 성공 뒤 다음 실행에서 같은 파일을 또 올리지 않게 한다.
+def extract_attachment_state(properties: dict) -> list[dict]:
+    raw = extract_rich_text_value(properties, ATTACHMENT_STATE_PROPERTY)
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        LOGGER.info("첨부 상태 파싱 실패: JSON decode error")
+        return []
+    if not isinstance(payload, list):
+        LOGGER.info("첨부 상태 파싱 실패: list 아님")
+        return []
+    items: list[dict] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        source_url = str(entry.get("source_url") or "").strip()
+        upload_id = str(entry.get("upload_id") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        if not source_url or not upload_id:
+            continue
+        normalized_entry = {"source_url": source_url, "upload_id": upload_id}
+        if name:
+            normalized_entry["name"] = name
+        items.append(normalized_entry)
+    return items
+
+
+def extract_existing_uploaded_attachment_ids(
+    properties: dict,
+    attachment_state: list[dict],
+) -> dict[str, list[str]]:
+    if not attachment_state:
+        return {}
+    files_prop = properties.get(ATTACHMENT_PROPERTY, {})
+    files = files_prop.get("files", [])
+    if not isinstance(files, list):
+        LOGGER.info("기존 첨부 재사용 스킵: files 속성 형식 불일치")
+        return {}
+    current_upload_ids: set[str] = set()
+    for file_info in files:
+        if not isinstance(file_info, dict):
+            LOGGER.info("기존 첨부 재사용 스킵: files 항목 형식 불일치")
+            return {}
+        if file_info.get("type") != "file_upload":
+            # 첨부 속성에 수동 편집으로 외부 파일 등이 섞였으면 현재 상태를 신뢰하지 않고 재사용을 끈다.
+            LOGGER.info("기존 첨부 재사용 스킵: file_upload가 아닌 첨부 감지")
+            return {}
+        upload_id = str(file_info.get("file_upload", {}).get("id") or "").strip()
+        if not upload_id:
+            LOGGER.info("기존 첨부 재사용 스킵: 현재 첨부 upload_id 누락")
+            return {}
+        if upload_id in current_upload_ids:
+            LOGGER.info(
+                "기존 첨부 재사용 스킵: 현재 첨부 중복 upload_id 감지 (%s)",
+                upload_id,
+            )
+            return {}
+        current_upload_ids.add(upload_id)
+    reusable: dict[str, list[str]] = {}
+    seen_upload_ids: set[str] = set()
+    for entry in attachment_state:
+        source_url = str(entry.get("source_url") or "").strip()
+        upload_id = str(entry.get("upload_id") or "").strip()
+        if not source_url or not upload_id:
+            LOGGER.info("기존 첨부 재사용 스킵: 상태 값 누락")
+            return {}
+        if upload_id in seen_upload_ids:
+            LOGGER.info(
+                "기존 첨부 재사용 스킵: 상태 중복 upload_id 감지 (%s)",
+                upload_id,
+            )
+            return {}
+        if upload_id not in current_upload_ids:
+            LOGGER.info(
+                "기존 첨부 재사용 스킵: 현재 첨부 속성에 없는 upload_id (%s)",
+                upload_id,
+            )
+            return {}
+        seen_upload_ids.add(upload_id)
+        reusable.setdefault(source_url, []).append(upload_id)
+    return reusable
+
+
+# 이전 sync에서 이미 성공한 업로드 블록을 실제 upload_id까지 확인해 재사용해,
+# 부분 성공 뒤 다음 실행에서 같은 파일을 또 올리지 않으면서도 수동 편집 오매핑을 막는다.
 def extract_existing_uploaded_media_blocks(
     token: str,
     page_id: str,
@@ -219,7 +319,11 @@ def extract_existing_uploaded_media_blocks(
 ) -> dict[tuple[str, str], list[dict]]:
     if not page_id or not media_state:
         return {}
-    container = find_sync_container_block(token, page_id)
+    try:
+        container = find_sync_container_block(token, page_id)
+    except NotionRequestError as exc:
+        LOGGER.info("기존 본문 컨테이너 조회 실패: %s (%s)", page_id, exc)
+        return {}
     if not container:
         return {}
     container_id = container.get("id")
@@ -230,8 +334,7 @@ def extract_existing_uploaded_media_blocks(
     except NotionRequestError as exc:
         LOGGER.info("기존 본문 미디어 조회 실패: %s (%s)", container_id, exc)
         return {}
-    uploaded_blocks: list[dict] = []
-    uploaded_types: list[str] = []
+    uploaded_blocks_by_id: dict[str, dict] = {}
     for block in children:
         if not is_uploaded_media_block(block):
             continue
@@ -242,29 +345,57 @@ def extract_existing_uploaded_media_blocks(
                 block.get("type"),
             )
             return {}
-        uploaded_blocks.append(sanitized)
-        uploaded_types.append(str(sanitized.get("type") or ""))
-    state_types = [meta["type"] for meta in media_state]
-    # media_state와 실제 업로드 블록이 조금이라도 어긋나면 재사용을 포기해,
-    # 잘못된 블록이 source_url과 섞여 들어가며 해시와 실제 본문이 갈라지는 상황을 막는다.
-    if len(uploaded_blocks) != len(media_state):
+        upload_id = extract_file_upload_id_from_sanitized_block(sanitized)
+        if not upload_id:
+            LOGGER.info("기존 본문 미디어 재사용 스킵: upload_id 누락")
+            return {}
+        if upload_id in uploaded_blocks_by_id:
+            LOGGER.info(
+                "기존 본문 미디어 재사용 스킵: 중복 upload_id 감지 (%s)",
+                upload_id,
+            )
+            return {}
+        uploaded_blocks_by_id[upload_id] = sanitized
+    # media_state와 현재 컨테이너의 실제 upload_id 집합이 조금이라도 다르면 재사용을 포기해,
+    # 순서가 같아 보여도 수동 편집으로 다른 업로드 블록이 들어온 경우를 안전하게 차단한다.
+    if len(uploaded_blocks_by_id) != len(media_state):
         LOGGER.info(
             "기존 본문 미디어 재사용 스킵: 미디어 개수 불일치 (state=%s, blocks=%s)",
             len(media_state),
-            len(uploaded_blocks),
-        )
-        return {}
-    if uploaded_types != state_types:
-        LOGGER.info(
-            "기존 본문 미디어 재사용 스킵: 미디어 타입 시퀀스 불일치 (state=%s, blocks=%s)",
-            state_types,
-            uploaded_types,
+            len(uploaded_blocks_by_id),
         )
         return {}
     reusable: dict[tuple[str, str], list[dict]] = {}
-    for meta, block in zip(media_state, uploaded_blocks):
+    seen_upload_ids: set[str] = set()
+    for meta in media_state:
+        upload_id = str(meta.get("upload_id") or "").strip()
+        if not upload_id:
+            LOGGER.info("기존 본문 미디어 재사용 스킵: 상태 upload_id 누락")
+            return {}
+        if upload_id in seen_upload_ids:
+            LOGGER.info(
+                "기존 본문 미디어 재사용 스킵: 상태 중복 upload_id 감지 (%s)",
+                upload_id,
+            )
+            return {}
+        seen_upload_ids.add(upload_id)
+        block = uploaded_blocks_by_id.get(upload_id)
+        if not block:
+            LOGGER.info(
+                "기존 본문 미디어 재사용 스킵: 현재 컨테이너에 없는 upload_id (%s)",
+                upload_id,
+            )
+            return {}
+        if str(block.get("type") or "") != meta["type"]:
+            LOGGER.info(
+                "기존 본문 미디어 재사용 스킵: upload_id 타입 불일치 (%s, state=%s, block=%s)",
+                upload_id,
+                meta["type"],
+                block.get("type"),
+            )
+            return {}
         key = (meta["type"], meta["source_url"])
-        reusable.setdefault(key, []).append(block)
+        reusable.setdefault(key, []).append(copy.deepcopy(block))
     return reusable
 
 
@@ -366,8 +497,10 @@ def build_properties(
         props[AUTHOR_PROPERTY] = {"select": {"name": item["author"]}}
     if item.get("type"):
         props[TYPE_PROPERTY] = {"select": {"name": item["type"]}}
-    if has_attachments_property and item.get("attachments"):
-        props[ATTACHMENT_PROPERTY] = {"files": item["attachments"]}
+    if has_attachments_property and "attachments" in item:
+        # 원본에서 첨부가 사라진 경우에도 files=[]를 명시적으로 보내야,
+        # 예전 실행에서 남은 Notion 첨부파일 속성이 그대로 잔존하지 않는다.
+        props[ATTACHMENT_PROPERTY] = {"files": item.get("attachments") or []}
     if has_views_property and item.get("views") is not None:
         props[VIEWS_PROPERTY] = {"number": item["views"]}
     if has_classification_property and item.get("classification"):

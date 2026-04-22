@@ -106,7 +106,10 @@ def run_attachment_policy_selftest() -> None:
             raise RuntimeError("첨부파일 정책 셀프테스트 실패")
         # 본문 image/embed 경로도 allowlist와 업로드 결과가 해시에 반영되는지 함께 확인한다.
         import notion_client as notion_client_module
-        from notion_client import prepare_body_blocks_for_sync
+        from notion_client import (
+            prepare_attachments_for_sync,
+            prepare_body_blocks_for_sync,
+        )
         import sync as sync_module
         from utils import build_pdf_block, compute_body_hash, normalize_body_blocks_for_hash
 
@@ -143,7 +146,7 @@ def run_attachment_policy_selftest() -> None:
                 },
             },
         ]
-        prepared_blocks, prepared_hash_blocks = prepare_body_blocks_for_sync(
+        prepared_blocks, prepared_hash_blocks, prepared_media_state = prepare_body_blocks_for_sync(
             "selftest-token", allowed_blocks
         )
         desired_hash = compute_body_hash(
@@ -157,6 +160,19 @@ def run_attachment_policy_selftest() -> None:
         if (
             prepared_blocks[0].get("image", {}).get("type") != "file_upload"
             or prepared_blocks[1].get("type") != "pdf"
+            or prepared_media_state
+            != [
+                {
+                    "type": "image",
+                    "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                    "upload_id": "image-test.jpg",
+                },
+                {
+                    "type": "pdf",
+                    "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf",
+                    "upload_id": "file-test.pdf",
+                },
+            ]
             or desired_hash != actual_hash
         ):
             raise RuntimeError("본문 업로드 셀프테스트 실패(allowlist/hash)")
@@ -174,7 +190,7 @@ def run_attachment_policy_selftest() -> None:
             return f"{suffix}-{filename}"
 
         notion_client_module.upload_external_file_to_notion = fake_upload_partial
-        partial_blocks, partial_hash_blocks = prepare_body_blocks_for_sync(
+        partial_blocks, partial_hash_blocks, partial_media_state = prepare_body_blocks_for_sync(
             "selftest-token", allowed_blocks
         )
         partial_hash = compute_body_hash(
@@ -184,6 +200,14 @@ def run_attachment_policy_selftest() -> None:
         if (
             partial_blocks[0].get("image", {}).get("type") != "file_upload"
             or partial_blocks[1].get("type") != "embed"
+            or partial_media_state
+            != [
+                {
+                    "type": "image",
+                    "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                    "upload_id": "image-test.jpg",
+                }
+            ]
             or partial_hash == desired_hash
         ):
             raise RuntimeError("본문 업로드 셀프테스트 실패(부분 실패 재시도)")
@@ -204,7 +228,7 @@ def run_attachment_policy_selftest() -> None:
             "image": {"type": "file_upload", "file_upload": {"id": "reused-test-image"}},
         }
         reusable_pdf = build_pdf_block("reused-test-pdf")
-        reused_blocks, reused_hash_blocks = prepare_body_blocks_for_sync(
+        reused_blocks, reused_hash_blocks, reused_media_state = prepare_body_blocks_for_sync(
             "selftest-token",
             allowed_blocks,
             reusable_uploaded_media={
@@ -228,6 +252,19 @@ def run_attachment_policy_selftest() -> None:
             or
             reused_blocks[1].get("type") != "pdf"
             or reused_blocks[1].get("pdf", {}).get("file_upload", {}).get("id") != "reused-test-pdf"
+            or reused_media_state
+            != [
+                {
+                    "type": "image",
+                    "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                    "upload_id": "reused-test-image",
+                },
+                {
+                    "type": "pdf",
+                    "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf",
+                    "upload_id": "reused-test-pdf",
+                },
+            ]
             or reused_hash != desired_hash
         ):
             raise RuntimeError("본문 업로드 셀프테스트 실패(기존 업로드 재사용)")
@@ -241,7 +278,11 @@ def run_attachment_policy_selftest() -> None:
                 "caption": [{"type": "text", "text": {"content": "old caption"}}],
             },
         }
-        caption_removed_blocks, caption_removed_hash_blocks = prepare_body_blocks_for_sync(
+        (
+            caption_removed_blocks,
+            caption_removed_hash_blocks,
+            caption_removed_media_state,
+        ) = prepare_body_blocks_for_sync(
             "selftest-token",
             [
                 {
@@ -265,8 +306,53 @@ def run_attachment_policy_selftest() -> None:
         if (
             "caption" in caption_removed_blocks[0].get("image", {})
             or "caption" in caption_removed_hash_blocks[0].get("image", {})
+            or caption_removed_media_state
+            != [
+                {
+                    "type": "image",
+                    "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                    "upload_id": "caption-test-image",
+                }
+            ]
         ):
             raise RuntimeError("본문 업로드 셀프테스트 실패(캡션 제거 반영)")
+
+        reused_attachments, reused_attachment_state = prepare_attachments_for_sync(
+            "selftest-token",
+            [
+                {
+                    "name": "sample.jpg",
+                    "type": "external",
+                    "external": {
+                        "url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg"
+                    },
+                }
+            ],
+            reusable_uploaded_attachments={
+                "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg": [
+                    "attachment-upload-1"
+                ]
+            },
+        )
+        if (
+            reused_attachments
+            != [
+                {
+                    "name": "sample.jpg",
+                    "type": "file_upload",
+                    "file_upload": {"id": "attachment-upload-1"},
+                }
+            ]
+            or reused_attachment_state
+            != [
+                {
+                    "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                    "name": "sample.jpg",
+                    "upload_id": "attachment-upload-1",
+                }
+            ]
+        ):
+            raise RuntimeError("첨부 업로드 셀프테스트 실패(기존 업로드 재사용)")
 
         notion_client_module.upload_external_file_to_notion = fake_upload_success
         blocked_blocks = [
@@ -284,10 +370,14 @@ def run_attachment_policy_selftest() -> None:
                 "embed": {"url": "https://example.com/test.pdf"},
             },
         ]
-        blocked_prepared, blocked_hash_blocks = prepare_body_blocks_for_sync(
+        blocked_prepared, blocked_hash_blocks, blocked_media_state = prepare_body_blocks_for_sync(
             "selftest-token", blocked_blocks
         )
-        if blocked_prepared != blocked_blocks or blocked_hash_blocks != blocked_blocks:
+        if (
+            blocked_prepared != blocked_blocks
+            or blocked_hash_blocks != blocked_blocks
+            or blocked_media_state
+        ):
             raise RuntimeError("본문 업로드 셀프테스트 실패(차단 URL 유지)")
         if get_detail_html_fallback_reason(
             {
@@ -366,10 +456,12 @@ def run_attachment_policy_selftest() -> None:
                     {
                         "type": "image",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                        "upload_id": "image-upload-state",
                     },
                     {
                         "type": "pdf",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf",
+                        "upload_id": "pdf-upload-state",
                     },
                 ],
             ):
@@ -401,6 +493,7 @@ def run_attachment_policy_selftest() -> None:
                     {
                         "type": "image",
                         "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                        "upload_id": "image-upload-sanitized",
                     }
                 ],
             )
@@ -424,6 +517,198 @@ def run_attachment_policy_selftest() -> None:
             }
             if sanitized_reusable != expected_reusable:
                 raise RuntimeError("본문 업로드 셀프테스트 실패(재사용 sanitize)")
+
+            # 상태에 upload_id를 같이 저장하면 같은 타입이 반복되어도 순서가 아니라 식별자로 정확히 재사용할 수 있다.
+            def fake_reordered_same_type_children(_token: str, _page_id: str):
+                return [
+                    {
+                        "id": "image-b",
+                        "type": "image",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "image-upload-b"},
+                        },
+                    },
+                    {
+                        "id": "image-a",
+                        "type": "image",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "image-upload-a"},
+                        },
+                    },
+                ]
+
+            sync_module.list_block_children = fake_reordered_same_type_children
+            reordered_reusable = sync_module.extract_existing_uploaded_media_blocks(
+                "selftest-token",
+                "selftest-page",
+                [
+                    {
+                        "type": "image",
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/A.jpg?sg=A.jpg",
+                        "upload_id": "image-upload-a",
+                    },
+                    {
+                        "type": "image",
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/B.jpg?sg=B.jpg",
+                        "upload_id": "image-upload-b",
+                    },
+                ],
+            )
+            if reordered_reusable != {
+                (
+                    "image",
+                    "https://www.sogang.ac.kr/file-fe-prd/board/1/A.jpg?sg=A.jpg",
+                ): [
+                    {
+                        "object": "block",
+                        "type": "image",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "image-upload-a"},
+                        },
+                    }
+                ],
+                (
+                    "image",
+                    "https://www.sogang.ac.kr/file-fe-prd/board/1/B.jpg?sg=B.jpg",
+                ): [
+                    {
+                        "object": "block",
+                        "type": "image",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "image-upload-b"},
+                        },
+                    }
+                ],
+            }:
+                raise RuntimeError("본문 업로드 셀프테스트 실패(upload_id 기반 재사용)")
+
+            # 같은 개수/같은 타입 시퀀스라도 저장된 upload_id와 현재 블록이 다르면 수동 편집이 섞인 상태이므로 재사용을 끈다.
+            def fake_same_shape_but_stale_ids(_token: str, _page_id: str):
+                return [
+                    {
+                        "id": "image-current",
+                        "type": "image",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "image-upload-current"},
+                        },
+                    },
+                    {
+                        "id": "pdf-current",
+                        "type": "pdf",
+                        "pdf": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "pdf-upload-current"},
+                        },
+                    },
+                ]
+
+            sync_module.list_block_children = fake_same_shape_but_stale_ids
+            if sync_module.extract_existing_uploaded_media_blocks(
+                "selftest-token",
+                "selftest-page",
+                [
+                    {
+                        "type": "image",
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                        "upload_id": "image-upload-stale",
+                    },
+                    {
+                        "type": "pdf",
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.pdf?sg=test.pdf",
+                        "upload_id": "pdf-upload-stale",
+                    },
+                ],
+            ):
+                raise RuntimeError("본문 업로드 셀프테스트 실패(수동 편집 stale id 차단)")
+
+            # 첨부 재사용도 body와 마찬가지로, 저장된 상태만 믿지 말고 현재 첨부 속성에 실제로 남아 있는 upload_id만 허용해야 한다.
+            valid_attachment_reuse = sync_module.extract_existing_uploaded_attachment_ids(
+                {
+                    "첨부파일": {
+                        "files": [
+                            {
+                                "name": "sample.jpg",
+                                "type": "file_upload",
+                                "file_upload": {"id": "attachment-upload-1"},
+                            }
+                        ]
+                    }
+                },
+                [
+                    {
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                        "name": "sample.jpg",
+                        "upload_id": "attachment-upload-1",
+                    }
+                ],
+            )
+            if valid_attachment_reuse != {
+                "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg": [
+                    "attachment-upload-1"
+                ]
+            }:
+                raise RuntimeError("첨부 업로드 셀프테스트 실패(현재 첨부 검증)")
+
+            # 상태에 적힌 upload_id가 현재 첨부 속성에 없으면 stale 상태이므로 재사용을 끈다.
+            if sync_module.extract_existing_uploaded_attachment_ids(
+                {
+                    "첨부파일": {
+                        "files": [
+                            {
+                                "name": "sample.jpg",
+                                "type": "file_upload",
+                                "file_upload": {"id": "attachment-upload-current"},
+                            }
+                        ]
+                    }
+                },
+                [
+                    {
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                        "name": "sample.jpg",
+                        "upload_id": "attachment-upload-stale",
+                    }
+                ],
+            ):
+                raise RuntimeError("첨부 업로드 셀프테스트 실패(stale 상태 차단)")
+
+            # 원본에서 첨부가 사라진 경우에는 files=[] payload를 보내 예전 첨부가 남지 않게 해야 한다.
+            if sync_module.build_properties(
+                {
+                    "title": "첨부 제거 테스트",
+                    "top": False,
+                    "attachments": [],
+                },
+                has_views_property=False,
+                has_attachments_property=True,
+                has_classification_property=False,
+            ).get("첨부파일") != {"files": []}:
+                raise RuntimeError("첨부 업로드 셀프테스트 실패(빈 첨부 clear)")
+
+            # 재사용 후보 조회는 최적화일 뿐이므로, 루트 컨테이너 조회 실패가 항목 전체 실패로 번지지 않고
+            # 새 업로드 경로로 자연스럽게 되돌아가는지 확인한다.
+            def fake_top_level_failure(_token: str, _page_id: str):
+                raise sync_module.NotionRequestError("selftest-root-failure", status_code=500)
+
+            sync_module.find_sync_container_block = original_find_sync_container_block
+            sync_module.list_block_children = fake_top_level_failure
+            if sync_module.extract_existing_uploaded_media_blocks(
+                "selftest-token",
+                "selftest-page",
+                [
+                    {
+                        "type": "image",
+                        "source_url": "https://www.sogang.ac.kr/file-fe-prd/board/1/test.jpg?sg=test.jpg",
+                        "upload_id": "image-upload-sanitized",
+                    }
+                ],
+            ):
+                raise RuntimeError("본문 업로드 셀프테스트 실패(컨테이너 조회 best-effort)")
         finally:
             sync_module.find_sync_container_block = original_find_sync_container_block
             sync_module.list_block_children = original_list_block_children
@@ -958,21 +1243,25 @@ def crawl_top_items_api(
                     fallback_reason,
                 )
 
-            title = normalize_title_key(detail.get("title") or entry.get("title") or "")
-            author = detail.get("userName") or entry.get("userName") or entry.get("userNickName") or ""
-            written_at = parse_compact_datetime(detail.get("regDate") or entry.get("regDate"))
+            # detail은 HTML fallback 전후로 Optional로 보일 수 있어서, 여기서 dict로 한 번 좁혀
+            # 아래 필드 접근을 안전하게 만들고 Pylance의 Optional 경고도 함께 없앤다.
+            detail_data = detail if isinstance(detail, dict) else {}
+
+            title = normalize_title_key(detail_data.get("title") or entry.get("title") or "")
+            author = detail_data.get("userName") or entry.get("userName") or entry.get("userNickName") or ""
+            written_at = parse_compact_datetime(detail_data.get("regDate") or entry.get("regDate"))
             if not written_at and fallback_written_at:
                 written_at = fallback_written_at
-            views_raw = detail.get("viewCount", entry.get("viewCount"))
+            views_raw = detail_data.get("viewCount", entry.get("viewCount"))
             views = parse_int(str(views_raw)) if views_raw is not None else None
             top = str(entry.get("isTop", "")).upper() == "Y"
             if not include_non_top and not top:
                 continue
 
-            attachments = extract_attachments_from_api_data(detail or entry)
+            attachments = extract_attachments_from_api_data(detail_data or entry)
             if not attachments and fallback_attachments:
                 attachments = fallback_attachments
-            content_html = detail.get("content") or ""
+            content_html = detail_data.get("content") or ""
             body_blocks = extract_body_blocks_from_html(content_html) if content_html else []
             if not body_blocks and fallback_body_blocks:
                 body_blocks = fallback_body_blocks
