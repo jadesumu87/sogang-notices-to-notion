@@ -16,6 +16,7 @@ from settings import (
     ATTACHMENT_PROPERTY,
     AUTHOR_PROPERTY,
     BODY_HASH_PROPERTY,
+    BODY_MEDIA_STATE_PROPERTY,
     CLASSIFICATION_PROPERTY,
     DATE_PROPERTY,
     FALLBACK_TYPE,
@@ -769,7 +770,40 @@ def prepare_attachments_for_sync(token: str, attachments: list[dict]) -> list[di
     return updated
 
 
-def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> tuple[list[dict], list[dict]]:
+def pop_reusable_uploaded_media_block(
+    reusable_uploaded_media: Optional[dict[tuple[str, str], list[dict]]],
+    media_type: str,
+    source_url: str,
+) -> Optional[dict]:
+    if not reusable_uploaded_media:
+        return None
+    key = (media_type, source_url)
+    candidates = reusable_uploaded_media.get(key) or []
+    if not candidates:
+        return None
+    block = candidates.pop(0)
+    if not candidates:
+        reusable_uploaded_media.pop(key, None)
+    return block
+
+
+def is_valid_reusable_uploaded_media_block(block: Optional[dict], expected_type: str) -> bool:
+    if not isinstance(block, dict):
+        return False
+    if str(block.get("type") or "") != expected_type:
+        return False
+    payload = block.get(expected_type, {})
+    if payload.get("type") != "file_upload":
+        return False
+    upload_id = str(payload.get("file_upload", {}).get("id") or "").strip()
+    return bool(upload_id)
+
+
+def prepare_body_blocks_for_sync(
+    token: str,
+    blocks: list[dict],
+    reusable_uploaded_media: Optional[dict[tuple[str, str], list[dict]]] = None,
+) -> tuple[list[dict], list[dict]]:
     if not blocks or not should_upload_files_to_notion():
         return blocks, blocks
     updated: list[dict] = []
@@ -792,6 +826,28 @@ def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> tuple[list[d
                 LOGGER.info("본문 이미지 업로드 스킵: 허용되지 않은 외부 URL (%s)", url)
                 updated.append(block)
                 hash_blocks.append(block)
+                continue
+            reused_block = pop_reusable_uploaded_media_block(
+                reusable_uploaded_media, "image", url
+            )
+            if reused_block:
+                if not is_valid_reusable_uploaded_media_block(reused_block, "image"):
+                    LOGGER.info(
+                        "본문 이미지 재사용 스킵: 재사용 블록 타입 불일치 (%s)",
+                        reused_block.get("type"),
+                    )
+                    reused_block = None
+            if reused_block:
+                # 이전 실행에서 이미 업로드된 이미지면 현재 블록을 재사용해, 부분 성공 뒤 다음 실행에서 중복 업로드를 줄인다.
+                # 이때 캡션은 단방향 추가가 아니라 현재 원본 블록 상태에 맞춰 동기화해야 해시와 실제 본문이 어긋나지 않는다.
+                if image.get("caption"):
+                    reused_block.setdefault("image", {})["caption"] = image["caption"]
+                else:
+                    reused_block.setdefault("image", {}).pop("caption", None)
+                updated.append(reused_block)
+                hash_blocks.append(
+                    build_uploaded_image_hash_block(url, image.get("caption"))
+                )
                 continue
             filename = derive_filename_from_url(url, fallback="image")
             upload_id = upload_external_file_to_notion(
@@ -828,6 +884,24 @@ def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> tuple[list[d
                 hash_blocks.append(block)
                 continue
             filename = derive_filename_from_url(url, fallback="file")
+            media_type = "pdf" if is_pdf_name_or_url(filename, url) else "file"
+            reused_block = pop_reusable_uploaded_media_block(
+                reusable_uploaded_media, media_type, url
+            )
+            if reused_block:
+                if not is_valid_reusable_uploaded_media_block(reused_block, media_type):
+                    LOGGER.info(
+                        "본문 임베드 재사용 스킵: 재사용 블록 타입 불일치 (%s -> %s)",
+                        media_type,
+                        reused_block.get("type"),
+                    )
+                    reused_block = None
+            if reused_block:
+                updated.append(reused_block)
+                hash_blocks.append(
+                    build_uploaded_file_hash_block(url, as_pdf=media_type == "pdf")
+                )
+                continue
             upload_id = upload_external_file_to_notion(
                 token, url, filename, expect_image=False
             )
@@ -836,7 +910,7 @@ def prepare_body_blocks_for_sync(token: str, blocks: list[dict]) -> tuple[list[d
                 # 업로드 실패 시에는 실제 결과가 embed 유지이므로 해시도 같은 상태로 남긴다.
                 hash_blocks.append(block)
                 continue
-            if is_pdf_name_or_url(filename, url):
+            if media_type == "pdf":
                 updated.append(build_pdf_block(upload_id))
                 hash_blocks.append(build_uploaded_file_hash_block(url, as_pdf=True))
             else:
@@ -994,6 +1068,18 @@ def ensure_body_hash_property(token: str, database_id: str, database: dict) -> d
         return database
     LOGGER.info("Notion 속성 추가: %s", BODY_HASH_PROPERTY)
     return update_database(token, database_id, {BODY_HASH_PROPERTY: {"rich_text": {}}})
+
+
+def ensure_body_media_state_property(token: str, database_id: str, database: dict) -> dict:
+    prop = database.get("properties", {}).get(BODY_MEDIA_STATE_PROPERTY)
+    if prop:
+        if prop.get("type") != "rich_text":
+            raise RuntimeError(
+                f"Notion 속성 타입 불일치: {BODY_MEDIA_STATE_PROPERTY} (rich_text 아님)"
+            )
+        return database
+    LOGGER.info("Notion 속성 추가: %s", BODY_MEDIA_STATE_PROPERTY)
+    return update_database(token, database_id, {BODY_MEDIA_STATE_PROPERTY: {"rich_text": {}}})
 
 
 def ensure_required_properties(token: str, database_id: str, database: dict) -> dict:

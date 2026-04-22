@@ -158,6 +158,44 @@ def build_uploaded_file_hash_block(source_url: str, as_pdf: bool) -> dict:
     }
 
 
+# 긴 JSON 상태도 Notion rich_text 속성에 안전하게 저장할 수 있게 짧은 조각으로 나눠 둔다.
+def build_rich_text_chunks(text: str, chunk_size: int = 1900) -> list[dict]:
+    if not text:
+        return []
+    chunks: list[dict] = []
+    for idx in range(0, len(text), chunk_size):
+        chunks.append(
+            {
+                "type": "text",
+                "text": {"content": text[idx : idx + chunk_size]},
+            }
+        )
+    return chunks
+
+
+# 업로드 성공한 본문 미디어만 별도로 저장해 두면, 다음 실행에서 같은 source_url을 재사용하는 기준으로 쓸 수 있다.
+def collect_uploaded_media_state(blocks: list[dict]) -> list[dict]:
+    items: list[dict] = []
+    for block in blocks or []:
+        block_type = block.get("type")
+        if block_type == "image":
+            image = block.get("image", {})
+            if image.get("type") != "uploaded_external":
+                continue
+            source_url = str(image.get("source_url") or "").strip()
+            if source_url:
+                items.append({"type": "image", "source_url": source_url})
+            continue
+        if block_type in {"file", "pdf"}:
+            payload = block.get(block_type, {})
+            if payload.get("type") != "uploaded_external":
+                continue
+            source_url = str(payload.get("source_url") or "").strip()
+            if source_url:
+                items.append({"type": block_type, "source_url": source_url})
+    return items
+
+
 def normalize_body_blocks_for_hash(
     blocks: list[dict], upload_files: bool
 ) -> list[dict]:
