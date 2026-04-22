@@ -3,6 +3,7 @@ import os
 from crawler import crawl_top_items, run_attachment_policy_selftest
 from log import LOGGER, log_environment_info, setup_logging
 from notion_client import (
+    NotionRequestError,
     create_page,
     ensure_attachment_property,
     ensure_body_hash_property,
@@ -109,10 +110,23 @@ def main() -> None:
         database = ensure_body_hash_property(notion_token, database_id, database)
         database = ensure_classification_property(notion_token, database_id, database)
         database = ensure_views_property(notion_token, database_id, database)
+        current_stage = "시작 URL 중복 정리"
         if should_dedupe_on_start():
-            archived = dedupe_database_by_url(notion_token, database_id)
-            if archived:
-                LOGGER.info("URL 중복 정리 수: %s", archived)
+            try:
+                archived = dedupe_database_by_url(notion_token, database_id)
+            except NotionRequestError as exc:
+                # 시작 시 전체 DB를 훑는 정리는 보조 작업이므로, 429면 이번 실행만 생략하고 본 동기화는 계속한다.
+                if exc.status_code == 429:
+                    LOGGER.warning(
+                        "시작 URL 중복 정리 생략: Notion 요청 제한으로 이번 실행에서는 건너뜀 (%s)",
+                        exc,
+                    )
+                else:
+                    raise
+            else:
+                if archived:
+                    LOGGER.info("URL 중복 정리 수: %s", archived)
+        current_stage = "Notion 옵션 준비"
         author_options = get_select_options(database, AUTHOR_PROPERTY)
         type_options = get_select_options(database, TYPE_PROPERTY)
         author_options = ensure_select_options_batch(
