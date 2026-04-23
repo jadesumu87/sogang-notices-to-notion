@@ -883,6 +883,116 @@ def run_attachment_policy_selftest() -> None:
             ):
                 raise RuntimeError("첨부 업로드 셀프테스트 실패(API content 첨부 보존)")
 
+            # 1차 HTML/HTTP 판정이 known이어도, Playwright가 실제 DOM을 읽고 unknown을 판단했다면
+            # 최종 병합 상태가 unknown으로 바뀌어 stale attachment clear를 막아야 한다.
+            original_fetch_detail_metadata_from_url = fetch_detail_metadata_from_url
+            original_fetch_detail_metadata_via_playwright = (
+                fetch_detail_metadata_via_playwright
+            )
+            original_should_retry_detail_fetch = should_retry_detail_fetch
+            try:
+                def fake_fetch_detail_metadata_from_url(_detail_url: str):
+                    return (
+                        None,
+                        [],
+                        [],
+                        {
+                            "has_html": True,
+                            "has_attachment_label": True,
+                            "has_attachment_link": False,
+                        },
+                    )
+
+                def fake_fetch_detail_metadata_via_playwright_unknown(
+                    _page,
+                    _list_url: str,
+                    _detail_url: str,
+                ):
+                    return (None, [], [], ATTACHMENTS_STATUS_UNKNOWN)
+
+                def fake_should_retry_detail_fetch(
+                    _written_at,
+                    _attachments,
+                    _body_blocks,
+                    _signals,
+                ):
+                    return True
+
+                globals()["fetch_detail_metadata_from_url"] = (
+                    fake_fetch_detail_metadata_from_url
+                )
+                globals()["fetch_detail_metadata_via_playwright"] = (
+                    fake_fetch_detail_metadata_via_playwright_unknown
+                )
+                globals()["should_retry_detail_fetch"] = fake_should_retry_detail_fetch
+                _, _, merged_attachments, _, merged_status = fetch_detail_for_row(
+                    None,
+                    "https://www.sogang.ac.kr/ko/notice",
+                    0,
+                    "https://www.sogang.ac.kr/ko/detail/123456?bbsConfigFk=141",
+                )
+                merged_item = {"title": "첨부 병합 테스트", "top": False}
+                apply_item_attachments(merged_item, merged_attachments, merged_status)
+                sync_module.normalize_item_attachments(merged_item)
+                if (
+                    merged_status != ATTACHMENTS_STATUS_UNKNOWN
+                    or "attachments" in merged_item
+                    or sync_module.build_properties(
+                        merged_item,
+                        has_views_property=False,
+                        has_attachments_property=True,
+                        has_classification_property=False,
+                    ).get("첨부파일")
+                    is not None
+                ):
+                    raise RuntimeError("첨부 업로드 셀프테스트 실패(Playwright unknown 병합)")
+
+                def fake_fetch_detail_metadata_via_playwright_unavailable(
+                    _page,
+                    _list_url: str,
+                    _detail_url: str,
+                ):
+                    return (None, [], [], None)
+
+                globals()["fetch_detail_metadata_via_playwright"] = (
+                    fake_fetch_detail_metadata_via_playwright_unavailable
+                )
+                _, _, unavailable_attachments, _, unavailable_status = fetch_detail_for_row(
+                    None,
+                    "https://www.sogang.ac.kr/ko/notice",
+                    0,
+                    "https://www.sogang.ac.kr/ko/detail/123456?bbsConfigFk=141",
+                )
+                unavailable_item = {"title": "첨부 병합 유지 테스트", "top": False}
+                apply_item_attachments(
+                    unavailable_item,
+                    unavailable_attachments,
+                    unavailable_status,
+                )
+                sync_module.normalize_item_attachments(unavailable_item)
+                if (
+                    unavailable_status != ATTACHMENTS_STATUS_KNOWN
+                    or unavailable_item.get("attachments") != []
+                    or sync_module.build_properties(
+                        unavailable_item,
+                        has_views_property=False,
+                        has_attachments_property=True,
+                        has_classification_property=False,
+                    ).get("첨부파일")
+                    != {"files": []}
+                ):
+                    raise RuntimeError("첨부 업로드 셀프테스트 실패(Playwright 상태 유지)")
+            finally:
+                globals()["fetch_detail_metadata_from_url"] = (
+                    original_fetch_detail_metadata_from_url
+                )
+                globals()["fetch_detail_metadata_via_playwright"] = (
+                    original_fetch_detail_metadata_via_playwright
+                )
+                globals()["should_retry_detail_fetch"] = (
+                    original_should_retry_detail_fetch
+                )
+
             # 재사용 후보 조회는 최적화일 뿐이므로, 루트 컨테이너 조회 실패가 항목 전체 실패로 번지지 않고
             # 새 업로드 경로로 자연스럽게 되돌아가는지 확인한다.
             def fake_top_level_failure(_token: str, _page_id: str):
@@ -1298,13 +1408,13 @@ def fetch_detail_metadata_via_playwright(
     page,
     list_url: str,
     detail_url: str,
-) -> tuple[Optional[str], list[dict], list[dict], str]:
+) -> tuple[Optional[str], list[dict], list[dict], Optional[str]]:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     written_at = None
     attachments: list[dict] = []
     body_blocks: list[dict] = []
-    attachment_status = ATTACHMENTS_STATUS_UNKNOWN
+    attachment_status: Optional[str] = None
     try:
         page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
         if not wait_for_written_at(page):
@@ -1331,8 +1441,8 @@ def fetch_detail_metadata_via_playwright(
         if not attachments:
             attachments = extract_attachments_from_detail(html_text)
         body_blocks = extract_body_blocks_from_html(html_text)
-        # Playwright까지 도달한 페이지는 HTML 신호를 다시 분류해
-        # 빈 첨부가 확정인지 추출 실패인지 상위 동기화 단계가 구분하게 한다.
+        # Playwright가 실제 DOM을 읽은 뒤에만 첨부 상태를 계산해
+        # 상위 병합 단계가 "로드 실패"와 "관측 후 unknown"을 구분하게 한다.
         attachment_status = classify_attachment_status_from_signals(
             attachments,
             build_detail_signals(html_text),
@@ -1344,6 +1454,23 @@ def fetch_detail_metadata_via_playwright(
     finally:
         return_to_list_page(page, list_url)
     return written_at, attachments, body_blocks, attachment_status
+
+
+def merge_playwright_attachment_result(
+    attachments: list[dict],
+    attachment_status: str,
+    pw_attachments: list[dict],
+    pw_attachment_status: Optional[str],
+) -> tuple[list[dict], str]:
+    merged_attachments = pw_attachments if pw_attachments else attachments
+    # Playwright가 실제 DOM을 보고 계산한 상태는 첨부 목록이 비어 있어도 더 안전한 2차 관측값이므로
+    # known/unknown을 그대로 우선한다. 단, 로드 실패처럼 상태가 None이면 1차 판정을 유지한다.
+    merged_attachment_status = (
+        pw_attachment_status
+        if pw_attachment_status is not None
+        else attachment_status
+    )
+    return merged_attachments, merged_attachment_status
 
 
 def fetch_detail_for_row(
@@ -1371,10 +1498,12 @@ def fetch_detail_for_row(
             )
             if not written_at and pw_written_at:
                 written_at = pw_written_at
-            if pw_attachments:
-                attachments = pw_attachments
-            if pw_attachment_status == ATTACHMENTS_STATUS_KNOWN or pw_attachments:
-                attachment_status = pw_attachment_status
+            attachments, attachment_status = merge_playwright_attachment_result(
+                attachments,
+                attachment_status,
+                pw_attachments,
+                pw_attachment_status,
+            )
             if pw_body_blocks:
                 body_blocks = pw_body_blocks
         return written_at, detail_url, attachments, body_blocks, attachment_status
@@ -1407,10 +1536,12 @@ def fetch_detail_for_row(
                 )
                 if not written_at and pw_written_at:
                     written_at = pw_written_at
-                if pw_attachments:
-                    attachments = pw_attachments
-                if pw_attachment_status == ATTACHMENTS_STATUS_KNOWN or pw_attachments:
-                    attachment_status = pw_attachment_status
+                attachments, attachment_status = merge_playwright_attachment_result(
+                    attachments,
+                    attachment_status,
+                    pw_attachments,
+                    pw_attachment_status,
+                )
                 if pw_body_blocks:
                     body_blocks = pw_body_blocks
             if written_at or attachments or body_blocks:
