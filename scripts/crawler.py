@@ -837,6 +837,21 @@ def run_attachment_policy_selftest() -> None:
             ) != ATTACHMENTS_STATUS_UNKNOWN:
                 raise RuntimeError("첨부 업로드 셀프테스트 실패(첨부 상태 분류)")
 
+            # 실제 첨부 추출 기준과 신호 기준이 어긋나면 .pdf?sg=... 같은 파일 링크가
+            # 추출 실패 시 known 빈 첨부로 오분류될 수 있으므로, 같은 후보 판정을 쓰는지 확인한다.
+            sg_pdf_html = (
+                '<div>첨부파일</div>'
+                '<a href="https://www.sogang.ac.kr/files/sample.pdf?sg=sample.pdf">'
+                "sample.pdf</a>"
+            )
+            sg_pdf_signals = build_detail_signals(sg_pdf_html)
+            if (
+                not sg_pdf_signals.get("has_attachment_link")
+                or classify_attachment_status_from_signals([], sg_pdf_signals)
+                != ATTACHMENTS_STATUS_UNKNOWN
+            ):
+                raise RuntimeError("첨부 업로드 셀프테스트 실패(.pdf sg 신호 감지)")
+
             # 재사용 후보 조회는 최적화일 뿐이므로, 루트 컨테이너 조회 실패가 항목 전체 실패로 번지지 않고
             # 새 업로드 경로로 자연스럽게 되돌아가는지 확인한다.
             def fake_top_level_failure(_token: str, _page_id: str):
@@ -1780,11 +1795,45 @@ def fetch_html(url: str) -> Optional[str]:
     return raw.decode("utf-8", errors="replace")
 
 
+def strip_html_for_attachment_text(html_text: str) -> str:
+    # 첨부 후보 판정은 링크 텍스트도 함께 보므로, a 태그 안쪽 HTML을 최소한의 평문으로 맞춘다.
+    return unescape(re.sub(r"<[^>]+>", " ", html_text or "")).strip()
+
+
+def detect_attachment_evidence_from_html(html_text: str) -> bool:
+    if not html_text:
+        return False
+    if ATTACHMENT_LINK_PATTERN.search(html_text):
+        return True
+    for match in re.finditer(
+        r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        html_text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        href = unescape(match.group(1)).strip()
+        if not href:
+            continue
+        url = normalize_file_url(href)
+        if not url:
+            continue
+        text = strip_html_for_attachment_text(match.group(2))
+        allowed, _ = is_attachment_candidate(
+            url,
+            text,
+            allow_domain_only=True,
+        )
+        if allowed:
+            # clear/retry 판단은 실제 첨부 추출과 같은 후보 기준을 써야
+            # .pdf?sg=... 같은 파일 링크를 "첨부 흔적 없음"으로 오판하지 않는다.
+            return True
+    return False
+
+
 def build_detail_signals(html_text: str) -> dict:
     return {
         "has_html": True,
         "has_attachment_label": "첨부파일" in html_text,
-        "has_attachment_link": bool(ATTACHMENT_LINK_PATTERN.search(html_text)),
+        "has_attachment_link": detect_attachment_evidence_from_html(html_text),
         "has_body_container": bool(BODY_CONTAINER_PATTERN.search(html_text)),
         "body_has_content": detect_body_has_content(html_text),
     }
