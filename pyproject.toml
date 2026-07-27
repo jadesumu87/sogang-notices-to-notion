@@ -1,0 +1,24 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = [".runtime"]
+
+[tool.ruff.lint]
+select = ["E9", "F", "B904", "B905"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+cache_dir = ".runtime/mypy_cache"
+
+[tool.coverage.run]
+branch = true
+source = ["scripts"]
+
+[tool.coverage.report]
+fail_under = 60
+precision = 1
+show_missing = true

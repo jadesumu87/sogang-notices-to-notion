@@ -1,0 +1,35 @@
+name: 버그 보고
+description: 재현 가능한 문제를 알려 주세요.
+title: "[버그] "
+body:
+  - type: markdown
+    attributes:
+      value: 토큰, 데이터베이스 ID, 개인정보는 제거한 뒤 작성해 주세요.
+  - type: textarea
+    id: summary
+    attributes:
+      label: 문제
+      description: 기대한 동작과 실제 동작을 설명해 주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 재현 방법
+      description: 문제를 재현하는 데 필요한 단계를 적어 주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 실행 환경
+      description: Python 버전과 실행 방법을 적어 주세요.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: 관련 로그
+      description: 비밀값과 개인정보를 제거한 로그가 있다면 첨부해 주세요.
+    validations:
+      required: false

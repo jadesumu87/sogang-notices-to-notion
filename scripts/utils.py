@@ -1,13 +1,17 @@
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
 import re
+import socket
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import (
     parse_qs,
+    parse_qsl,
     quote,
     urlencode,
     unquote,
@@ -81,8 +85,21 @@ def parse_datetime(date_text: str) -> Optional[str]:
         hour, minute, second = time_match.groups()
         if not second:
             second = "00"
-        return f"{year}-{month}-{day}T{hour}:{minute}:{second}+09:00"
-    return f"{year}-{month}-{day}T00:00:00+09:00"
+    else:
+        hour, minute, second = "00", "00", "00"
+    try:
+        parsed = datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            int(second),
+            tzinfo=timezone(timedelta(hours=9)),
+        )
+    except ValueError:
+        return None
+    return parsed.isoformat()
 
 
 def parse_compact_datetime(date_text: Optional[str]) -> Optional[str]:
@@ -92,10 +109,12 @@ def parse_compact_datetime(date_text: Optional[str]) -> Optional[str]:
     if len(digits) >= 14:
         year, month, day = digits[0:4], digits[4:6], digits[6:8]
         hour, minute, second = digits[8:10], digits[10:12], digits[12:14]
-        return f"{year}-{month}-{day}T{hour}:{minute}:{second}+09:00"
+        return parse_datetime(
+            f"{year}-{month}-{day} {hour}:{minute}:{second}"
+        )
     if len(digits) >= 8:
         year, month, day = digits[0:4], digits[4:6], digits[6:8]
-        return f"{year}-{month}-{day}T00:00:00+09:00"
+        return parse_datetime(f"{year}-{month}-{day}")
     return parse_datetime(str(date_text))
 
 
@@ -108,7 +127,10 @@ def normalize_date_key(date_text: Optional[str]) -> str:
     return date_text[:10]
 
 
-def compute_body_hash(blocks: list[dict], image_mode: str = "") -> str:
+def compute_body_hash(
+    blocks: list[dict[str, Any]],
+    image_mode: str = "",
+) -> str:
     payload_value: object
     if image_mode:
         payload_value = {"image_mode": image_mode, "blocks": blocks}
@@ -120,7 +142,18 @@ def compute_body_hash(blocks: list[dict], image_mode: str = "") -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def has_image_blocks(blocks: list[dict]) -> bool:
+def compute_content_sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def normalize_content_sha256(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        return ""
+    return normalized
+
+
+def has_image_blocks(blocks: list[dict[str, Any]]) -> bool:
     if not blocks:
         return False
     for block in blocks:
@@ -129,40 +162,63 @@ def has_image_blocks(blocks: list[dict]) -> bool:
     return False
 
 
-# 본문 해시는 file_upload id 대신 원본 URL을 기준으로 남겨야, 같은 파일을 다시 올려도 해시가 흔들리지 않는다.
+# 본문 해시는 업로드 ID가 아닌 원본 URL을 기준으로 계산해 재업로드에도 유지한다.
 def build_uploaded_image_hash_block(
     source_url: str,
-    caption: Optional[list[dict]] = None,
-) -> dict:
-    block = {
+    caption: Optional[list[dict[str, Any]]] = None,
+    content_sha256: str = "",
+) -> dict[str, Any]:
+    identity_url = (
+        normalize_attachment_identity_url(source_url)
+        or str(source_url or "").strip()
+    )
+    block: dict[str, Any] = {
         "type": "image",
         "image": {
             "type": "uploaded_external",
-            "source_url": source_url,
+            "source_url": identity_url,
         },
     }
     if caption:
         block["image"]["caption"] = caption
+    normalized_content_sha256 = normalize_content_sha256(content_sha256)
+    if normalized_content_sha256:
+        block["image"]["content_sha256"] = normalized_content_sha256
     return block
 
 
-# 파일/ PDF 업로드도 upload id가 아니라 source_url로 정규화해야 실제 sync 결과를 안정적으로 비교할 수 있다.
-def build_uploaded_file_hash_block(source_url: str, as_pdf: bool) -> dict:
+# 파일과 PDF도 업로드 ID 대신 원본 URL로 정규화해 동기화 결과를 안정적으로 비교한다.
+def build_uploaded_file_hash_block(
+    source_url: str,
+    as_pdf: bool,
+    content_sha256: str = "",
+) -> dict[str, Any]:
+    identity_url = (
+        normalize_attachment_identity_url(source_url)
+        or str(source_url or "").strip()
+    )
     block_type = "pdf" if as_pdf else "file"
-    return {
+    block: dict[str, Any] = {
         "type": block_type,
         block_type: {
             "type": "uploaded_external",
-            "source_url": source_url,
+            "source_url": identity_url,
         },
     }
+    normalized_content_sha256 = normalize_content_sha256(content_sha256)
+    if normalized_content_sha256:
+        block[block_type]["content_sha256"] = normalized_content_sha256
+    return block
 
 
 # 긴 JSON 상태도 Notion rich_text 속성에 안전하게 저장할 수 있게 짧은 조각으로 나눠 둔다.
-def build_rich_text_chunks(text: str, chunk_size: int = 1900) -> list[dict]:
+def build_rich_text_chunks(
+    text: str,
+    chunk_size: int = 1900,
+) -> list[dict[str, Any]]:
     if not text:
         return []
-    chunks: list[dict] = []
+    chunks: list[dict[str, Any]] = []
     for idx in range(0, len(text), chunk_size):
         chunks.append(
             {
@@ -174,11 +230,14 @@ def build_rich_text_chunks(text: str, chunk_size: int = 1900) -> list[dict]:
 
 
 def normalize_body_blocks_for_hash(
-    blocks: list[dict], upload_files: bool
-) -> list[dict]:
+    blocks: list[dict[str, Any]],
+    upload_files: bool,
+    media_content_state: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
     if not blocks:
         return []
-    normalized: list[dict] = []
+    normalized: list[dict[str, Any]] = []
+    media_index = 0
     for block in blocks:
         block_type = block.get("type")
         if block_type == "image":
@@ -190,8 +249,30 @@ def normalize_body_blocks_for_hash(
                 and url
                 and is_allowed_external_download_url(url)
             ):
+                content_sha256 = ""
+                if (
+                    media_content_state
+                    and media_index < len(media_content_state)
+                ):
+                    content_entry = media_content_state[media_index]
+                    if (
+                        str(content_entry.get("type") or "")
+                        == "image"
+                        and normalize_attachment_identity_url(
+                            str(content_entry.get("source_url") or "")
+                        )
+                        == normalize_attachment_identity_url(url)
+                    ):
+                        content_sha256 = normalize_content_sha256(
+                            content_entry.get("content_sha256")
+                        )
+                media_index += 1
                 normalized.append(
-                    build_uploaded_image_hash_block(url, image.get("caption"))
+                    build_uploaded_image_hash_block(
+                        url,
+                        image.get("caption"),
+                        content_sha256,
+                    )
                 )
             else:
                 normalized.append(block)
@@ -206,8 +287,30 @@ def normalize_body_blocks_for_hash(
             ):
                 filename = derive_filename_from_url(url, fallback="file")
                 marker_type = "pdf" if is_pdf_name_or_url(filename, url) else "file"
+                content_sha256 = ""
+                if (
+                    media_content_state
+                    and media_index < len(media_content_state)
+                ):
+                    content_entry = media_content_state[media_index]
+                    if (
+                        str(content_entry.get("type") or "")
+                        == marker_type
+                        and normalize_attachment_identity_url(
+                            str(content_entry.get("source_url") or "")
+                        )
+                        == normalize_attachment_identity_url(url)
+                    ):
+                        content_sha256 = normalize_content_sha256(
+                            content_entry.get("content_sha256")
+                        )
+                media_index += 1
                 normalized.append(
-                    build_uploaded_file_hash_block(url, as_pdf=marker_type == "pdf")
+                    build_uploaded_file_hash_block(
+                        url,
+                        as_pdf=marker_type == "pdf",
+                        content_sha256=content_sha256,
+                    )
                 )
             else:
                 normalized.append(block)
@@ -236,6 +339,19 @@ def normalize_detail_url(raw_url: Optional[str]) -> Optional[str]:
             parsed = urlparse(f"{base.scheme}://{base.netloc}{raw_url}")
         else:
             return None
+    base_site = urlparse(BASE_SITE)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != base_site.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    try:
+        if parsed.port not in {None, 443}:
+            return None
+    except ValueError:
+        return None
     query = parse_qs(parsed.query)
     drop_keys = {"introPkId", "option", "page"}
     query_items: list[tuple[str, str]] = []
@@ -272,14 +388,50 @@ def normalize_file_url(raw_url: Optional[str]) -> Optional[str]:
     )
 
 
-# Attachment policy:
-# - ATTACHMENT_ALLOWED_DOMAINS: comma-separated allowed hosts (default: sogang.ac.kr)
+def normalize_attachment_identity_url(raw_url: Optional[str]) -> str:
+    normalized = normalize_file_url(raw_url)
+    if not normalized:
+        return ""
+    parsed = urlsplit(normalized)
+    identity_keys = {
+        "sg",
+        "fileid",
+        "file_id",
+        "fileno",
+        "file_no",
+        "fileseq",
+        "file_seq",
+        "attachid",
+        "attach_id",
+        "attachno",
+        "attach_no",
+    }
+    identity_query = sorted(
+        (key.lower(), value)
+        for key, value in parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+        if key.lower() in identity_keys
+    )
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path,
+            urlencode(identity_query, doseq=True),
+            "",
+        )
+    )
+
+
 def is_allowed_attachment_host(host: str, allowed_domains: tuple[str, ...]) -> bool:
     if not host:
         return False
-    host = host.split(":", 1)[0]
+    host = host.strip().lower().rstrip(".")
     for domain in allowed_domains:
-        if host == domain or host.endswith(f".{domain}"):
+        domain = domain.strip().lower().rstrip(".")
+        if domain and (host == domain or host.endswith(f".{domain}")):
             return True
     return False
 
@@ -290,7 +442,7 @@ def is_attachment_candidate(
     allow_domain_only: bool = False,
 ) -> tuple[bool, bool]:
     parsed = urlparse(url)
-    host = (parsed.netloc or "").lower()
+    host = (parsed.hostname or "").lower()
     allowed_domains = get_attachment_allowed_domains()
     lowered_url = url.lower()
     ext_match = bool(
@@ -318,7 +470,7 @@ def is_attachment_candidate(
     return False, False
 
 
-# 실제 다운로드 직전에도 동일한 allowlist를 강제해, 본문 미디어와 첨부파일 정책이 어긋나지 않게 한다.
+# 실제 다운로드에도 같은 허용 목록을 적용해 본문 미디어와 첨부파일 정책을 맞춘다.
 def is_allowed_external_download_url(
     url: str,
     require_file_hint: bool = False,
@@ -328,7 +480,9 @@ def is_allowed_external_download_url(
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return False
-    host = (parsed.netloc or "").lower()
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    host = (parsed.hostname or "").lower()
     allowed_domains = get_attachment_allowed_domains()
     if not is_allowed_attachment_host(host, allowed_domains):
         return False
@@ -338,11 +492,71 @@ def is_allowed_external_download_url(
     return allowed
 
 
+def is_public_network_address(raw_address: str) -> bool:
+    try:
+        address = ipaddress.ip_address(raw_address)
+    except ValueError:
+        return False
+    return (
+        address.is_global
+        and not address.is_loopback
+        and not address.is_private
+        and not address.is_link_local
+        and not address.is_multicast
+        and not address.is_reserved
+        and not address.is_unspecified
+    )
+
+
+def resolve_public_network_address_info(
+    hostname: str,
+    port: int,
+) -> tuple[Any, ...]:
+    try:
+        address_info = socket.getaddrinfo(
+            hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    except (OSError, UnicodeError, ValueError):
+        return ()
+    if not address_info:
+        return ()
+    addresses = {str(entry[4][0]) for entry in address_info if entry[4]}
+    if not addresses or not all(
+        is_public_network_address(address) for address in addresses
+    ):
+        return ()
+    return tuple(address_info)
+
+
+def is_safe_external_download_target(
+    url: str,
+    require_file_hint: bool = False,
+) -> bool:
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or port not in {None, 443}:
+        return False
+    if not is_allowed_external_download_url(
+        url,
+        require_file_hint=require_file_hint,
+    ):
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    return bool(resolve_public_network_address_info(hostname, 443))
+
+
 def normalize_attachment_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "")).strip().lower()
 
 
-def extract_attachment_name(attachment: dict) -> str:
+def extract_attachment_name(attachment: dict[str, Any]) -> str:
     name = attachment.get("name") or ""
     if name:
         return name
@@ -362,19 +576,24 @@ def strip_dataview_prefix(filename: str) -> str:
     return filename
 
 
-def replace_body_image_urls(body_blocks: list[dict], attachments: list[dict]) -> list[dict]:
+def replace_body_image_urls(
+    body_blocks: list[dict[str, Any]],
+    attachments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     if not body_blocks or not attachments:
         return body_blocks
-    name_map: dict[str, str] = {}
+    name_map: dict[str, list[str]] = {}
     for attachment in attachments:
         name = extract_attachment_name(attachment)
         key = normalize_attachment_name(name)
         url = attachment.get("external", {}).get("url") or ""
-        if key and url and key not in name_map:
-            name_map[key] = url
+        if key and url:
+            candidates = name_map.setdefault(key, [])
+            if url not in candidates:
+                candidates.append(url)
     if not name_map:
         return body_blocks
-    replaced = 0
+    image_groups: dict[str, list[dict[str, Any]]] = {}
     for block in body_blocks:
         if block.get("type") != "image":
             continue
@@ -390,16 +609,34 @@ def replace_body_image_urls(body_blocks: list[dict], attachments: list[dict]) ->
         filename = unquote(Path(parsed.path).name)
         if not filename:
             continue
-        normalized = normalize_attachment_name(strip_dataview_prefix(filename))
-        replacement = name_map.get(normalized)
-        if replacement and replacement != url:
-            image["external"]["url"] = replacement
-            replaced += 1
+        key = normalize_attachment_name(strip_dataview_prefix(filename))
+        if key:
+            image_groups.setdefault(key, []).append(image)
+    replaced = 0
+    for key, images in image_groups.items():
+        candidates = name_map.get(key, [])
+        if not candidates:
+            continue
+        if len(candidates) == 1:
+            replacements = candidates * len(images)
+        elif len(candidates) == len(images):
+            replacements = candidates
+        else:
+            continue
+        for image, replacement in zip(
+            images,
+            replacements,
+            strict=True,
+        ):
+            url = image.get("external", {}).get("url") or ""
+            if replacement != url:
+                image["external"]["url"] = replacement
+                replaced += 1
     if replaced:
         LOGGER.info("본문 이미지 URL 치환: %s개", replaced)
     return body_blocks
 
-def build_site_headers() -> dict:
+def build_site_headers() -> dict[str, str]:
     return {"User-Agent": USER_AGENT, "Referer": BASE_URL}
 
 
@@ -584,9 +821,8 @@ def split_text_with_links(text: str) -> list[tuple[str, Optional[str]]]:
             link = trimmed
             if link.lower().startswith("www."):
                 link = "https://" + link
-            normalized = normalize_content_url(link)
-            link = normalized if normalized else None
-            parts.append((trimmed, link))
+            normalized_link = normalize_content_url(link)
+            parts.append((trimmed, normalized_link or None))
         if suffix:
             parts.append((suffix, None))
         last_index = end
@@ -595,7 +831,7 @@ def split_text_with_links(text: str) -> list[tuple[str, Optional[str]]]:
     return parts
 
 
-def build_image_block(url: str) -> dict:
+def build_image_block(url: str) -> dict[str, Any]:
     return {
         "object": "block",
         "type": "image",
@@ -603,7 +839,7 @@ def build_image_block(url: str) -> dict:
     }
 
 
-def build_embed_block(url: str) -> dict:
+def build_embed_block(url: str) -> dict[str, Any]:
     return {
         "object": "block",
         "type": "embed",
@@ -611,7 +847,7 @@ def build_embed_block(url: str) -> dict:
     }
 
 
-def build_file_block(upload_id: str) -> dict:
+def build_file_block(upload_id: str) -> dict[str, Any]:
     return {
         "object": "block",
         "type": "file",
@@ -619,7 +855,7 @@ def build_file_block(upload_id: str) -> dict:
     }
 
 
-def build_pdf_block(upload_id: str) -> dict:
+def build_pdf_block(upload_id: str) -> dict[str, Any]:
     return {
         "object": "block",
         "type": "pdf",
@@ -627,7 +863,7 @@ def build_pdf_block(upload_id: str) -> dict:
     }
 
 
-def build_space_rich_text() -> list[dict]:
+def build_space_rich_text() -> list[dict[str, Any]]:
     return [
         {
             "type": "text",
@@ -637,7 +873,9 @@ def build_space_rich_text() -> list[dict]:
     ]
 
 
-def build_container_block(rich_text: Optional[list[dict]] = None) -> dict:
+def build_container_block(
+    rich_text: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
     return {
         "object": "block",
         "type": "quote",
@@ -648,7 +886,9 @@ def build_container_block(rich_text: Optional[list[dict]] = None) -> dict:
     }
 
 
-def build_table_row_block(cells: list[list[dict]]) -> dict:
+def build_table_row_block(
+    cells: list[list[dict[str, Any]]],
+) -> dict[str, Any]:
     return {
         "object": "block",
         "type": "table_row",
@@ -657,16 +897,16 @@ def build_table_row_block(cells: list[list[dict]]) -> dict:
 
 
 def build_table_block(
-    rows: list[list[list[dict]]],
+    rows: list[list[list[dict[str, Any]]]],
     has_column_header: bool,
     has_row_header: bool,
-) -> Optional[dict]:
+) -> Optional[dict[str, Any]]:
     if not rows:
         return None
     table_width = max((len(row) for row in rows), default=0)
     if table_width <= 0:
         return None
-    normalized_rows: list[dict] = []
+    normalized_rows: list[dict[str, Any]] = []
     for row in rows:
         if len(row) < table_width:
             row = row + [[] for _ in range(table_width - len(row))]
@@ -681,7 +921,10 @@ def build_table_block(
             "children": normalized_rows,
         },
     }
-def chunks(items: list[dict], size: int) -> list[list[dict]]:
+def chunks(
+    items: list[dict[str, Any]],
+    size: int,
+) -> list[list[dict[str, Any]]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 def parse_int(value: str) -> Optional[int]:
     digits = re.sub(r"[^0-9]", "", value)
