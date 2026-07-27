@@ -423,7 +423,10 @@ class CrawlerRegressionTests(unittest.TestCase):
         report = CrawlReport(sources=[crawl_result()])
         state = default_run_state()
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.dict(os.environ, {}, clear=True),
+        ):
             state_path = Path(temp_dir) / "run-state.json"
             incident_path = Path(temp_dir) / "incident.json"
             auth_record = crawler_main.create_run_record(False, False)
