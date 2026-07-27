@@ -1,6 +1,6 @@
 import re
 from html import unescape
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from settings import (
@@ -45,6 +45,22 @@ def extract_detail_id_from_text(text: str) -> Optional[str]:
     return None
 
 
+def extract_verified_detail_url_identity(
+    url: str,
+    config_fk: str,
+) -> Optional[str]:
+    normalized = normalize_detail_url(url)
+    if not normalized:
+        return None
+    notice_id = extract_detail_id_from_text(normalized)
+    if not notice_id:
+        return None
+    expected = normalize_detail_url(build_detail_url(notice_id, config_fk))
+    if normalized != expected:
+        return None
+    return notice_id
+
+
 def is_detail_url(url: str) -> bool:
     if not url:
         return False
@@ -68,13 +84,15 @@ def extract_detail_url_from_row_html(
         detail_id = extract_detail_id_from_text(href)
         if detail_id:
             return normalize_detail_url(build_detail_url(detail_id, config_fk))
-    match = re.search(r"/detail/(\d+)", row_html)
-    if match:
-        return normalize_detail_url(build_detail_url(match.group(1), config_fk))
+    path_match = re.search(r"/detail/(\d+)", row_html)
+    if path_match:
+        return normalize_detail_url(
+            build_detail_url(path_match.group(1), config_fk)
+        )
     return None
 
 
-def get_browser_launcher(playwright, browser: str):
+def get_browser_launcher(playwright: Any, browser: str) -> Any:
     browser = browser.lower()
     if browser in {"chromium", "chrome", "edge"}:
         return playwright.chromium
@@ -82,10 +100,13 @@ def get_browser_launcher(playwright, browser: str):
         return playwright.firefox
     if browser in {"webkit", "safari"}:
         return playwright.webkit
-    raise RuntimeError(f"Unsupported BROWSER: {browser}")
+    raise RuntimeError(f"지원하지 않는 브라우저입니다: {browser}")
 
 
-def extract_list_rows(page, config_fk: Optional[str] = None) -> list[dict]:
+def extract_list_rows(
+    page: Any,
+    config_fk: Optional[str] = None,
+) -> list[dict[str, Any]]:
     rows = page.locator(LIST_ROW_SELECTOR)
     count = rows.count()
     items = []
@@ -154,7 +175,7 @@ def extract_list_rows(page, config_fk: Optional[str] = None) -> list[dict]:
 
 
 # 본문 블록 정규화와 제목 보정은 수집기와 동기화기가 같은 기준을 써야 해시와 중복 판별이 흔들리지 않는다.
-def is_empty_paragraph_block(block: dict) -> bool:
+def is_empty_paragraph_block(block: dict[str, Any]) -> bool:
     if block.get("type") != "paragraph":
         return False
     rich_text = block.get("paragraph", {}).get("rich_text", [])
@@ -166,7 +187,9 @@ def is_empty_paragraph_block(block: dict) -> bool:
     return content.replace("\u00a0", "").strip() == ""
 
 
-def strip_trailing_empty_paragraphs(blocks: list[dict]) -> list[dict]:
+def strip_trailing_empty_paragraphs(
+    blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     if not blocks:
         return blocks
     end = len(blocks)
@@ -177,7 +200,9 @@ def strip_trailing_empty_paragraphs(blocks: list[dict]) -> list[dict]:
     return blocks[:end]
 
 
-def trim_trailing_whitespace_rich_text(rich_text: list[dict]) -> None:
+def trim_trailing_whitespace_rich_text(
+    rich_text: list[dict[str, Any]],
+) -> None:
     idx = len(rich_text) - 1
     while idx >= 0:
         item = rich_text[idx]
@@ -195,7 +220,9 @@ def trim_trailing_whitespace_rich_text(rich_text: list[dict]) -> None:
         idx -= 1
 
 
-def normalize_body_blocks(blocks: list[dict]) -> list[dict]:
+def normalize_body_blocks(
+    blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     normalized = strip_trailing_empty_paragraphs(blocks or [])
     if not normalized:
         return normalized
@@ -210,7 +237,7 @@ def normalize_body_blocks(blocks: list[dict]) -> list[dict]:
     return normalized
 
 
-def rich_text_plain_text(rich_text: list[dict]) -> str:
+def rich_text_plain_text(rich_text: list[dict[str, Any]]) -> str:
     return "".join(item.get("text", {}).get("content", "") for item in rich_text)
 
 
@@ -224,7 +251,7 @@ def extract_first_nonempty_line(text: str) -> str:
     return text.replace("\u00a0", " ").strip()
 
 
-def derive_title_from_blocks(blocks: list[dict]) -> str:
+def derive_title_from_blocks(blocks: list[dict[str, Any]]) -> str:
     for block in blocks or []:
         block_type = block.get("type")
         if block_type not in {"paragraph", "bulleted_list_item"}:
@@ -250,8 +277,8 @@ def build_fallback_title(detail_url: Optional[str], date_iso: Optional[str]) -> 
 
 
 def ensure_item_title(
-    item: dict,
-    body_blocks: list[dict],
+    item: dict[str, Any],
+    body_blocks: list[dict[str, Any]],
     detail_url: Optional[str] = None,
 ) -> None:
     title = normalize_title_key(item.get("title", ""))

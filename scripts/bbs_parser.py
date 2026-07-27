@@ -2,23 +2,17 @@ import re
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from common import (
-    ensure_item_title,
     extract_detail_id_from_text,
-    extract_detail_url_from_row_html,
-    extract_list_rows,
-    get_browser_launcher,
     is_detail_url,
     normalize_body_blocks,
 )
 
 from log import LOGGER
 from settings import (
-    ATTACHMENT_EXT_PATTERN,
-    ATTACHMENT_HINTS,
     DATE_PATTERN,
     DATE_TIME_PATTERN,
     DETAIL_PATH_PATTERN,
@@ -37,10 +31,8 @@ from utils import (
     normalize_detail_url,
     normalize_file_url,
     normalize_link_url,
-    normalize_title_key,
     parse_datetime,
     parse_int,
-    replace_body_image_urls,
     resolve_iframe_embed_url,
     split_text_with_links,
 )
@@ -89,7 +81,6 @@ def parse_css_color(value: str) -> Optional[tuple[int, int, int]]:
                         rgb.append(int(float(part)))
                     except ValueError:
                         return None
-            # Pylance가 길이 미정 tuple로 보지 않도록, 3채널 RGB를 고정 길이로 반환한다.
             normalized_rgb = [max(0, min(255, val)) for val in rgb[:3]]
             return normalized_rgb[0], normalized_rgb[1], normalized_rgb[2]
     return None
@@ -165,8 +156,10 @@ def normalize_inline_text(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def build_rich_text_from_segments(segments: list[dict]) -> list[dict]:
-    rich_text: list[dict] = []
+def build_rich_text_from_segments(
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rich_text: list[dict[str, Any]] = []
     has_content = False
     for segment in segments:
         text = segment.get("text", "")
@@ -185,7 +178,7 @@ def build_rich_text_from_segments(segments: list[dict]) -> list[dict]:
         while remaining:
             chunk = remaining[:2000]
             remaining = remaining[2000:]
-            text_payload = {"content": chunk}
+            text_payload: dict[str, Any] = {"content": chunk}
             if link:
                 text_payload["link"] = {"url": link}
             rich_text.append(
@@ -199,7 +192,9 @@ def build_rich_text_from_segments(segments: list[dict]) -> list[dict]:
     return rich_text
 
 
-def build_paragraph_block_from_rich_text(rich_text: list[dict]) -> Optional[dict]:
+def build_paragraph_block_from_rich_text(
+    rich_text: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
     if not rich_text:
         return None
     return {
@@ -209,7 +204,9 @@ def build_paragraph_block_from_rich_text(rich_text: list[dict]) -> Optional[dict
     }
 
 
-def build_bulleted_block_from_rich_text(rich_text: list[dict]) -> Optional[dict]:
+def build_bulleted_block_from_rich_text(
+    rich_text: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
     if not rich_text:
         return None
     return {
@@ -219,7 +216,22 @@ def build_bulleted_block_from_rich_text(rich_text: list[dict]) -> Optional[dict]
     }
 
 
-def build_empty_paragraph_block() -> dict:
+def build_heading_block_from_rich_text(
+    rich_text: list[dict[str, Any]],
+    level: int,
+) -> Optional[dict[str, Any]]:
+    if not rich_text:
+        return None
+    notion_level = max(1, min(3, level))
+    block_type = f"heading_{notion_level}"
+    return {
+        "object": "block",
+        "type": block_type,
+        block_type: {"rich_text": rich_text},
+    }
+
+
+def build_empty_paragraph_block() -> dict[str, Any]:
     return {
         "object": "block",
         "type": "paragraph",
@@ -234,14 +246,14 @@ def build_empty_paragraph_block() -> dict:
         },
     }
 class TiptapBlockParser(HTMLParser):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.in_tiptap = False
         self.tiptap_depth = 0
         self.seen_tiptap = False
         self.in_list_item = False
         self.current_block_type: Optional[str] = None
-        self.rich_text: list[dict] = []
+        self.rich_text: list[dict[str, Any]] = []
         self.bold_depth = 0
         self.italic_depth = 0
         self.underline_depth = 0
@@ -250,19 +262,21 @@ class TiptapBlockParser(HTMLParser):
         self.link_stack: list[Optional[str]] = []
         self.color_stack: list[str] = ["default"]
         self.color_push_stack: list[bool] = []
-        self.blocks: list[dict] = []
+        self.blocks: list[dict[str, Any]] = []
         self.in_table = False
         self.table_depth = 0
         self.in_table_row = False
         self.in_table_cell = False
-        self.table_rows: list[list[list[dict]]] = []
-        self.table_cells: list[list[dict]] = []
-        self.table_cell_segments: list[dict] = []
+        self.table_rows: list[list[list[dict[str, Any]]]] = []
+        self.table_cells: list[list[dict[str, Any]]] = []
+        self.table_cell_segments: list[dict[str, Any]] = []
         self.table_cell_is_header = False
         self.table_row_index = -1
         self.table_cell_index = 0
         self.table_has_column_header = False
         self.table_has_row_header = False
+        self.hidden_content_depth = 0
+        self.hidden_content_tags = {"script", "style", "template"}
         self.void_tags = {
             "area",
             "base",
@@ -291,6 +305,17 @@ class TiptapBlockParser(HTMLParser):
                 self.tiptap_depth = 1
                 return
         if not self.in_tiptap:
+            return
+        if self.hidden_content_depth:
+            if tag not in self.void_tags:
+                self.tiptap_depth += 1
+                self.color_push_stack.append(False)
+                self.hidden_content_depth += 1
+            return
+        if tag in self.hidden_content_tags:
+            self.tiptap_depth += 1
+            self.color_push_stack.append(False)
+            self.hidden_content_depth = 1
             return
         if tag not in self.void_tags:
             self.tiptap_depth += 1
@@ -343,6 +368,10 @@ class TiptapBlockParser(HTMLParser):
                 self.flush_block()
                 self.in_list_item = True
                 self.current_block_type = "li"
+        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            if not self.in_list_item:
+                self.flush_block()
+                self.current_block_type = f"heading_{min(int(tag[1]), 3)}"
         elif tag == "p":
             if not self.in_list_item and self.current_block_type != "p":
                 self.flush_block()
@@ -383,6 +412,13 @@ class TiptapBlockParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if not self.in_tiptap:
             return
+        if self.hidden_content_depth:
+            if tag not in self.void_tags:
+                if self.color_push_stack:
+                    self.color_push_stack.pop()
+                self.hidden_content_depth -= 1
+                self.tiptap_depth = max(0, self.tiptap_depth - 1)
+            return
         if tag not in self.void_tags and self.color_push_stack:
             pushed = self.color_push_stack.pop()
             if pushed and len(self.color_stack) > 1:
@@ -410,6 +446,14 @@ class TiptapBlockParser(HTMLParser):
                 self.flush_block()
             else:
                 self.blocks.append(build_empty_paragraph_block())
+            self.current_block_type = None
+        elif (
+            tag in {"h1", "h2", "h3", "h4", "h5", "h6"}
+            and not self.in_list_item
+            and self.current_block_type
+            and self.current_block_type.startswith("heading_")
+        ):
+            self.flush_block()
             self.current_block_type = None
         elif tag in {"strong", "b"}:
             self.bold_depth = max(0, self.bold_depth - 1)
@@ -452,9 +496,12 @@ class TiptapBlockParser(HTMLParser):
                 self.table_cell_index = 0
                 self.table_has_column_header = False
                 self.table_has_row_header = False
+                self.hidden_content_depth = 0
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         if not self.in_tiptap:
+            return
+        if self.hidden_content_depth:
             return
         if tag == "br":
             self.append_line_break()
@@ -485,6 +532,8 @@ class TiptapBlockParser(HTMLParser):
     def append_text(self, data: str) -> None:
         if self.in_table and not self.in_table_cell:
             return
+        if self.hidden_content_depth:
+            return
         text = normalize_inline_text(data)
         if not text:
             return
@@ -502,7 +551,12 @@ class TiptapBlockParser(HTMLParser):
         for segment_text, segment_link in split_text_with_links(text):
             self.append_segment(segment_text, annotations, segment_link)
 
-    def append_segment(self, text: str, annotations: dict, link: Optional[str]) -> None:
+    def append_segment(
+        self,
+        text: str,
+        annotations: dict[str, Any],
+        link: Optional[str],
+    ) -> None:
         if not text:
             return
         segments = self.table_cell_segments if self.in_table_cell else self.rich_text
@@ -551,6 +605,14 @@ class TiptapBlockParser(HTMLParser):
         self.rich_text = []
         if self.in_list_item or self.current_block_type == "li":
             block = build_bulleted_block_from_rich_text(rich_text)
+        elif (
+            self.current_block_type
+            and self.current_block_type.startswith("heading_")
+        ):
+            block = build_heading_block_from_rich_text(
+                rich_text,
+                int(self.current_block_type.rsplit("_", 1)[1]),
+            )
         else:
             block = build_paragraph_block_from_rich_text(rich_text)
         if block:
@@ -605,7 +667,9 @@ class TiptapBlockParser(HTMLParser):
         self.table_has_row_header = False
 
 
-def extract_body_blocks_from_html(html_text: str) -> list[dict]:
+def extract_body_blocks_from_html(
+    html_text: str,
+) -> list[dict[str, Any]]:
     if not html_text:
         return []
     parser = TiptapBlockParser()
@@ -624,7 +688,10 @@ def extract_body_blocks_from_html(html_text: str) -> list[dict]:
     return normalize_body_blocks(parser.blocks)
 
 
-def chunks(items: list[dict], size: int) -> list[list[dict]]:
+def chunks(
+    items: list[dict[str, Any]],
+    size: int,
+) -> list[list[dict[str, Any]]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
@@ -632,8 +699,12 @@ class BodyContentDetector(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.in_container = False
+        self.seen_container = False
+        self.container_complete = False
         self.depth = 0
         self.has_content = False
+        self.hidden_content_depth = 0
+        self.hidden_content_tags = {"script", "style", "template"}
         self.void_tags = {
             "area",
             "base",
@@ -658,9 +729,20 @@ class BodyContentDetector(HTMLParser):
             classes = attrs_dict.get("class", "")
             if "tiptap" in classes.split() or "custom-css-tag-a" in classes.split():
                 self.in_container = True
+                self.seen_container = True
+                self.container_complete = False
                 self.depth = 1
                 return
         if not self.in_container:
+            return
+        if self.hidden_content_depth:
+            if tag not in self.void_tags:
+                self.depth += 1
+                self.hidden_content_depth += 1
+            return
+        if tag in self.hidden_content_tags:
+            self.depth += 1
+            self.hidden_content_depth = 1
             return
         if tag in {"img", "a", "iframe"}:
             self.has_content = True
@@ -670,14 +752,22 @@ class BodyContentDetector(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if not self.in_container:
             return
+        if self.hidden_content_depth:
+            if tag not in self.void_tags:
+                self.hidden_content_depth -= 1
+                self.depth = max(0, self.depth - 1)
+            return
         if tag not in self.void_tags:
             self.depth -= 1
         if self.depth <= 0:
             self.in_container = False
+            self.container_complete = True
             self.depth = 0
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         if not self.in_container:
+            return
+        if self.hidden_content_depth:
             return
         if tag in {"img", "iframe"}:
             self.has_content = True
@@ -685,16 +775,114 @@ class BodyContentDetector(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self.in_container:
             return
+        if self.hidden_content_depth:
+            return
         text = unescape(data).replace("\u00a0", " ").strip()
         if text:
             self.has_content = True
 
 
 def detect_body_has_content(html_text: str) -> bool:
+    return inspect_body_content(html_text)[1]
+
+
+def inspect_body_content(html_text: str) -> tuple[bool, bool]:
     detector = BodyContentDetector()
     detector.feed(html_text)
     detector.close()
-    return detector.has_content
+    return (
+        detector.seen_container,
+        detector.has_content and detector.container_complete,
+    )
+
+
+class AttachmentEvidenceDetector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.context_stack: list[tuple[bool, bool]] = []
+        self.seen_label = False
+        self.seen_loading_shell = False
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, Optional[str]]],
+    ) -> None:
+        attrs_dict = {key.lower(): value or "" for key, value in attrs}
+        parent_candidate = (
+            self.context_stack[-1][0] if self.context_stack else False
+        )
+        parent_hidden = (
+            self.context_stack[-1][1] if self.context_stack else False
+        )
+        descriptor = " ".join(
+            attrs_dict.get(key, "")
+            for key in (
+                "class",
+                "id",
+                "role",
+                "data-testid",
+                "data-v",
+            )
+        ).lower()
+        attachment_candidate = bool(
+            re.search(
+                r"(?:^|[\s_-])(?:attachment|attach|"
+                r"file(?:[\s_-]?(?:list|area|box|wrap|section))|"
+                r"download)(?:$|[\s_-])",
+                descriptor,
+            )
+        )
+        style = attrs_dict.get("style", "").replace(" ", "").lower()
+        hidden = bool(
+            parent_hidden
+            or tag in {"script", "style", "template"}
+            or "hidden" in attrs_dict
+            or attrs_dict.get("aria-hidden", "").lower() == "true"
+            or "display:none" in style
+            or "visibility:hidden" in style
+        )
+        self.context_stack.append(
+            (parent_candidate or attachment_candidate, hidden)
+        )
+        if not hidden and (
+            attrs_dict.get("aria-busy", "").lower() == "true"
+            or re.search(
+                r"(?:^|[\s_-])(?:skeleton|loading|spinner)"
+                r"(?:$|[\s_-])",
+                descriptor,
+            )
+        ):
+            self.seen_loading_shell = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.context_stack:
+            self.context_stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        if not self.context_stack:
+            return
+        attachment_candidate, hidden = self.context_stack[-1]
+        if (
+            attachment_candidate
+            and not hidden
+            and "첨부파일" in unescape(data)
+        ):
+            self.seen_label = True
+
+
+def detect_attachment_container(html_text: str) -> bool:
+    detector = AttachmentEvidenceDetector()
+    detector.feed(html_text)
+    detector.close()
+    return detector.seen_label
+
+
+def detect_loading_shell(html_text: str) -> bool:
+    detector = AttachmentEvidenceDetector()
+    detector.feed(html_text)
+    detector.close()
+    return detector.seen_loading_shell
 
 class TableRowParser(HTMLParser):
     def __init__(self) -> None:
@@ -704,9 +892,34 @@ class TableRowParser(HTMLParser):
         self.current_cells: list[str] = []
         self.current_parts: list[str] = []
         self.current_meta: list[str] = []
-        self.rows: list[dict] = []
+        self.rows: list[dict[str, Any]] = []
+        self.hidden_content_depth = 0
+        self.hidden_content_tags = {"script", "style", "template"}
+        self.void_tags = {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
+        }
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if self.hidden_content_depth:
+            if tag not in self.void_tags:
+                self.hidden_content_depth += 1
+            return
+        if tag in self.hidden_content_tags:
+            self.hidden_content_depth = 1
+            return
         attrs_dict = {key: value or "" for key, value in attrs}
         if tag == "tr":
             self.in_tr = True
@@ -732,6 +945,10 @@ class TableRowParser(HTMLParser):
                 self.current_meta.append(href)
 
     def handle_endtag(self, tag: str) -> None:
+        if self.hidden_content_depth:
+            if tag not in self.void_tags:
+                self.hidden_content_depth -= 1
+            return
         if tag == "td" and self.in_td:
             text = "".join(self.current_parts)
             text = unescape(text).replace("\u00a0", " ")
@@ -746,15 +963,20 @@ class TableRowParser(HTMLParser):
             self.current_meta = []
 
     def handle_data(self, data: str) -> None:
+        if self.hidden_content_depth:
+            return
         if self.in_tr and self.in_td:
             self.current_parts.append(data)
 
 
-def parse_rows(html_text: str, config_fk: Optional[str] = None) -> list[dict]:
+def parse_rows(
+    html_text: str,
+    config_fk: Optional[str] = None,
+) -> list[dict[str, Any]]:
     parser = TableRowParser()
     parser.feed(html_text)
     parser.close()
-    items: list[dict] = []
+    items: list[dict[str, Any]] = []
 
     for row in parser.rows:
         cells = row.get("cells", [])
@@ -797,10 +1019,129 @@ def parse_rows(html_text: str, config_fk: Optional[str] = None) -> list[dict]:
     return items
 
 
+class VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hidden_stack: list[bool] = []
+        self.parts: list[str] = []
+        self.void_tags = {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
+        }
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, Optional[str]]],
+    ) -> None:
+        attrs_dict = {key.lower(): value or "" for key, value in attrs}
+        parent_hidden = self.hidden_stack[-1] if self.hidden_stack else False
+        style = attrs_dict.get("style", "").replace(" ", "").lower()
+        hidden = bool(
+            parent_hidden
+            or tag in {"script", "style", "template"}
+            or "hidden" in attrs_dict
+            or attrs_dict.get("aria-hidden", "").lower() == "true"
+            or "display:none" in style
+            or "visibility:hidden" in style
+        )
+        if tag in self.void_tags:
+            return
+        self.hidden_stack.append(hidden)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.void_tags:
+            return
+        if self.hidden_stack:
+            self.hidden_stack.pop()
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, Optional[str]]],
+    ) -> None:
+        return
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden_stack or not self.hidden_stack[-1]:
+            text = unescape(data).replace("\u00a0", " ").strip()
+            if text:
+                self.parts.append(text)
+
+
+def extract_visible_text(html_text: str) -> str:
+    parser = VisibleTextParser()
+    parser.feed(html_text)
+    parser.close()
+    return " ".join(parser.parts)
+
+
+class VisibleAnchorParser(VisibleTextParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.current_anchor_href: Optional[str] = None
+        self.current_anchor_parts: list[str] = []
+        self.anchors: list[tuple[str, str]] = []
+        self.seen_attachment_label = False
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, Optional[str]]],
+    ) -> None:
+        super().handle_starttag(tag, attrs)
+        hidden = self.hidden_stack[-1] if self.hidden_stack else False
+        if tag == "a" and not hidden:
+            attrs_dict = {key.lower(): value or "" for key, value in attrs}
+            href = unescape(attrs_dict.get("href", "")).strip()
+            if href:
+                self.current_anchor_href = href
+                self.current_anchor_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        hidden = self.hidden_stack[-1] if self.hidden_stack else False
+        if tag == "a" and not hidden and self.current_anchor_href:
+            self.anchors.append(
+                (
+                    self.current_anchor_href,
+                    clean_text(" ".join(self.current_anchor_parts)),
+                )
+            )
+            self.current_anchor_href = None
+            self.current_anchor_parts = []
+        super().handle_endtag(tag)
+
+    def handle_data(self, data: str) -> None:
+        hidden = self.hidden_stack[-1] if self.hidden_stack else False
+        if hidden:
+            return
+        text = unescape(data).replace("\u00a0", " ").strip()
+        if not text:
+            return
+        if "첨부파일" in text:
+            self.seen_attachment_label = True
+        if self.current_anchor_href:
+            self.current_anchor_parts.append(text)
+        super().handle_data(data)
+
+
 def extract_written_at_from_detail(html_text: str) -> Optional[str]:
+    visible_text = extract_visible_text(html_text)
     matches = re.findall(
         r"(작성일|등록일).*?(\d{4}[.\-]\d{2}[.\-]\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)",
-        html_text,
+        visible_text,
         re.DOTALL,
     )
     if not matches:
@@ -811,8 +1152,10 @@ def extract_written_at_from_detail(html_text: str) -> Optional[str]:
     return parse_datetime(matches[0][1])
 
 
-def extract_attachments_from_detail(html_text: str) -> list[dict]:
-    attachments: list[dict] = []
+def extract_attachments_from_detail(
+    html_text: str,
+) -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     allowlist_only_urls: list[str] = []
 
@@ -837,44 +1180,19 @@ def extract_attachments_from_detail(html_text: str) -> list[dict]:
             name = Path(urlparse(url).path).name or "첨부파일"
         attachments.append({"name": name, "type": "external", "external": {"url": url}})
 
-    def extract_from_chunk(chunk: str, strict: bool) -> None:
-        for match in re.finditer(
-            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-            chunk,
-            re.IGNORECASE | re.DOTALL,
-        ):
-            href = unescape(match.group(1)).strip()
-            if not href:
-                continue
-            text = clean_text(match.group(2))
-            if not strict:
-                snippet = chunk[max(0, match.start() - 200) : match.end() + 200]
-                lowered_href = href.lower()
-                if (
-                    "첨부" not in text
-                    and "첨부" not in snippet
-                    and "다운로드" not in text
-                    and "다운로드" not in snippet
-                    and not ATTACHMENT_EXT_PATTERN.search(href)
-                    and not ATTACHMENT_EXT_PATTERN.search(text)
-                    and not any(hint in lowered_href for hint in ATTACHMENT_HINTS)
-                ):
-                    continue
-            add_attachment(href, text, allow_domain_only=strict)
-
-    label_matches = list(re.finditer(r"첨부파일", html_text))
-    has_label = bool(label_matches)
-    if has_label:
-        for match in label_matches:
-            start = max(0, match.start() - 800)
-            end = min(len(html_text), match.end() + 6000)
-            extract_from_chunk(html_text[start:end], strict=True)
-    if not attachments:
-        extract_from_chunk(html_text, strict=has_label)
+    parser = VisibleAnchorParser()
+    parser.feed(html_text)
+    parser.close()
+    for href, text in parser.anchors:
+        add_attachment(
+            href,
+            text,
+            allow_domain_only=parser.seen_attachment_label,
+        )
     if allowlist_only_urls:
         sample = ", ".join(allowlist_only_urls[:3])
         LOGGER.info(
-            "allow_domain_only 첨부: %s개 (샘플=%s)",
+            "허용 도메인에서 찾은 첨부파일: %s개 (샘플=%s)",
             len(allowlist_only_urls),
             sample or "없음",
         )
@@ -882,7 +1200,9 @@ def extract_attachments_from_detail(html_text: str) -> list[dict]:
     return attachments
 
 
-def extract_attachments_from_page(page) -> list[dict]:
+def extract_attachments_from_page(
+    page: Any,
+) -> list[dict[str, Any]]:
     result = page.evaluate(
         """
         () => {
@@ -972,12 +1292,11 @@ def extract_attachments_from_page(page) -> list[dict]:
     candidates = result.get("links", []) if isinstance(result, dict) else []
     label_count = result.get("labelCount", 0) if isinstance(result, dict) else 0
     label_link_count = result.get("labelLinkCount", 0) if isinstance(result, dict) else 0
-    label_candidate_count = (
-        result.get("labelCandidateCount", 0) if isinstance(result, dict) else 0
-    )
     allow_domain_only = label_count > 0
-    def build_attachments(candidate_list: list[dict]) -> tuple[list[dict], list[str]]:
-        attachments: list[dict] = []
+    def build_attachments(
+        candidate_list: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        attachments: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
         allowlist_only_urls: list[str] = []
         for candidate in candidate_list:
@@ -1033,7 +1352,7 @@ def extract_attachments_from_page(page) -> list[dict]:
     if allowlist_only_urls:
         sample = ", ".join(allowlist_only_urls[:3])
         LOGGER.info(
-            "allow_domain_only 첨부: %s개 (샘플=%s)",
+            "허용 도메인에서 찾은 첨부파일: %s개 (샘플=%s)",
             len(allowlist_only_urls),
             sample or "없음",
         )
@@ -1052,10 +1371,10 @@ def extract_attachments_from_page(page) -> list[dict]:
                 sample or "없음",
             )
     return attachments
-def extract_detail_id_from_row(row) -> Optional[str]:
+def extract_detail_id_from_row(row: Any) -> Optional[str]:
     for key in ("data-id", "data-no", "data-board-id", "data-article-id", "data-detail-id"):
         value = row.get_attribute(key)
-        if value and value.isdigit():
+        if isinstance(value, str) and value.isdigit():
             return value
     onclick = row.get_attribute("onclick") or ""
     detail_id = extract_detail_id_from_text(onclick)
@@ -1078,7 +1397,7 @@ def extract_detail_id_from_row(row) -> Optional[str]:
     return None
 
 
-def extract_written_at_from_page(page) -> Optional[str]:
+def extract_written_at_from_page(page: Any) -> Optional[str]:
     for label_text in ("작성일", "등록일"):
         locator = page.locator(f"text={label_text}")
         for idx in range(locator.count()):

@@ -1,477 +1,872 @@
 import os
-import json
+from pathlib import Path
+from typing import Any, Optional
 
-from common import ensure_item_title
-from crawler import crawl_top_items, run_attachment_policy_selftest
-from log import LOGGER, log_environment_info, setup_logging
-from notion_client import (
-    NotionRequestError,
-    create_page,
-    ensure_attachment_property,
-    ensure_attachment_state_property,
-    ensure_body_hash_property,
-    ensure_body_media_state_property,
-    ensure_classification_property,
-    ensure_required_properties,
-    ensure_select_options_batch,
-    ensure_views_property,
-    fetch_database,
-    get_select_options,
-    prepare_attachments_for_sync,
-    prepare_body_blocks_for_sync,
-    update_page,
-)
 from bbs_parser import parse_rows
+from common import extract_detail_id_from_text
+from crawler import (
+    build_source_spec,
+    crawl_sources,
+    get_backfill_detail_limit,
+)
+from log import LOGGER, log_environment_info, setup_logging
+from models import (
+    CrawlReport,
+    DestinationConsistencyError,
+    FailureCategory,
+    LocalConfigurationError,
+    RunRecord,
+    SourceCrawlResult,
+    SourceStatus,
+    SyncCounters,
+    ValidationIssue,
+    utc_now_iso,
+)
+from run_control import (
+    install_run_control,
+    require_destination_state_reserve,
+)
+from run_lock import exclusive_run_lock
+from run_state import (
+    append_run_record,
+    build_incident,
+    classify_exception,
+    clear_active_incidents,
+    create_run_record,
+    known_ids_for_source,
+    load_run_state,
+    mark_failure_signaled,
+    mark_exception_failure,
+    should_full_reconcile,
+    source_reconcile_due,
+    update_state_from_report,
+    write_json_atomic,
+    write_run_state_atomic,
+)
 from settings import (
-    ATTACHMENT_STATE_PROPERTY,
-    AUTHOR_PROPERTY,
-    BODY_HASH_IMAGE_MODE_UPLOAD,
-    BODY_HASH_PROPERTY,
-    BODY_MEDIA_STATE_PROPERTY,
-    CLASSIFICATION_PROPERTY,
-    TYPE_PROPERTY,
     get_bbs_config_fk,
-    get_classification_for_config,
-    get_sync_mode,
+    get_bbs_config_fks,
+    get_full_reconcile_interval_hours,
+    get_incident_path,
+    get_run_state_path,
+    get_snapshot_path,
+    is_writer_context_confirmed,
     load_dotenv,
     resolve_html_path,
-    should_dedupe_on_start,
-    should_run_attachment_selftest,
-    should_upload_files_to_notion,
+    should_allow_notion_schema_migration,
+    should_run_dry_run,
+    should_run_notion_schema_migration_only,
+    should_use_incremental_crawl,
 )
-from sync import (
-    build_properties,
-    dedupe_database_by_url,
-    disable_missing_top,
-    extract_attachment_state,
-    extract_body_media_state,
-    extract_existing_uploaded_attachment_ids,
-    extract_existing_uploaded_media_blocks,
-    extract_rich_text_value,
-    extract_type_from_title,
-    enrich_attachment_state_with_page,
-    enrich_attachment_state_with_properties,
-    enrich_body_media_state_with_block_ids,
-    find_existing_page,
-    normalize_item_attachments,
-    sync_page_body_blocks,
+from sync_engine import (
+    apply_report,
+    build_dry_run_plan,
+    prepare_destination,
+    safe_source_results,
 )
-from utils import (
-    build_rich_text_chunks,
-    compute_body_hash,
-    has_image_blocks,
-    normalize_body_blocks_for_hash,
-)
-from utils import normalize_date_key, normalize_detail_url
+from validation import validate_crawl_report
 
 
-# 실패 로그 한 줄만 봐도 어느 공지에서 멈췄는지 바로 식별할 수 있게 핵심 필드를 묶는다.
-def build_item_context(item: dict) -> str:
-    detail_status = item.get("detail_fetch_status")
-    detail_part = (
-        f", detail={detail_status}"
-        if isinstance(detail_status, str) and detail_status and detail_status != "api"
-        else ""
+def select_refresh_ids(
+    source_state: dict[str, Any],
+    known_ids: set[str],
+) -> list[str]:
+    raw_ids = source_state.get("observed_ids", [])
+    ordered_ids = [
+        str(value)
+        for value in raw_ids
+        if str(value) in known_ids
+    ] if isinstance(raw_ids, list) else sorted(known_ids)
+    if not ordered_ids:
+        return []
+    cursor = str(source_state.get("detail_refresh_cursor_id") or "")
+    start = 0
+    if cursor in ordered_ids:
+        start = (ordered_ids.index(cursor) + 1) % len(ordered_ids)
+    limit = max(1, get_backfill_detail_limit() // 2)
+    rotated = ordered_ids[start:] + ordered_ids[:start]
+    return rotated[:limit]
+
+
+def pending_shrink_ids(
+    state: dict[str, Any],
+    source_id: str,
+) -> list[str]:
+    candidates = state.get("shrink_candidates", {})
+    if not isinstance(candidates, dict):
+        return []
+    prefix = f"{source_id}:"
+    shrink_ids = [
+        key[len(prefix):]
+        for key in candidates
+        if isinstance(key, str)
+        and key.startswith(prefix)
+        and key[len(prefix):]
+    ]
+    source_state = state.get("sources", {}).get(source_id, {})
+    pending_ids = (
+        source_state.get("pending_notice_ids", [])
+        if isinstance(source_state, dict)
+        else []
+    )
+    if not isinstance(pending_ids, list):
+        pending_ids = []
+    return list(
+        dict.fromkeys(
+            [
+                *(
+                    str(value)
+                    for value in pending_ids
+                    if str(value).strip()
+                ),
+                *shrink_ids,
+            ]
+        )
+    )[:get_backfill_detail_limit()]
+
+
+def backfill_resume_page(source_state: object) -> int:
+    if not isinstance(source_state, dict):
+        return 1
+    try:
+        return max(1, int(source_state.get("backfill_resume_page") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def external_download_incident_summary(
+    counters: Optional[SyncCounters],
+) -> str:
+    if (
+        counters is None
+        or counters.external_download_status_code not in {403, 429}
+    ):
+        return ""
+    retry_after = (
+        counters.external_download_retry_after
+        or (
+            str(counters.external_download_retry_after_seconds)
+            if counters.external_download_retry_after_seconds is not None
+            else "-"
+        )
     )
     return (
-        f"title={item.get('title') or '제목없음'}, "
-        f"date={item.get('date') or '날짜없음'}, "
-        f"classification={item.get('classification') or '-'}, "
-        f"url={item.get('url') or '-'}"
-        f"{detail_part}"
+        "외부 파일 다운로드 안전 회로가 열렸습니다: "
+        f"상태 코드={counters.external_download_status_code}, "
+        f"중단 사유={counters.external_download_stopped_reason}, "
+        f"요청 수={counters.external_download_requests}, "
+        f"재시도 대기={retry_after}"
     )
+
+
+def destination_contract_summary(
+    counters: Optional[SyncCounters],
+) -> str:
+    if counters is None or (
+        not counters.quarantined_source_ids
+        and not counters.unresolved_pending_page_ids
+    ):
+        return ""
+    sources = ",".join(counters.quarantined_source_ids) or "-"
+    return (
+        "복구되지 않은 Notion 대기 페이지를 출처별로 격리했습니다: "
+        f"출처={sources}, "
+        f"대기 페이지={len(counters.unresolved_pending_page_ids)}"
+    )
+
+
+def add_destination_quarantine_issues(
+    report: CrawlReport,
+    source_ids: list[str],
+) -> None:
+    existing = {
+        issue.source_config_fk
+        for issue in report.issues
+        if issue.code == "destination_pending_quarantine"
+    }
+    for source_id in source_ids:
+        if source_id in existing:
+            continue
+        report.issues.append(
+            ValidationIssue(
+                code="destination_pending_quarantine",
+                message=(
+                    "복구되지 않은 Notion 대기 페이지 때문에 "
+                    f"출처를 격리했습니다: {source_id}"
+                ),
+                source_config_fk=source_id,
+            )
+        )
+
+
+def collect_report(
+    state: dict[str, Any],
+    full_reconcile: bool,
+    force_all_reconcile: bool = False,
+) -> CrawlReport:
+    html_path = resolve_html_path()
+    if html_path is None:
+        config_fks = get_bbs_config_fks()
+        known_ids_by_source = {
+            config_fk: known_ids_for_source(state, config_fk)
+            for config_fk in config_fks
+        }
+        source_states = state.get("sources", {})
+        reconcile_by_source = {
+            config_fk: bool(
+                full_reconcile
+                and (
+                    force_all_reconcile
+                    or source_reconcile_due(
+                        state,
+                        config_fk,
+                        get_full_reconcile_interval_hours(),
+                    )
+                )
+            )
+            for config_fk in config_fks
+        }
+        incremental_by_source = {
+            config_fk: bool(
+                not force_all_reconcile
+                and (
+                    not reconcile_by_source[config_fk]
+                    or known_ids_by_source[config_fk]
+                    or (
+                        isinstance(source_states.get(config_fk), dict)
+                        and source_states[config_fk].get("backfill_active")
+                    )
+                )
+            )
+            for config_fk in config_fks
+        }
+        rotation_windows_by_source = {
+            config_fk: (
+                select_refresh_ids(
+                    source_states.get(config_fk, {}),
+                    known_ids_by_source[config_fk],
+                )
+                if (
+                    reconcile_by_source[config_fk]
+                    and known_ids_by_source[config_fk]
+                    and isinstance(source_states.get(config_fk), dict)
+                    and not source_states[config_fk].get("backfill_active")
+                )
+                else []
+            )
+            for config_fk in config_fks
+        }
+        refresh_ids_by_source = {
+            config_fk: set(
+                [
+                    *pending_shrink_ids(state, config_fk),
+                    *rotation_windows_by_source[config_fk],
+                ]
+            )
+            for config_fk in config_fks
+        }
+        report: CrawlReport = crawl_sources(
+            known_ids_by_source=known_ids_by_source,
+            source_state_by_source=source_states,
+            incremental=not full_reconcile,
+            incremental_by_source=incremental_by_source,
+            reconcile_mode=full_reconcile,
+            reconcile_mode_by_source=reconcile_by_source,
+            refresh_ids_by_source=refresh_ids_by_source,
+            resume_page_by_source={
+                config_fk: (
+                    backfill_resume_page(
+                        source_states.get(config_fk, {})
+                    )
+                    if reconcile_by_source[config_fk]
+                    else 1
+                )
+                for config_fk in config_fks
+            },
+            resume_anchor_ids_by_source={
+                config_fk: (
+                    {
+                        str(value)
+                        for value in source_states.get(
+                            config_fk,
+                            {},
+                        ).get("backfill_anchor_ids", [])
+                        if str(value)
+                    }
+                    if (
+                        reconcile_by_source[config_fk]
+                        and isinstance(
+                            source_states.get(config_fk),
+                            dict,
+                        )
+                        and isinstance(
+                            source_states[config_fk].get(
+                                "backfill_anchor_ids"
+                            ),
+                            list,
+                        )
+                    )
+                    else set()
+                )
+                for config_fk in config_fks
+            },
+        )
+        for result in report.sources:
+            refresh_window = rotation_windows_by_source.get(
+                result.source.config_fk,
+                [],
+            )
+            if refresh_window:
+                result.refresh_window_end_id = refresh_window[-1]
+        return report
+    if not html_path.exists():
+        raise RuntimeError(f"HTML 파일을 찾을 수 없습니다: {html_path}")
+    config_fk = get_bbs_config_fk()
+    source = build_source_spec(config_fk)
+    html_text = html_path.read_text(encoding="utf-8", errors="replace")
+    items = parse_rows(html_text, config_fk)
+    if not items:
+        return CrawlReport(
+            sources=[
+                SourceCrawlResult(
+                    source=source,
+                    status=SourceStatus.FAILED,
+                    method="local_html",
+                    category=FailureCategory.SOURCE_CONTRACT,
+                    error="local_html_no_rows",
+                )
+            ]
+        )
+    observed_ids = [
+        detail_id
+        for item in items
+        if (
+            detail_id := extract_detail_id_from_text(
+                str(item.get("url") or "")
+            )
+        )
+    ]
+    return CrawlReport(
+        sources=[
+            SourceCrawlResult(
+                source=source,
+                status=SourceStatus.PARTIAL,
+                items=[
+                    {
+                        **item,
+                        "completeness": "partial",
+                    }
+                    for item in items
+                ],
+                method="local_html",
+                observed_count=len(items),
+                observed_ids=observed_ids,
+                category=FailureCategory.SOURCE_PARTIAL,
+                error="local_html_detail_unverified",
+                detail_failures=len(items),
+            )
+        ]
+    )
+
+
+def snapshot_payload(
+    report: CrawlReport,
+    run_id: str,
+    full_reconcile: bool,
+    dry_run: bool,
+    plan: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "created_at": utc_now_iso(),
+        "full_reconcile": full_reconcile,
+        "dry_run": dry_run,
+        "report": report.to_dict(),
+    }
+    if plan is not None:
+        payload["plan"] = plan
+    return payload
+
+
+def report_failure_summary(report: CrawlReport) -> str:
+    fragments = [
+        (
+            f"{result.source.config_fk}:{result.status.value}:"
+            f"{result.category.value}:{result.error or '-'}"
+        )
+        for result in report.sources
+        if not result.write_safe
+    ]
+    fragments.extend(
+        f"{issue.source_config_fk or 'global'}:{issue.code}:{issue.message}"
+        for issue in report.issues
+        if issue.fatal
+    )
+    return "; ".join(fragments) or "수집 결과가 쓰기 안전 기준을 충족하지 못했습니다"
+
+
+def source_run_payload(result: SourceCrawlResult) -> dict[str, Any]:
+    return {
+        "source_id": result.source.config_fk,
+        "classification": result.source.classification,
+        "status": result.status.value,
+        "category": result.category.value,
+        "method": result.method,
+        "pages_scanned": result.pages_scanned,
+        "observed_count": result.observed_count,
+        "item_count": len(result.items),
+        "detail_failures": result.detail_failures,
+        "rejected_count": result.rejected_count,
+        "checkpoint_found": result.checkpoint_found,
+        "terminal_reached": result.terminal_reached,
+        "termination_reason": result.termination_reason,
+        "full_snapshot": result.full_snapshot,
+        "reconcile_requested": result.reconcile_requested,
+        "error": result.error,
+    }
+
+
+def persist_failed_run(
+    state: dict[str, Any],
+    record: RunRecord,
+    exc: BaseException,
+    report: Optional[CrawlReport],
+    state_path: Path,
+    incident_path: Path,
+) -> tuple[dict[str, Any], bool]:
+    mark_exception_failure(state, exc)
+    category = classify_exception(exc)
+    record.finished_at = utc_now_iso()
+    record.status = "failed"
+    record.failure_category = category
+    if report is not None:
+        record.source_results = [
+            source_run_payload(result) for result in report.sources
+        ]
+    incident = build_incident(
+        state,
+        category,
+        "서강대 공지 동기화 실패",
+        str(exc),
+        report,
+        exception=exc,
+    )
+    suppressed = apply_failure_signal_policy(state, incident)
+    append_run_record(state, record)
+    write_run_state_atomic(state_path, state)
+    write_json_atomic(incident_path, incident)
+    return incident, suppressed
+
+
+def should_suppress_repeated_scheduled_failure(
+    incident: dict[str, Any],
+) -> bool:
+    return (
+        os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
+        and os.environ.get("GITHUB_EVENT_NAME", "").strip() == "schedule"
+        and os.environ.get("GITHUB_RUN_ATTEMPT", "").strip() == "1"
+        and not bool(incident.get("should_signal_failure", True))
+    )
+
+
+def apply_failure_signal_policy(
+    state: dict[str, Any],
+    incident: dict[str, Any],
+) -> bool:
+    suppressed = should_suppress_repeated_scheduled_failure(incident)
+    if not suppressed and not mark_failure_signaled(state, incident):
+        raise RuntimeError("반복 실패 상태를 기록할 수 없습니다")
+    return suppressed
+
+
+def report_suppressed_failure(incident: dict[str, Any]) -> None:
+    category = str(incident.get("category") or "unknown")
+    count = int(incident.get("count") or 1)
+    LOGGER.warning(
+        "동일한 예약 실행 실패가 반복되어 이번 종료 신호를 생략합니다: "
+        "유형=%s, 누적=%s",
+        category,
+        count,
+    )
+    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+        print(
+            "::warning title=반복 실패 대기::"
+            "동일 장애의 반복 종료 신호를 설정된 간격까지 생략했습니다. "
+            f"유형={category}, 누적={count}"
+        )
+
+
+def validate_destination_write_authorization(
+    dry_run: bool,
+    schema_migration_only: bool,
+) -> None:
+    if dry_run:
+        return
+    if not is_writer_context_confirmed():
+        raise LocalConfigurationError(
+            "허용된 GitHub Actions 쓰기 실행 문맥이 아니어서 "
+            "Notion 변경을 차단합니다",
+            "destination_contract",
+        )
+    if (
+        schema_migration_only
+        and os.environ.get("GITHUB_EVENT_NAME", "").strip()
+        != "workflow_dispatch"
+    ):
+        raise LocalConfigurationError(
+            "스키마 변경은 수동 GitHub Actions 실행에서만 허용됩니다",
+            "destination_contract",
+        )
+    if schema_migration_only:
+        return
 
 
 def main() -> None:
     setup_logging()
     load_dotenv()
     log_environment_info()
-    current_stage = "초기화"
-    current_item_context = ""
-    try:
-        if should_run_attachment_selftest():
-            run_attachment_policy_selftest()
-            return
+    install_run_control()
+    dry_run = should_run_dry_run()
+    schema_migration_only = should_run_notion_schema_migration_only()
+    incremental_enabled = should_use_incremental_crawl()
+    state_path = get_run_state_path()
+    snapshot_path = get_snapshot_path()
+    incident_path = get_incident_path()
+    lock_path = state_path.with_name("run.lock")
+    deferred_error: Optional[RuntimeError] = None
+    deferred_incident: Optional[dict[str, Any]] = None
+    deferred_failure_suppressed = False
 
-        notion_token = os.environ.get("NOTION_TOKEN")
-        database_id = os.environ.get("NOTION_DB_ID")
-
-        if not notion_token or not database_id:
-            raise RuntimeError("NOTION_TOKEN and NOTION_DB_ID must be set (env or .env)")
-
-        current_stage = "입력 수집"
-        html_path = resolve_html_path()
-        if html_path is not None:
-            if not html_path.exists():
-                raise RuntimeError(f"HTML file not found: {html_path}")
-            html_text = html_path.read_text(encoding="utf-8", errors="replace")
-            items = parse_rows(html_text, get_bbs_config_fk())
-        else:
-            items = crawl_top_items()
-
-        if not items:
-            raise RuntimeError("No items parsed from source")
-
-        current_stage = "공지 전처리"
-        author_values: set[str] = set()
-        type_values: set[str] = set()
-        classification_values: set[str] = set()
-        default_classification = get_classification_for_config(get_bbs_config_fk())
-        for item in items:
-            ensure_item_title(item, item.get("body_blocks", []), item.get("url"))
-            if not item.get("classification") and default_classification:
-                item["classification"] = default_classification
-            item["type"] = extract_type_from_title(item["title"])
-            if item.get("author"):
-                author_values.add(item["author"])
-            if item.get("type"):
-                type_values.add(item["type"])
-            if item.get("classification"):
-                classification_values.add(item["classification"])
-
-        current_stage = "Notion 데이터베이스 준비"
-        database = fetch_database(notion_token, database_id)
-        database = ensure_required_properties(notion_token, database_id, database)
-        database = ensure_attachment_property(notion_token, database_id, database)
-        database = ensure_attachment_state_property(notion_token, database_id, database)
-        database = ensure_body_hash_property(notion_token, database_id, database)
-        database = ensure_body_media_state_property(notion_token, database_id, database)
-        database = ensure_classification_property(notion_token, database_id, database)
-        database = ensure_views_property(notion_token, database_id, database)
-        current_stage = "시작 URL 중복 정리"
-        if should_dedupe_on_start():
-            try:
-                archived = dedupe_database_by_url(notion_token, database_id)
-            except NotionRequestError as exc:
-                # 시작 시 전체 DB를 훑는 정리는 보조 작업이므로, 429면 이번 실행만 생략하고 본 동기화는 계속한다.
-                if exc.status_code == 429:
-                    LOGGER.warning(
-                        "시작 URL 중복 정리 생략: Notion 요청 제한으로 이번 실행에서는 건너뜀 (%s)",
-                        exc,
-                    )
-                else:
-                    raise
-            else:
-                if archived:
-                    LOGGER.info("URL 중복 정리 수: %s", archived)
-        current_stage = "Notion 옵션 준비"
-        author_options = get_select_options(database, AUTHOR_PROPERTY)
-        type_options = get_select_options(database, TYPE_PROPERTY)
-        author_options = ensure_select_options_batch(
-            notion_token, database_id, AUTHOR_PROPERTY, author_options, author_values
-        )
-        type_options = ensure_select_options_batch(
-            notion_token, database_id, TYPE_PROPERTY, type_options, type_values
-        )
-        if classification_values:
-            classification_options = get_select_options(database, CLASSIFICATION_PROPERTY)
-            classification_options = ensure_select_options_batch(
-                notion_token,
-                database_id,
-                CLASSIFICATION_PROPERTY,
-                classification_options,
-                classification_values,
+    with exclusive_run_lock(lock_path):
+        state = load_run_state(state_path)
+        configured_source_ids = get_bbs_config_fks()
+        full_reconcile = (
+            not incremental_enabled
+            or should_full_reconcile(
+                state,
+                get_full_reconcile_interval_hours(),
+                configured_source_ids,
             )
-        has_classification_property = True
-        has_views_property = True
-        has_attachments_property = True
-        has_attachment_state_property = True
-        has_body_hash_property = True
-        sync_mode = get_sync_mode()
-        upload_files = should_upload_files_to_notion()
-
-        created = 0
-        updated = 0
-        body_updated = 0
-
-        current_stage = "공지 동기화"
-        current_top_urls: set[str] = set()
-        current_top_dates: dict[str, set[str]] = {}
-        for item in items:
-            is_top = bool(item.get("top"))
-            if item.get("url"):
-                normalized_url = normalize_detail_url(item["url"])
-                if normalized_url:
-                    item["url"] = normalized_url
-                    if is_top:
-                        current_top_urls.add(normalized_url)
-            label = f"{item['title']} ({item.get('date') or '날짜없음'})"
-            current_item_context = build_item_context(item)
-            date_key = normalize_date_key(item.get("date"))
-            if is_top:
-                current_top_dates.setdefault(item["title"], set()).add(date_key)
-            detail_status = item.get("detail_fetch_status") or "api"
-            LOGGER.info("처리 시작: %s (상세=%s)", label, detail_status)
-            try:
-                if has_attachments_property:
-                    # 첨부가 "확정적으로 없음"일 때만 files=[]를 만들고,
-                    # 추출 실패처럼 미확인 상태면 기존 Notion 첨부를 보존한다.
-                    normalize_item_attachments(item)
-                existing_page = find_existing_page(
+        )
+        record = create_run_record(full_reconcile, dry_run)
+        report: Optional[CrawlReport] = None
+        try:
+            validate_destination_write_authorization(
+                dry_run,
+                schema_migration_only,
+            )
+            if schema_migration_only:
+                if dry_run:
+                    raise LocalConfigurationError(
+                        "스키마 마이그레이션 전용 모드와 드라이런을 동시에 실행할 수 없습니다",
+                        "destination_contract",
+                    )
+                if not should_allow_notion_schema_migration():
+                    raise LocalConfigurationError(
+                        "스키마 마이그레이션 전용 모드에는 "
+                        "NOTION_SCHEMA_MIGRATION=1이 필요합니다",
+                        "destination_contract",
+                    )
+                notion_token = os.environ.get("NOTION_TOKEN")
+                database_id = os.environ.get("NOTION_DB_ID")
+                if not notion_token or not database_id:
+                    raise LocalConfigurationError(
+                        "NOTION_TOKEN과 NOTION_DB_ID를 환경 변수나 .env에 설정해야 합니다",
+                        "destination_auth",
+                    )
+                prepare_destination(
                     notion_token,
                     database_id,
-                    item.get("url"),
-                    item["title"],
-                    item.get("date"),
+                    [],
+                    recover_pending=False,
                 )
-                page_id = existing_page.get("id") if existing_page else None
-                existing_hash = ""
-                existing_media_state: list[dict] = []
-                existing_media_state_raw = ""
-                existing_attachment_state: list[dict] = []
-                existing_attachment_state_raw = ""
-                if has_body_hash_property and existing_page:
-                    existing_hash = extract_rich_text_value(
-                        existing_page.get("properties", {}), BODY_HASH_PROPERTY
-                    )
-                    existing_media_state_raw = extract_rich_text_value(
-                        existing_page.get("properties", {}),
-                        BODY_MEDIA_STATE_PROPERTY,
-                    )
-                    existing_media_state = extract_body_media_state(
-                        existing_page.get("properties", {})
-                    )
-                    if page_id and existing_media_state and any(
-                        not str(entry.get("block_id") or "").strip()
-                        or not str(entry.get("hosted_file_key") or "").strip()
-                        for entry in existing_media_state
-                    ):
-                        # block_id만이 아니라 현재 hosted_file_key까지 같이 보강해 두면,
-                        # 다음 실행부터는 같은 block_id를 유지한 수동 파일 교체도 재사용 전에 더 안전하게 차단할 수 있다.
-                        existing_media_state = enrich_body_media_state_with_block_ids(
-                            notion_token,
-                            page_id,
-                            existing_media_state,
-                        )
-                if has_attachment_state_property and existing_page:
-                    existing_attachment_state = extract_attachment_state(
-                        existing_page.get("properties", {})
-                    )
-                    existing_attachment_state_raw = extract_rich_text_value(
-                        existing_page.get("properties", {}),
-                        ATTACHMENT_STATE_PROPERTY,
-                    )
-                    if existing_attachment_state and any(
-                        not str(entry.get("hosted_file_key") or "").strip()
-                        for entry in existing_attachment_state
-                    ):
-                        # page files read 응답이 file 중심으로 오는 환경에서는,
-                        # 현재 properties에서 hosted_file_key를 보강해 둬야 다음 실행 stale 상태를 구분할 수 있다.
-                        existing_attachment_state = enrich_attachment_state_with_properties(
-                            existing_page.get("properties", {}),
-                            existing_attachment_state,
-                        )
-                attachment_count = len(item.get("attachments") or [])
-                attachment_state: list[dict] = []
-                if upload_files and has_attachments_property and "attachments" in item:
-                    reusable_uploaded_attachments = (
-                        extract_existing_uploaded_attachment_ids(
-                            existing_page.get("properties", {}) if existing_page else {},
-                            existing_attachment_state,
-                        )
-                        if existing_page
-                        else {}
-                    )
-                    # 기존 페이지를 먼저 찾은 뒤 첨부를 준비해야, 이미 올린 이미지 첨부를 같은 실행 안에서 또 업로드하지 않을 수 있다.
-                    item["attachments"], attachment_state = prepare_attachments_for_sync(
-                        notion_token,
-                        item["attachments"],
-                        reusable_uploaded_attachments=(
-                            reusable_uploaded_attachments or None
-                        ),
-                    )
-                    attachment_count = len(item.get("attachments") or [])
-                properties = build_properties(
-                    item,
-                    has_views_property,
-                    has_attachments_property,
-                    has_classification_property,
+                record.finished_at = utc_now_iso()
+                record.status = "schema_migration_succeeded"
+                append_run_record(state, record)
+                write_run_state_atomic(state_path, state)
+                LOGGER.info("Notion 스키마 마이그레이션 완료")
+                return
+            notion_token = (
+                os.environ.get("NOTION_TOKEN") or ""
+            ).strip()
+            database_id = (
+                os.environ.get("NOTION_DB_ID") or ""
+            ).strip()
+            if not dry_run and (not notion_token or not database_id):
+                raise LocalConfigurationError(
+                    "NOTION_TOKEN과 NOTION_DB_ID를 환경 변수나 .env에 설정해야 합니다",
+                    "destination_auth",
                 )
-                action = "업데이트" if page_id else "생성"
-                if page_id:
-                    update_page(notion_token, page_id, properties)
-                    updated += 1
-                else:
-                    page_id = create_page(notion_token, database_id, properties)
-                    created += 1
-                post_update_properties: dict = {}
-                if (
-                    has_body_hash_property
-                    and existing_page
-                    and existing_media_state
-                    and json.dumps(
-                        existing_media_state,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    != existing_media_state_raw
-                ):
-                    post_update_properties[BODY_MEDIA_STATE_PROPERTY] = {
-                        "rich_text": build_rich_text_chunks(
-                            json.dumps(
-                                existing_media_state,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            )
-                        )
-                    }
-                if (
-                    has_attachment_state_property
-                    and existing_page
-                    and existing_attachment_state
-                    and json.dumps(
-                        existing_attachment_state,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    != existing_attachment_state_raw
-                ):
-                    post_update_properties[ATTACHMENT_STATE_PROPERTY] = {
-                        "rich_text": build_rich_text_chunks(
-                            json.dumps(
-                                existing_attachment_state,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            )
-                        )
-                    }
-                # 첨부 상태도 확인된 첨부 목록이 있을 때만 갱신해야,
-                # 추출 실패 항목이 기존 재사용 상태를 []로 덮어쓰지 않는다.
-                if has_attachment_state_property and "attachments" in item:
-                    if page_id and attachment_state:
-                        attachment_state = enrich_attachment_state_with_page(
-                            notion_token,
-                            page_id,
-                            attachment_state,
-                        )
-                    attachment_state_raw = json.dumps(
-                        attachment_state,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    if attachment_state_raw != existing_attachment_state_raw:
-                        post_update_properties[ATTACHMENT_STATE_PROPERTY] = {
-                            "rich_text": build_rich_text_chunks(attachment_state_raw)
-                        }
-                body_state = "없음"
-                body_blocks = item.get("body_blocks", [])
-                if page_id and body_blocks:
-                    if has_body_hash_property:
-                        image_mode = ""
-                        if upload_files and has_image_blocks(body_blocks):
-                            image_mode = BODY_HASH_IMAGE_MODE_UPLOAD
-                        # 먼저 "원하는 최종 상태" 해시를 계산해, 이미 반영된 본문이면 불필요한 업로드 시도 자체를 건너뛴다.
-                        desired_hash_blocks = normalize_body_blocks_for_hash(
-                            body_blocks, upload_files
-                        )
-                        desired_body_hash = compute_body_hash(
-                            desired_hash_blocks, image_mode=image_mode
-                        )
-                        if desired_body_hash != existing_hash:
-                            # 부분 성공 뒤 다시 돌 때는, 이전 실행에서 이미 올라간 미디어 블록을 그대로 재사용해 중복 업로드를 줄인다.
-                            reusable_uploaded_media = extract_existing_uploaded_media_blocks(
-                                notion_token,
-                                page_id,
-                                existing_media_state,
-                            )
-                            (
-                                blocks_for_sync,
-                                actual_hash_blocks,
-                                actual_media_state,
-                            ) = prepare_body_blocks_for_sync(
-                                notion_token,
-                                body_blocks,
-                                reusable_uploaded_media=reusable_uploaded_media,
-                            )
-                            actual_body_hash = compute_body_hash(
-                                actual_hash_blocks, image_mode=image_mode
-                            )
-                            if actual_body_hash != existing_hash:
-                                sync_page_body_blocks(
-                                    notion_token,
-                                    page_id,
-                                    blocks_for_sync,
-                                    sync_mode=sync_mode,
-                                )
-                                actual_media_state = enrich_body_media_state_with_block_ids(
-                                    notion_token,
-                                    page_id,
-                                    actual_media_state,
-                                )
-                                body_updated += 1
-                                body_state = (
-                                    "변경"
-                                    if actual_body_hash == desired_body_hash
-                                    else "변경(미디어보류)"
-                                )
-                                post_update_properties[BODY_HASH_PROPERTY] = {
-                                    "rich_text": build_rich_text_chunks(actual_body_hash)
-                                }
-                                post_update_properties[BODY_MEDIA_STATE_PROPERTY] = {
-                                    "rich_text": build_rich_text_chunks(
-                                        json.dumps(
-                                            actual_media_state,
-                                            ensure_ascii=False,
-                                            separators=(",", ":"),
-                                        )
-                                    )
-                                }
-                            else:
-                                # 업로드 재시도를 했지만 실제 반영 상태가 바뀌지 않았다면, 다음 실행에서 다시 도전할 수 있게 유지로 남긴다.
-                                body_state = "유지(미디어재시도)"
-                                LOGGER.info(
-                                    "본문 미디어 업로드 재시도 보류: %s (원하는 상태와 아직 불일치)",
-                                    label,
-                                )
-                        else:
-                            body_state = "유지"
-                    else:
-                        blocks_for_sync, _hash_blocks, _media_state = prepare_body_blocks_for_sync(
-                            notion_token, body_blocks
-                        )
-                        sync_page_body_blocks(
-                            notion_token, page_id, blocks_for_sync, sync_mode=sync_mode
-                        )
-                        body_updated += 1
-                        body_state = "동기화"
-                if page_id and post_update_properties:
-                    update_page(notion_token, page_id, post_update_properties)
-                LOGGER.info(
-                    "처리 완료: %s (상태=%s, 본문=%s, 첨부=%s, 상세=%s)",
-                    label,
-                    action,
-                    body_state,
-                    attachment_count,
-                    detail_status,
-                )
-            except Exception as exc:
-                LOGGER.error("항목 처리 실패: %s (%s)", current_item_context, exc)
-                raise
-
-        current_item_context = ""
-        current_stage = "TOP 정리"
-        LOGGER.info("기존 TOP 정리 시작")
-        disabled = disable_missing_top(
-            notion_token, database_id, current_top_urls, current_top_dates
-        )
-        LOGGER.info("TOP 해제 수: %s", disabled)
-
-        current_stage = "완료"
-        LOGGER.info("수집 항목 수: %s", len(items))
-        LOGGER.info("생성: %s", created)
-        LOGGER.info("업데이트: %s", updated)
-        LOGGER.info("본문 변경: %s", body_updated)
-    except Exception:
-        # 상위 레벨에서 단계와 마지막 공지 문맥을 함께 남겨야 운영 로그만으로도 원인 추적이 가능하다.
-        if current_item_context:
-            LOGGER.exception(
-                "전체 동기화 실패: 단계=%s, 항목=%s",
-                current_stage,
-                current_item_context,
+            report = validate_crawl_report(
+                collect_report(
+                    state,
+                    full_reconcile,
+                    force_all_reconcile=not incremental_enabled,
+                ),
+                state,
+                full_reconcile=full_reconcile,
+                expected_source_ids=configured_source_ids,
             )
-        else:
-            LOGGER.exception("전체 동기화 실패: 단계=%s", current_stage)
-        raise
+            record.source_results = [
+                source_run_payload(result) for result in report.sources
+            ]
+            write_json_atomic(
+                snapshot_path,
+                snapshot_payload(
+                    report,
+                    record.run_id,
+                    full_reconcile,
+                    dry_run,
+                ),
+            )
+
+            if dry_run:
+                require_destination_state_reserve()
+                plan = build_dry_run_plan(
+                    record.execution_id,
+                    report,
+                    notion_token,
+                    database_id,
+                    full_reconcile,
+                    state,
+                    logical_run_id=record.run_id,
+                )
+                dry_run_destination_summary = ""
+                if plan.quarantined_source_ids:
+                    add_destination_quarantine_issues(
+                        report,
+                        plan.quarantined_source_ids,
+                    )
+                    dry_run_destination_summary = (
+                        "Notion 대기 페이지 격리 계획이 있습니다: "
+                        f"출처={','.join(plan.quarantined_source_ids)}"
+                    )
+                record.planned_writes = plan.write_count
+                record.finished_at = utc_now_iso()
+                record.status = (
+                    "dry_run_succeeded"
+                    if report.write_safe
+                    and not dry_run_destination_summary
+                    else "dry_run_failed"
+                )
+                record.failure_category = (
+                    FailureCategory.DESTINATION_CONTRACT
+                    if dry_run_destination_summary
+                    else report.failure_category
+                )
+                append_run_record(state, record)
+                write_run_state_atomic(state_path, state)
+                write_json_atomic(
+                    snapshot_path,
+                    snapshot_payload(
+                        report,
+                        record.run_id,
+                        full_reconcile,
+                        dry_run,
+                        plan.to_dict(),
+                    ),
+                )
+                LOGGER.info(
+                    "드라이런 완료: 계획 쓰기=%s, 출처=%s",
+                    plan.write_count,
+                    len(report.sources),
+                )
+                if dry_run_destination_summary:
+                    incident = build_incident(
+                        state,
+                        FailureCategory.DESTINATION_CONTRACT,
+                        "Notion 대기 페이지 격리 필요",
+                        dry_run_destination_summary,
+                        report,
+                    )
+                    deferred_incident = incident
+                    write_run_state_atomic(state_path, state)
+                    write_json_atomic(incident_path, incident)
+                    deferred_error = DestinationConsistencyError(
+                        dry_run_destination_summary
+                    )
+                elif not report.write_safe:
+                    incident = build_incident(
+                        state,
+                        report.failure_category,
+                        "서강대 공지 수집 검증 실패",
+                        report_failure_summary(report),
+                        report,
+                    )
+                    deferred_incident = incident
+                    write_run_state_atomic(state_path, state)
+                    write_json_atomic(incident_path, incident)
+                    deferred_error = RuntimeError(
+                        report_failure_summary(report)
+                    )
+            else:
+                safe_results = safe_source_results(report)
+                counters = None
+                if safe_results:
+                    require_destination_state_reserve()
+                    counters = apply_report(
+                        notion_token,
+                        database_id,
+                        report,
+                        full_reconcile,
+                        previous_state=state,
+                        run_id=record.execution_id,
+                        logical_run_id=record.run_id,
+                    )
+                elif report.write_safe:
+                    raise RuntimeError("동기화할 출처가 없습니다")
+                source_report_write_safe = report.write_safe
+                destination_summary = destination_contract_summary(
+                    counters
+                )
+                if destination_summary and counters is not None:
+                    add_destination_quarantine_issues(
+                        report,
+                        counters.quarantined_source_ids,
+                    )
+                external_download_summary = (
+                    external_download_incident_summary(counters)
+                    if source_report_write_safe
+                    else ""
+                )
+                if external_download_summary:
+                    report.issues.append(
+                        ValidationIssue(
+                            code="external_download_circuit",
+                            message=external_download_summary,
+                        )
+                    )
+                quarantined_source_ids = (
+                    set(counters.quarantined_source_ids)
+                    if counters is not None
+                    else set()
+                )
+                update_state_from_report(
+                    state,
+                    report,
+                    full_reconcile,
+                    (
+                        set()
+                        if external_download_summary
+                        else {
+                            result.source.config_fk
+                            for result in safe_results
+                            if result.source.config_fk
+                            not in quarantined_source_ids
+                        }
+                    ),
+                    counters,
+                )
+                record.finished_at = utc_now_iso()
+                record.status = (
+                    "succeeded"
+                    if report.write_safe
+                    and not destination_summary
+                    and not external_download_summary
+                    else "partial_failed"
+                )
+                record.failure_category = (
+                    FailureCategory.DESTINATION_CONTRACT
+                    if destination_summary
+                    else (
+                        FailureCategory.SECURITY_POLICY
+                        if external_download_summary
+                        else report.failure_category
+                    )
+                )
+                append_run_record(state, record, counters)
+                if destination_summary:
+                    incident = build_incident(
+                        state,
+                        FailureCategory.DESTINATION_CONTRACT,
+                        "Notion 대기 페이지 출처 격리",
+                        destination_summary,
+                        report,
+                    )
+                    deferred_incident = incident
+                    write_json_atomic(incident_path, incident)
+                    deferred_error = DestinationConsistencyError(
+                        destination_summary
+                    )
+                elif external_download_summary:
+                    incident = build_incident(
+                        state,
+                        FailureCategory.SECURITY_POLICY,
+                        "서강대 외부 파일 다운로드 안전 차단",
+                        external_download_summary,
+                        report,
+                    )
+                    deferred_incident = incident
+                    write_json_atomic(incident_path, incident)
+                    deferred_error = RuntimeError(
+                        external_download_summary
+                    )
+                elif report.write_safe:
+                    recovered_count = clear_active_incidents(state)
+                    incident_path.unlink(missing_ok=True)
+                    if recovered_count:
+                        LOGGER.info(
+                            "이전 실패 상태 %s건이 정상 실행으로 해소됐습니다",
+                            recovered_count,
+                        )
+                else:
+                    incident = build_incident(
+                        state,
+                        report.failure_category,
+                        "서강대 공지 부분 동기화 실패",
+                        report_failure_summary(report),
+                        report,
+                    )
+                    deferred_incident = incident
+                    write_json_atomic(incident_path, incident)
+                    deferred_error = RuntimeError(
+                        report_failure_summary(report)
+                    )
+                write_run_state_atomic(state_path, state)
+                if counters is not None:
+                    LOGGER.info(
+                        "동기화 완료: 생성=%s, 속성=%s, 본문=%s, TOP해제=%s, "
+                        "무변경=%s, 전체쓰기=%s",
+                        counters.created,
+                        counters.property_updates,
+                        counters.body_updates,
+                        counters.top_disabled,
+                        counters.unchanged,
+                        counters.writes,
+                    )
+            if deferred_error is not None and deferred_incident is not None:
+                deferred_failure_suppressed = apply_failure_signal_policy(
+                    state,
+                    deferred_incident,
+                )
+                write_run_state_atomic(state_path, state)
+                write_json_atomic(incident_path, deferred_incident)
+        except Exception as exc:
+            incident, failure_suppressed = persist_failed_run(
+                state,
+                record,
+                exc,
+                report,
+                state_path,
+                incident_path,
+            )
+            if failure_suppressed:
+                LOGGER.warning(
+                    "전체 동기화 실패가 반복됐습니다",
+                    exc_info=True,
+                )
+                report_suppressed_failure(incident)
+                return
+            LOGGER.exception("전체 동기화 실패")
+            raise
+
+    if deferred_error is not None:
+        if deferred_failure_suppressed and deferred_incident is not None:
+            report_suppressed_failure(deferred_incident)
+            return
+        LOGGER.error("동기화 안전 차단: %s", deferred_error)
+        raise deferred_error
 
 
 if __name__ == "__main__":
