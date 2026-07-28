@@ -1,4 +1,5 @@
 import hashlib
+import os
 import sys
 import unittest
 from io import BytesIO
@@ -862,6 +863,84 @@ class BodyMediaContentIdentityTests(unittest.TestCase):
                 notion_client,
                 "download_file_bytes",
                 return_value=(rejected_payload, "application/pdf"),
+            ) as download,
+            patch.object(notion_client, "create_file_upload") as create,
+        ):
+            preflight_state = (
+                notion_client.collect_body_media_content_state([block])
+            )
+            blocks, hash_blocks, applied_state = (
+                notion_client.prepare_body_blocks_for_sync(
+                    "token",
+                    [block],
+                )
+            )
+
+        download.assert_called_once()
+        create.assert_not_called()
+        self.assertEqual(preflight_state, [])
+        self.assertEqual(applied_state, [])
+        self.assertEqual(blocks, [block])
+        self.assertEqual(hash_blocks, [block])
+        self.assertEqual(
+            sync_engine.operation_id_for_item(
+                item,
+                body_media_state=preflight_state,
+            ),
+            sync_engine.operation_id_for_item(
+                item,
+                body_media_state=applied_state,
+            ),
+        )
+
+    def test_rejected_large_body_image_preserves_external_block_identity(
+        self,
+    ) -> None:
+        from PIL import Image
+
+        url = (
+            "https://www.sogang.ac.kr/dataview/board/141/"
+            "large-poster.jpg"
+        )
+        block = {
+            "object": "block",
+            "type": "image",
+            "image": {
+                "type": "external",
+                "external": {"url": url},
+            },
+        }
+        item = {
+            "source_id": "141",
+            "notice_id": "549836",
+            "title": "대형 이미지 본문 보존",
+            "url": (
+                "https://www.sogang.ac.kr/ko/detail/549836"
+                "?bbsConfigFk=141"
+            ),
+            "attachments": [],
+            "body_blocks": [block],
+        }
+        buffer = BytesIO()
+        Image.new("RGB", (100, 100), (10, 20, 30)).save(
+            buffer,
+            format="JPEG",
+        )
+        payload = buffer.getvalue()
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "IMAGE_MAX_PIXELS": "9999",
+                    "IMAGE_MAX_DIMENSION": "100",
+                },
+            ),
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(payload, "image/jpeg"),
             ) as download,
             patch.object(notion_client, "create_file_upload") as create,
         ):

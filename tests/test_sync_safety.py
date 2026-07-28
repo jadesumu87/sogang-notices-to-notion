@@ -247,6 +247,7 @@ class StatefulBlockStore:
         self.child_response_lost = False
         self.old_present_during_append = False
         self.child_batch_sizes = []
+        self.root_payloads = []
 
     def list_children(self, token: str, parent_id: str) -> list[dict]:
         self.events.append(("list", parent_id))
@@ -290,7 +291,11 @@ class StatefulBlockStore:
         if self.creation_mode == "missing_creation":
             return {}
         payload = copy.deepcopy(blocks[0])
-        child_blocks = payload.pop("children", [])
+        self.root_payloads.append(copy.deepcopy(payload))
+        child_blocks = payload.get("quote", {}).pop(
+            "children",
+            [],
+        )
         self.root_append_count += 1
         block_id = f"new-managed-{self.root_append_count}"
         payload["id"] = block_id
@@ -603,6 +608,24 @@ class SyncSafetyTests(unittest.TestCase):
         delete_index = store.events.index(("delete", store.old_id))
         self.assertLess(append_index, delete_index)
         self.assertLess(verify_index, delete_index)
+
+    def test_quote_creation_nests_children_in_quote_payload(self):
+        store = StatefulBlockStore()
+
+        self.run_body_sync(
+            store,
+            blocks=[
+                paragraph_block("첫 문단"),
+                paragraph_block("둘째 문단"),
+            ],
+        )
+
+        payload = store.root_payloads[0]
+        self.assertNotIn("children", payload)
+        self.assertEqual(
+            payload["quote"]["children"],
+            [paragraph_block("둘째 문단")],
+        )
 
     def test_split_body_parts_preserves_first_real_block_after_empty_prefix(self):
         visible = paragraph_block("첫 문단")
