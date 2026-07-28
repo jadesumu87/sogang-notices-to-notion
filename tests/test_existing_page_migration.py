@@ -539,6 +539,68 @@ class ExistingPageMigrationTests(unittest.TestCase):
         self.assertEqual(result["applied"], ["page-2"])
         self.assertEqual(len(store.patch_payloads), 2)
 
+    def test_plan_ignores_rotating_notion_hosted_file_urls(self) -> None:
+        store = NotionStore()
+        store.pages["page-1"]["request_id"] = "first-request"
+        store.pages["page-1"]["properties"]["첨부파일"] = {
+            "type": "files",
+            "files": [
+                {
+                    "id": "file-1",
+                    "name": "안내.pdf",
+                    "type": "file",
+                    "file": {
+                        "url": "https://signed.example/first",
+                        "expiry_time": "2026-07-28T10:00:00Z",
+                    },
+                }
+            ],
+        }
+
+        with store.patched():
+            first_plan = self.build_plan(store)
+            store.pages["page-1"]["request_id"] = "second-request"
+            store.pages["page-1"]["properties"]["첨부파일"]["files"][0][
+                "file"
+            ] = {
+                "url": "https://signed.example/second",
+                "expiry_time": "2026-07-28T11:00:00Z",
+            }
+            second_plan = self.build_plan(store)
+
+        self.assertEqual(
+            second_plan["confirmation"],
+            first_plan["confirmation"],
+        )
+        self.assertEqual(
+            second_plan["pages"][0]["page_fingerprint"],
+            first_plan["pages"][0]["page_fingerprint"],
+        )
+
+    def test_root_fingerprint_uses_stable_content_and_block_identity(self) -> None:
+        first = paragraph("manual-1", "내용")
+        first["last_edited_time"] = "2026-07-28T10:00:00Z"
+        first["last_edited_by"] = {"id": "first-user"}
+        second = copy.deepcopy(first)
+        second["last_edited_time"] = "2026-07-28T11:00:00Z"
+        second["last_edited_by"] = {"id": "second-user"}
+
+        self.assertEqual(
+            migration._root_fingerprint([first]),
+            migration._root_fingerprint([second]),
+        )
+        second["paragraph"]["rich_text"][0]["plain_text"] = "변경된 내용"
+        self.assertNotEqual(
+            migration._root_fingerprint([first]),
+            migration._root_fingerprint([second]),
+        )
+        second = copy.deepcopy(first)
+        second["id"] = "manual-2"
+        self.assertNotEqual(
+            migration._root_fingerprint([first]),
+            migration._root_fingerprint([second]),
+        )
+
     def test_all_pages_and_explicit_ids_are_mutually_exclusive(self) -> None:
         with self.assertRaisesRegex(
             migration.MigrationError,

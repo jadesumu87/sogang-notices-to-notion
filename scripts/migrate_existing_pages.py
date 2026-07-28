@@ -35,6 +35,7 @@ from settings import (
     load_dotenv,
 )
 from sync import (
+    block_content_signature,
     body_generation_property_payload,
     extract_body_generation_manifest,
     extract_rich_text_value,
@@ -49,7 +50,7 @@ from sync import (
 from utils import build_rich_text_chunks
 
 JsonObject = dict[str, Any]
-PLAN_VERSION = 4
+PLAN_VERSION = 5
 CONFIRMATION_PREFIX = "APPLY EXISTING PAGE MIGRATION"
 LOCAL_WRITE_CONFIRMATION = "ALLOW EXISTING PAGE METADATA MIGRATION"
 SYNC_PROPERTY_NAMES = (
@@ -92,20 +93,53 @@ def _same_notion_id(left: object, right: object) -> bool:
     ).lower()
 
 
+def _stable_notion_projection(value: object) -> object:
+    if isinstance(value, list):
+        return [_stable_notion_projection(entry) for entry in value]
+    if not isinstance(value, dict):
+        return value
+    projected: JsonObject = {}
+    hosted_file = (
+        value.get("type") == "file"
+        and isinstance(value.get("file"), dict)
+    )
+    for key, entry in value.items():
+        if hosted_file and key == "file":
+            stable_file = {
+                file_key: _stable_notion_projection(file_value)
+                for file_key, file_value in entry.items()
+                if file_key not in {"url", "expiry_time"}
+            }
+            projected[key] = stable_file or {"hosted": True}
+            continue
+        projected[key] = _stable_notion_projection(entry)
+    return projected
+
+
 def _page_fingerprint(page: JsonObject) -> str:
     protected = copy.deepcopy(page)
     protected.pop("last_edited_time", None)
     protected.pop("last_edited_by", None)
+    protected.pop("request_id", None)
     properties = protected.get("properties")
     if not isinstance(properties, dict):
         raise MigrationError("페이지 속성 형식이 올바르지 않습니다")
     for name in SYNC_PROPERTY_NAMES:
         properties.pop(name, None)
-    return _canonical_hash(protected)
+    return _canonical_hash(_stable_notion_projection(protected))
 
 
 def _root_fingerprint(blocks: list[JsonObject]) -> str:
-    return _canonical_hash(blocks)
+    return _canonical_hash(
+        [
+            {
+                "id": str(block.get("id") or "").strip(),
+                "has_children": bool(block.get("has_children")),
+                "content": block_content_signature("", block, False),
+            }
+            for block in blocks
+        ]
+    )
 
 
 def _is_target_parent(page: JsonObject, data_source_id: str) -> bool:
