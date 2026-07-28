@@ -38,7 +38,7 @@ jobs:
     name: Crawl and sync
     if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       TZ: Asia/Seoul
       PYTHONHASHSEED: "0"
@@ -120,6 +120,7 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
           NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+          INTERNAL_DEADLINE_SECONDS: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.schema_migration && '6300' || env.INTERNAL_DEADLINE_SECONDS }}
           SYNC_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
           NOTION_SCHEMA_MIGRATION: ${{ github.event_name == 'workflow_dispatch' && inputs.schema_migration && '1' || '0' }}
           NOTION_SCHEMA_MIGRATION_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.schema_migration && '1' || '0' }}

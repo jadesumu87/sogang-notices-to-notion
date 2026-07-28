@@ -5,6 +5,7 @@ import sys
 import unittest
 import urllib.request
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,6 +37,17 @@ def paragraph_block(text: str = "") -> dict:
             )
         },
     }
+
+
+def jpeg_payload() -> bytes:
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(
+        buffer,
+        format="JPEG",
+    )
+    return buffer.getvalue()
 
 
 def managed_container(
@@ -2225,7 +2237,7 @@ class SyncSafetyTests(unittest.TestCase):
             "https://www.sogang.ac.kr/file-fe-prd/board/body.jpg"
             "?fileId=88&signature=current"
         )
-        body_bytes = b"stable-body-image"
+        body_bytes = jpeg_payload()
         content_sha256 = utils.compute_content_sha256(body_bytes)
         body_blocks = [
             {
@@ -2350,7 +2362,7 @@ class SyncSafetyTests(unittest.TestCase):
             "https://www.sogang.ac.kr/file-fe-prd/board/body.jpg"
             "?fileId=88&signature=current"
         )
-        body_bytes = b"stable-body-image"
+        body_bytes = jpeg_payload()
         content_sha256 = utils.compute_content_sha256(body_bytes)
         body_blocks = [
             {
