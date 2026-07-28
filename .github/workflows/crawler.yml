@@ -45,7 +45,7 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_NO_INPUT: "1"
       PIP_ONLY_BINARY: ":all:"
-      INTERNAL_DEADLINE_SECONDS: "1200"
+      INTERNAL_DEADLINE_SECONDS: "2700"
 
     steps:
       - name: Checkout

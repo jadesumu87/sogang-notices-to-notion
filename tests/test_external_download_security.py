@@ -723,7 +723,8 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
                     with notion_client.external_download_run_scope() as policy:
                         first = notion_client.download_file_bytes(url)
                         if cap_kind == "time":
-                            clock.now = 2.0
+                            with policy.activity():
+                                clock.now = 2.0
                         second = notion_client.download_file_bytes(
                             url.replace("file.png", "next.png")
                         )
@@ -736,6 +737,124 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
                     snapshot["stopped_reason"],
                     "request_cap" if cap_kind == "requests" else "time_cap",
                 )
+
+    def test_idle_time_between_downloads_does_not_consume_time_cap(self):
+        clock = FakeClock()
+        opener = QueueOpener(
+            [
+                TrackingResponse(
+                    b"first",
+                    {
+                        "Content-Type": "image/png",
+                        "Content-Length": "5",
+                    },
+                ),
+                TrackingResponse(
+                    b"second",
+                    {
+                        "Content-Type": "image/png",
+                        "Content-Length": "6",
+                    },
+                ),
+            ]
+        )
+        first_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/first.png"
+        )
+        second_url = (
+            "https://cdn.sogang.ac.kr/file-fe-prd/board/second.png"
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "EXTERNAL_DOWNLOAD_MAX_REQUESTS": "10",
+                    "EXTERNAL_DOWNLOAD_MAX_SECONDS": "1",
+                    "EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS": "0.1",
+                },
+            ),
+            patch.object(utils.socket, "getaddrinfo", side_effect=public_dns),
+            patch.object(
+                notion_client,
+                "build_external_download_opener",
+                return_value=opener,
+            ),
+            patch.object(
+                notion_client.time,
+                "monotonic",
+                side_effect=clock.monotonic,
+            ),
+        ):
+            with notion_client.external_download_run_scope() as policy:
+                first = notion_client.download_file_bytes(first_url)
+                clock.now = 30.0
+                second = notion_client.download_file_bytes(second_url)
+                snapshot = policy.snapshot()
+
+        self.assertEqual(first, (b"first", "image/png"))
+        self.assertEqual(second, (b"second", "image/png"))
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(snapshot["elapsed_seconds"], 0.0)
+
+    def test_active_time_cap_is_not_reported_as_file_size(self):
+        clock = FakeClock()
+        response = TrackingResponse(
+            b"payload",
+            {
+                "Content-Type": "image/png",
+                "Content-Length": "7",
+            },
+        )
+        opener = FakeOpener(response)
+
+        def expire_during_read(*_args, **kwargs):
+            clock.now = 2.0
+            self.assertFalse(kwargs["time_check"]())
+            return None
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "EXTERNAL_DOWNLOAD_MAX_REQUESTS": "10",
+                    "EXTERNAL_DOWNLOAD_MAX_SECONDS": "1",
+                    "EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS": "0.1",
+                },
+            ),
+            patch.object(utils.socket, "getaddrinfo", side_effect=public_dns),
+            patch.object(
+                notion_client,
+                "build_external_download_opener",
+                return_value=opener,
+            ),
+            patch.object(
+                notion_client.time,
+                "monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch.object(
+                notion_client,
+                "read_external_response_bytes",
+                side_effect=expire_during_read,
+            ),
+            self.assertLogs(LOGGER, level="WARNING") as captured,
+        ):
+            with notion_client.external_download_run_scope() as policy:
+                result = notion_client.download_file_bytes(
+                    "https://www.sogang.ac.kr/file-fe-prd/board/file.png"
+                )
+                with self.assertRaisesRegex(
+                    notion_client.ExternalDownloadRunStoppedError,
+                    "time_cap",
+                ):
+                    notion_client.raise_if_external_download_stopped()
+                snapshot = policy.snapshot()
+
+        joined = "\n".join(captured.output)
+        self.assertEqual(result, (None, None))
+        self.assertEqual(snapshot["stopped_reason"], "time_cap")
+        self.assertIn("활성 시간 차단", joined)
+        self.assertNotIn("용량 차단", joined)
 
     def test_retry_after_longer_than_download_budget_stops_without_sleep(self):
         url = "https://www.sogang.ac.kr/file-fe-prd/board/file.png"

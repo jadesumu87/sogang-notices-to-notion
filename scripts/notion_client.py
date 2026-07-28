@@ -86,7 +86,7 @@ EXTERNAL_UPLOAD_MAX_RETRIES = 3
 EXTERNAL_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024
 EXTERNAL_DOWNLOAD_READ_CHUNK_BYTES = 64 * 1024
 EXTERNAL_DOWNLOAD_MAX_REQUESTS = 300
-EXTERNAL_DOWNLOAD_MAX_SECONDS = 300.0
+EXTERNAL_DOWNLOAD_MAX_SECONDS = 600.0
 EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 EXTERNAL_PREFLIGHT_CACHE_MAX_BYTES = 128 * 1024 * 1024
 IMAGE_MAX_PIXELS = 40_000_000
@@ -539,7 +539,6 @@ class ExternalDownloadRunStoppedError(RuntimeError):
 
 class ExternalDownloadRunPolicy:
     def __init__(self) -> None:
-        self.started_at = time.monotonic()
         self.max_requests = self._integer_env(
             "EXTERNAL_DOWNLOAD_MAX_REQUESTS",
             EXTERNAL_DOWNLOAD_MAX_REQUESTS,
@@ -569,6 +568,9 @@ class ExternalDownloadRunPolicy:
         self.retry_after: Optional[str] = None
         self.retry_after_seconds: Optional[float] = None
         self.next_request_at_by_host: dict[str, float] = {}
+        self.active_seconds = 0.0
+        self.active_started_at: Optional[float] = None
+        self.active_depth = 0
         self._lock = threading.Lock()
 
     @staticmethod
@@ -601,7 +603,30 @@ class ExternalDownloadRunPolicy:
 
     def _elapsed_seconds(self, now: Optional[float] = None) -> float:
         current = time.monotonic() if now is None else now
-        return max(0.0, current - self.started_at)
+        elapsed = self.active_seconds
+        if self.active_started_at is not None:
+            elapsed += max(0.0, current - self.active_started_at)
+        return max(0.0, elapsed)
+
+    @contextmanager
+    def activity(self) -> Iterator[None]:
+        with self._lock:
+            if self.active_depth == 0:
+                self.active_started_at = time.monotonic()
+            self.active_depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self.active_depth = max(0, self.active_depth - 1)
+                if self.active_depth == 0:
+                    now = time.monotonic()
+                    if self.active_started_at is not None:
+                        self.active_seconds += max(
+                            0.0,
+                            now - self.active_started_at,
+                        )
+                    self.active_started_at = None
 
     def _has_time_locked(self, now: float) -> bool:
         if self._elapsed_seconds(now) < self.max_seconds:
@@ -984,6 +1009,27 @@ def read_external_response_bytes(
     return b"".join(chunks)
 
 
+def external_download_stopped_error(
+    policy: ExternalDownloadRunPolicy,
+) -> ExternalDownloadRunStoppedError:
+    snapshot = policy.snapshot()
+    return ExternalDownloadRunStoppedError(
+        "외부 파일 다운로드 실행 안전 한도에 도달했습니다: "
+        f"중단 사유={snapshot['stopped_reason'] or 'unknown'}, "
+        f"요청={snapshot['requests']}, "
+        f"활성 시간={float(snapshot['elapsed_seconds']):.1f}초"
+    )
+
+
+def raise_if_external_download_stopped() -> None:
+    policy = current_external_download_run_policy()
+    if policy is None:
+        return
+    snapshot = policy.snapshot()
+    if snapshot["stopped_reason"]:
+        raise external_download_stopped_error(policy)
+
+
 def download_file_bytes(
     url: str,
     require_file_hint: bool = False,
@@ -997,6 +1043,21 @@ def download_file_bytes(
                 require_file_hint=require_file_hint,
                 max_bytes=max_bytes,
             )
+    with policy.activity():
+        return _download_file_bytes_with_policy(
+            policy,
+            url,
+            require_file_hint=require_file_hint,
+            max_bytes=max_bytes,
+        )
+
+
+def _download_file_bytes_with_policy(
+    policy: ExternalDownloadRunPolicy,
+    url: str,
+    require_file_hint: bool = False,
+    max_bytes: int = EXTERNAL_DOWNLOAD_MAX_BYTES,
+) -> tuple[Optional[bytes], Optional[str]]:
     request_target = summarize_external_request_target(url)
     if not is_allowed_external_download_url(url, require_file_hint=require_file_hint):
         LOGGER.warning("외부 파일 다운로드 차단: %s", request_target)
@@ -1027,11 +1088,21 @@ def download_file_bytes(
                     time_check=policy.has_time_remaining,
                 )
                 if data is None:
-                    LOGGER.warning(
-                        "외부 파일 다운로드 용량 차단: %s (limit=%s)",
-                        request_target,
-                        max_bytes,
-                    )
+                    snapshot = policy.snapshot()
+                    if snapshot["stopped_reason"] == "time_cap":
+                        LOGGER.warning(
+                            "외부 파일 다운로드 활성 시간 차단: %s "
+                            "(limit=%ss, requests=%s)",
+                            request_target,
+                            policy.max_seconds,
+                            snapshot["requests"],
+                        )
+                    else:
+                        LOGGER.warning(
+                            "외부 파일 다운로드 용량 차단: %s (limit=%s)",
+                            request_target,
+                            max_bytes,
+                        )
                     return None, None
                 return data, content_type or None
         except UnsafeExternalDownloadError:
@@ -2576,6 +2647,7 @@ def collect_attachment_content_state(
             require_file_hint=False,
         )
         if not payload:
+            raise_if_external_download_stopped()
             raise RuntimeError("첨부 콘텐츠 사전검증에 실패했습니다")
         cache_external_preflight_download(
             url,
@@ -2614,6 +2686,7 @@ def collect_body_media_content_state(
                 require_file_hint=False,
             )
             if not payload:
+                raise_if_external_download_stopped()
                 raise RuntimeError(
                     "본문 이미지 콘텐츠 사전검증에 실패했습니다"
                 )
@@ -2650,6 +2723,7 @@ def collect_body_media_content_state(
             require_file_hint=True,
         )
         if not payload:
+            raise_if_external_download_stopped()
             raise RuntimeError(
                 "본문 파일 콘텐츠 사전검증에 실패했습니다"
             )
