@@ -75,6 +75,22 @@ JsonObject = dict[str, Any]
 BODY_GENERATION_MANIFEST_VERSION = 2
 BODY_GENERATION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 BODY_GENERATION_HASH_RE = re.compile(r"[0-9a-f]{64}")
+DEFAULT_COLOR_BLOCK_TYPES = frozenset(
+    {
+        "bulleted_list_item",
+        "callout",
+        "heading_1",
+        "heading_2",
+        "heading_3",
+        "heading_4",
+        "numbered_list_item",
+        "paragraph",
+        "quote",
+        "table_of_contents",
+        "to_do",
+        "toggle",
+    }
+)
 
 
 def extract_type_from_title(title: str) -> str:
@@ -1367,8 +1383,9 @@ def block_content_signature(
             if isinstance(cells, list)
             else "invalid"
         )
+    if block_type in DEFAULT_COLOR_BLOCK_TYPES:
+        signature["color"] = str(payload.get("color") or "default")
     for key in (
-        "color",
         "language",
         "checked",
         "table_width",
