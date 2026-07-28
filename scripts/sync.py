@@ -1708,7 +1708,9 @@ def validate_body_write_payloads(blocks: list[JsonObject]) -> None:
         copy.deepcopy(container_rich_text)
     )
     if first_chunk:
-        container_payload["children"] = copy.deepcopy(first_chunk)
+        container_payload["quote"]["children"] = copy.deepcopy(
+            first_chunk
+        )
     encode_notion_payload({"children": [container_payload]})
     for offset in range(
         len(first_chunk),
@@ -2017,7 +2019,9 @@ def sync_page_body_blocks(
             copy.deepcopy(container_rich_text)
         )
         if first_chunk:
-            container_payload["children"] = copy.deepcopy(first_chunk)
+            container_payload["quote"]["children"] = copy.deepcopy(
+                first_chunk
+            )
         response: object = None
         append_error: Optional[Exception] = None
         try:
