@@ -150,7 +150,7 @@ jobs:
 
       - name: Save crawler state
         if: ${{ always() && hashFiles('.runtime/run-state.json') != '' && hashFiles('.runtime/public-run-state.json') != '' }}
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .runtime/public-run-state.json
           key: crawler-state-${{ github.run_id }}-${{ github.run_attempt }}
