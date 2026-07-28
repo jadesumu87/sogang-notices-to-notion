@@ -131,10 +131,18 @@ class CiScriptTests(unittest.TestCase):
             r'INTERNAL_DEADLINE_SECONDS:\s*"(\d+)"',
             workflow,
         )
+        manual_deadline = re.search(
+            r"INTERNAL_DEADLINE_SECONDS:\s*\$\{\{"
+            r".*?'(\d+)'\s*\|\|\s*env\.INTERNAL_DEADLINE_SECONDS"
+            r"\s*\}\}",
+            workflow,
+        )
         self.assertIsNotNone(timeout)
         self.assertIsNotNone(deadline)
+        self.assertIsNotNone(manual_deadline)
         assert timeout is not None
         assert deadline is not None
+        assert manual_deadline is not None
         self.assertLess(
             int(deadline.group(1)),
             int(timeout.group(1)) * 60,
@@ -142,6 +150,20 @@ class CiScriptTests(unittest.TestCase):
         self.assertGreaterEqual(
             int(timeout.group(1)) * 60 - int(deadline.group(1)),
             600,
+        )
+        self.assertGreater(
+            int(manual_deadline.group(1)),
+            int(deadline.group(1)),
+        )
+        self.assertGreaterEqual(
+            int(timeout.group(1)) * 60
+            - int(manual_deadline.group(1)),
+            600,
+        )
+        self.assertIn(
+            "github.event_name == 'workflow_dispatch' && "
+            "!inputs.dry_run && !inputs.schema_migration",
+            workflow,
         )
 
     def test_cache_projection_removes_private_state(self) -> None:

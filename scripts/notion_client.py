@@ -1334,7 +1334,7 @@ def payload_contains_archive_marker(payload: bytes) -> bool:
 
 
 def inspect_pdf_payload(payload: bytes) -> bool:
-    if not re.match(rb"%PDF-[12]\.[0-9]\r?\n", payload[:16]):
+    if not re.match(rb"%PDF-[12]\.[0-9](?:\r\n|\r|\n)", payload[:16]):
         return False
     if payload_contains_archive_marker(payload):
         return False
@@ -1929,6 +1929,35 @@ def validate_external_upload_payload(
     )
 
 
+def validated_external_upload_metadata(
+    payload: bytes,
+    filename_hint: Optional[str],
+    content_type: Optional[str],
+    url: str,
+    expect_image: bool,
+) -> Optional[tuple[str, str]]:
+    filename = sanitize_filename(
+        filename_hint or derive_filename_from_url(url, fallback="file")
+    )
+    normalized_content_type = normalize_content_type(
+        content_type,
+        filename,
+        url,
+    )
+    validated_format = validate_external_upload_payload(
+        payload,
+        filename,
+        normalized_content_type,
+        expect_image,
+    )
+    if validated_format is None:
+        return None
+    canonical_content_type, canonical_extension = validated_format
+    if not os.path.splitext(filename)[1]:
+        filename = f"{filename}{canonical_extension}"
+    return filename, canonical_content_type
+
+
 def compress_image_to_limit(
     payload: bytes,
     content_type: str,
@@ -2411,26 +2440,21 @@ def upload_external_file_to_notion(
         return None
     if len(payload) > EXTERNAL_DOWNLOAD_MAX_BYTES:
         return None
-    filename = sanitize_filename(
-        filename_hint or derive_filename_from_url(url, fallback="file")
-    )
-    content_type = normalize_content_type(content_type, filename, url)
-    validated_format = validate_external_upload_payload(
+    validated_metadata = validated_external_upload_metadata(
         payload,
-        filename,
+        filename_hint,
         content_type,
+        url,
         expect_image,
     )
-    if validated_format is None:
+    if validated_metadata is None:
         LOGGER.info(
             "파일 형식 검증 차단: content_type=%s (%s)",
             content_type,
             request_target,
         )
         return None
-    content_type, canonical_extension = validated_format
-    if not os.path.splitext(filename)[1]:
-        filename = f"{filename}{canonical_extension}"
+    filename, content_type = validated_metadata
     content_sha256 = compute_content_sha256(payload)
     cache_key = (
         normalize_attachment_identity_url(url) or url.strip(),
@@ -2654,6 +2678,14 @@ def collect_attachment_content_state(
             False,
             (payload, content_type),
         )
+        if validated_external_upload_metadata(
+            payload,
+            name,
+            content_type,
+            url,
+            True,
+        ) is None:
+            continue
         state.append(
             {
                 "source_url": normalize_attachment_identity_url(url),
@@ -2695,6 +2727,14 @@ def collect_body_media_content_state(
                 False,
                 (payload, content_type),
             )
+            if validated_external_upload_metadata(
+                payload,
+                derive_filename_from_url(url, fallback="image"),
+                content_type,
+                url,
+                True,
+            ) is None:
+                continue
             state.append(
                 {
                     "type": "image",
@@ -2733,6 +2773,14 @@ def collect_body_media_content_state(
             (payload, content_type),
         )
         filename = derive_filename_from_url(url, fallback="file")
+        if validated_external_upload_metadata(
+            payload,
+            filename,
+            content_type,
+            url,
+            False,
+        ) is None:
+            continue
         state.append(
             {
                 "type": (

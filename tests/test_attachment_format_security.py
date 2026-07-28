@@ -255,6 +255,25 @@ class AttachmentFormatSecurityTests(unittest.TestCase):
         self.assertEqual(create.call_count, 2)
         self.assertEqual(send.call_count, 2)
 
+    def test_pdf_header_accepts_standard_end_of_line_variants(self) -> None:
+        for line_ending in (b"\n", b"\r", b"\r\n"):
+            with self.subTest(line_ending=line_ending):
+                payload = (
+                    b"%PDF-1.6"
+                    + line_ending
+                    + b"%\xff\xff\xff\xff\n"
+                    + b"1 0 obj\n<<>>\nendobj\n%%EOF"
+                )
+                self.assertEqual(
+                    notion_client.validate_external_upload_payload(
+                        payload,
+                        "notice.pdf",
+                        "application/pdf",
+                        False,
+                    ),
+                    ("application/pdf", ".pdf"),
+                )
+
     def test_missing_extension_is_added_after_format_validation(self) -> None:
         with (
             patch.object(
