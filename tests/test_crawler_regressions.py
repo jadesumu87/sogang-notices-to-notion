@@ -252,6 +252,13 @@ class CrawlerRegressionTests(unittest.TestCase):
     def tearDown(self):
         self.env.stop()
 
+    def test_default_backfill_detail_limit_is_bounded_for_short_runs(self):
+        with patch.dict(
+            os.environ,
+            {"BACKFILL_DETAIL_LIMIT": ""},
+        ):
+            self.assertEqual(crawler.get_backfill_detail_limit(), 20)
+
     def test_missing_configured_source_result_fails_closed(self):
         report = validate_crawl_report(
             CrawlReport(sources=[crawl_result()]),
@@ -1522,6 +1529,7 @@ class CrawlerRegressionTests(unittest.TestCase):
                 "extract_body_blocks_from_html",
                 return_value=BODY,
             ),
+            self.assertLogs(crawler.LOGGER, level="INFO") as logs,
         ):
             result = crawler.crawl_top_items_api_result(
                 SOURCE,
@@ -1551,6 +1559,13 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertFalse(result.full_snapshot)
         self.assertTrue(state["sources"]["141"]["backfill_active"])
         self.assertIsNone(state["last_coverage_reconcile_at"])
+        self.assertTrue(
+            any(
+                "상세 수집 시작(API): 출처=141, 페이지=1, "
+                "항목=1/2, 공지=1002" in message
+                for message in logs.output
+            )
+        )
 
     def crawl_resumed_burst(self, total_count: int | None):
         known_ids = {
@@ -2534,10 +2549,12 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
                 "crawl_sources",
                 side_effect=crawl_sources,
             ),
+            self.assertLogs(crawler_main.LOGGER, level="INFO") as logs,
         ):
             crawler_main.collect_report(
                 state,
                 full_reconcile=True,
+                record_reconcile_attempts=True,
             )
 
         self.assertEqual(
@@ -2551,6 +2568,83 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
         self.assertEqual(
             captured["resume_anchor_ids_by_source"],
             {"141": set(), "2": {"190"}},
+        )
+        self.assertNotIn(
+            "last_reconcile_attempt_at",
+            state["sources"]["141"],
+        )
+        self.assertIn(
+            "last_reconcile_attempt_at",
+            state["sources"]["2"],
+        )
+        self.assertTrue(
+            any(
+                "수집 계획: 출처=2, 모드=과거 보강, "
+                "상세 한도=20, 시작 페이지=5" in message
+                for message in logs.output
+            )
+        )
+
+    def test_recent_backfill_attempt_stays_incremental(self):
+        now = datetime.now(timezone.utc).isoformat()
+        state = fresh_state()
+        state["sources"]["141"] = {
+            "observed_ids": ["300"],
+            "backfill_active": True,
+            "backfill_resume_page": 5,
+            "backfill_anchor_ids": ["290"],
+            "last_reconcile_attempt_at": now,
+        }
+        captured = {}
+
+        def crawl_sources(**kwargs):
+            captured.update(kwargs)
+            return CrawlReport([crawl_result()])
+
+        with (
+            patch.object(
+                crawler_main,
+                "resolve_html_path",
+                return_value=None,
+            ),
+            patch.object(
+                crawler_main,
+                "get_bbs_config_fks",
+                return_value=["141"],
+            ),
+            patch.object(
+                crawler_main,
+                "crawl_sources",
+                side_effect=crawl_sources,
+            ),
+            self.assertLogs(crawler_main.LOGGER, level="INFO") as logs,
+        ):
+            crawler_main.collect_report(
+                state,
+                full_reconcile=True,
+                record_reconcile_attempts=True,
+            )
+
+        self.assertFalse(
+            captured["reconcile_mode_by_source"]["141"]
+        )
+        self.assertTrue(
+            captured["incremental_by_source"]["141"]
+        )
+        self.assertEqual(
+            captured["resume_page_by_source"]["141"],
+            1,
+        )
+        self.assertEqual(
+            state["sources"]["141"]["last_reconcile_attempt_at"],
+            now,
+        )
+        self.assertTrue(
+            any(
+                "수집 계획: 출처=141, 모드=증분, "
+                "상세 한도=-, 시작 페이지=1, 백필=대기" in message
+                for message in logs.output
+            )
         )
 
 class SourceEmptySafetyRegressionTests(unittest.TestCase):

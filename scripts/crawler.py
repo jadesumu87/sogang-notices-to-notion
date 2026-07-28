@@ -1588,12 +1588,33 @@ def get_api_time_budget_seconds() -> float:
 
 
 def get_backfill_detail_limit() -> int:
-    raw = os.environ.get("BACKFILL_DETAIL_LIMIT", "100").strip()
+    raw = os.environ.get("BACKFILL_DETAIL_LIMIT", "20").strip()
     try:
         value = int(raw)
     except ValueError:
-        return 100
+        return 20
     return min(1000, max(1, value))
+
+
+def log_detail_collection_progress(
+    method: str,
+    stage: str,
+    source_id: str,
+    page_number: int,
+    item_index: int,
+    item_total: int,
+    notice_id: str,
+) -> None:
+    LOGGER.info(
+        "상세 수집 %s(%s): 출처=%s, 페이지=%s, 항목=%s/%s, 공지=%s",
+        stage,
+        method,
+        source_id,
+        page_number,
+        item_index,
+        item_total,
+        notice_id,
+    )
 
 
 def get_incremental_checkpoint_overlap_pages() -> int:
@@ -2019,7 +2040,7 @@ def crawl_top_items_api_result(
         page_has_unknown_notice = False
         page_contract_failed = False
 
-        for entry in entries_to_process:
+        for entry_index, entry in enumerate(entries_to_process, start=1):
             check_run_control()
             pk_id = str(entry.get("pkId") or "").strip()
             if not pk_id:
@@ -2070,6 +2091,15 @@ def crawl_top_items_api_result(
                 and pk_id not in refresh_known_ids
             ):
                 continue
+            log_detail_collection_progress(
+                "API",
+                "시작",
+                config_fk,
+                page_number,
+                entry_index,
+                len(entries_to_process),
+                pk_id,
+            )
             if not consume_api_budget():
                 page_contract_failed = True
                 break
@@ -2272,6 +2302,15 @@ def crawl_top_items_api_result(
             fetched_detail_count += 1
             if pk_id in known_ids:
                 refreshed_known_ids.append(pk_id)
+            log_detail_collection_progress(
+                "API",
+                "완료",
+                config_fk,
+                page_number,
+                entry_index,
+                len(entries_to_process),
+                pk_id,
+            )
 
         if page_contract_failed:
             break
@@ -2914,11 +2953,23 @@ def crawl_top_items_http(
         else:
             items_to_process = [item for item in page_items if item.get("top")]
         new_count = 0
-        for item in items_to_process:
+        for item_index, item in enumerate(items_to_process, start=1):
             body_blocks: JsonObjectList = []
             attachments: JsonObjectList = []
             attachment_status = ATTACHMENTS_STATUS_UNKNOWN
             if item.get("url"):
+                notice_id = extract_detail_id_from_text(
+                    str(item.get("url") or "")
+                ) or "-"
+                log_detail_collection_progress(
+                    "HTTP",
+                    "시작",
+                    config_fk,
+                    page_number,
+                    item_index,
+                    len(items_to_process),
+                    notice_id,
+                )
                 written_at, attachments, body_blocks, signals = fetch_detail_metadata_from_url(
                     item["url"]
                 )
@@ -2930,6 +2981,15 @@ def crawl_top_items_http(
                     item["date"] = written_at
                 if body_blocks:
                     item["body_blocks"] = body_blocks
+                log_detail_collection_progress(
+                    "HTTP",
+                    "완료",
+                    config_fk,
+                    page_number,
+                    item_index,
+                    len(items_to_process),
+                    notice_id,
+                )
             if classification:
                 item["classification"] = classification
             ensure_item_title(item, body_blocks, item.get("url"))
@@ -3838,7 +3898,7 @@ def crawl_fallback_with_fetchers(
         page_contract_failed = False
         page_has_checkpoint = False
         page_has_unknown_notice = False
-        for entry in page.entries:
+        for entry_index, entry in enumerate(page.entries, start=1):
             top = bool(entry.get("top"))
             raw_url = str(
                 entry.get("url")
@@ -3903,6 +3963,15 @@ def crawl_fallback_with_fetchers(
             if not consume_budget(f"detail:{notice_id}"):
                 page_contract_failed = True
                 break
+            log_detail_collection_progress(
+                "폴백",
+                "시작",
+                source.config_fk,
+                page_number,
+                entry_index,
+                len(page.entries),
+                notice_id,
+            )
             detail = fetch_detail(entry, page_number)
             if (
                 not detail.ok
@@ -4013,6 +4082,15 @@ def crawl_fallback_with_fetchers(
             fetched_detail_count += 1
             if notice_id in known_ids:
                 refreshed_known_ids.append(notice_id)
+            log_detail_collection_progress(
+                "폴백",
+                "완료",
+                source.config_fk,
+                page_number,
+                entry_index,
+                len(page.entries),
+                notice_id,
+            )
         if page_contract_failed:
             break
         sequence = tuple(id_sequence)
