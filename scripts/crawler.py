@@ -2006,20 +2006,6 @@ def crawl_top_items_api_result(
             termination_reason = "page_error"
             break
         page_id_sequences.add(id_sequence)
-        non_top_seen_on_page = False
-        invalid_top_order = False
-        for entry in page_entries:
-            entry_top = str(entry.get("isTop") or "").upper() == "Y"
-            if entry_top and non_top_seen_on_page:
-                invalid_top_order = True
-                break
-            if not entry_top:
-                non_top_seen_on_page = True
-        if invalid_top_order:
-            terminal_error = f"top_order_violation:{page_number}"
-            terminal_category = FailureCategory.SOURCE_CONTRACT
-            termination_reason = "page_error"
-            break
         if include_non_top:
             entries_to_process = page_entries
         else:
@@ -2475,6 +2461,8 @@ def crawl_top_items_api_result(
         top_snapshot_verified=(
             first_page_top_verified
             and status == SourceStatus.SUCCESS
+            and not resume_active
+            and termination_reason == "natural_end"
         ),
         retry_after_seconds=retry_after_seconds,
         backfill_resume_page=next_resume_page,
@@ -3847,20 +3835,11 @@ def crawl_fallback_with_fetchers(
             checkpoint_found = True
             break
         id_sequence: list[tuple[str, bool]] = []
-        non_top_seen = False
         page_contract_failed = False
         page_has_checkpoint = False
         page_has_unknown_notice = False
         for entry in page.entries:
             top = bool(entry.get("top"))
-            if top and non_top_seen:
-                terminal_error = f"fallback_top_order_violation:{page_number}"
-                terminal_category = FailureCategory.SOURCE_CONTRACT
-                termination_reason = "page_error"
-                page_contract_failed = True
-                break
-            if not top:
-                non_top_seen = True
             raw_url = str(
                 entry.get("url")
                 or entry.get("detail_url")
@@ -4211,6 +4190,8 @@ def crawl_fallback_with_fetchers(
             first_page_top_verified
             and terminal_reached
             and not terminal_error
+            and not resume_active
+            and termination_reason == "natural_end"
         ),
         retry_after_seconds=retry_after_seconds,
         backfill_resume_page=next_resume_page,

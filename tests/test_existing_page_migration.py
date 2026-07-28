@@ -1,4 +1,6 @@
 import copy
+import io
+import json
 import sys
 import unittest
 from contextlib import ExitStack, contextmanager
@@ -264,6 +266,7 @@ class ExistingPageMigrationTests(unittest.TestCase):
         with store.patched():
             plan = self.build_plan(store)
             entry = plan["pages"][0]
+            self.assertEqual(plan["selection"], "explicit_pages")
             self.assertEqual(plan["page_id_allowlist"], ["page-1"])
             self.assertEqual(entry["source_id"], "141")
             self.assertEqual(entry["notice_id"], "1001")
@@ -457,6 +460,176 @@ class ExistingPageMigrationTests(unittest.TestCase):
                     "data-source",
                     [],
                 )
+
+    def test_all_pages_plan_covers_every_active_page(self) -> None:
+        store = NotionStore()
+        store.pages["page-2"] = make_page(
+            page_id="page-2",
+            notice_id="1002",
+        )
+        store.roots["page-2"] = [quote("quote-2")]
+        store.children["quote-2"] = [paragraph("body-2", "두 번째 본문")]
+
+        with store.patched():
+            plan = migration.build_migration_plan(
+                "token",
+                store.data_source_id,
+                all_pages=True,
+            )
+
+        self.assertEqual(plan["selection"], "all_pages")
+        self.assertEqual(plan["page_id_allowlist"], ["page-1", "page-2"])
+        self.assertEqual(len(plan["pages"]), 2)
+
+    def test_all_pages_apply_blocks_when_scope_changes(self) -> None:
+        store = NotionStore()
+
+        with store.patched():
+            plan = migration.build_migration_plan(
+                "token",
+                store.data_source_id,
+                all_pages=True,
+            )
+            store.pages["page-2"] = make_page(
+                page_id="page-2",
+                notice_id="1002",
+            )
+            store.roots["page-2"] = []
+            with self.assertRaisesRegex(
+                migration.MigrationError,
+                "범위가 계획 생성 이후 변경",
+            ):
+                self.apply_plan(plan)
+
+        self.assertEqual(store.patch_payloads, [])
+
+    def test_all_pages_plan_resumes_exact_partial_application(self) -> None:
+        store = NotionStore()
+        store.pages["page-2"] = make_page(
+            page_id="page-2",
+            notice_id="1002",
+        )
+        store.roots["page-2"] = [quote("quote-2")]
+        store.children["quote-2"] = [paragraph("body-2", "두 번째 본문")]
+
+        with store.patched():
+            first_plan = migration.build_migration_plan(
+                "token",
+                store.data_source_id,
+                all_pages=True,
+            )
+            first_entry = first_plan["pages"][0]
+            migration._patch_properties(
+                "token",
+                first_entry["page_id"],
+                migration._desired_properties(first_entry),
+            )
+            resumed_plan = migration.build_migration_plan(
+                "token",
+                store.data_source_id,
+                all_pages=True,
+            )
+            result = self.apply_plan(resumed_plan)
+
+        self.assertEqual(
+            resumed_plan["confirmation"],
+            first_plan["confirmation"],
+        )
+        self.assertEqual(result["already_applied"], ["page-1"])
+        self.assertEqual(result["applied"], ["page-2"])
+        self.assertEqual(len(store.patch_payloads), 2)
+
+    def test_all_pages_and_explicit_ids_are_mutually_exclusive(self) -> None:
+        with self.assertRaisesRegex(
+            migration.MigrationError,
+            "함께 사용할 수 없습니다",
+        ):
+            migration.build_migration_plan(
+                "token",
+                "data-source",
+                ["page-1"],
+                all_pages=True,
+            )
+
+    def test_cli_resolves_data_source_from_database_id(self) -> None:
+        plan = {"selection": "all_pages", "pages": [], "confirmation": "confirm"}
+
+        with (
+            patch.dict(
+                migration.os.environ,
+                {
+                    "NOTION_TOKEN": "token",
+                    "NOTION_DB_ID": "database-id",
+                    "NOTION_DATA_SOURCE_ID": "",
+                },
+                clear=True,
+            ),
+            patch.object(
+                migration,
+                "resolve_notion_data_source_id",
+                return_value="data-source",
+            ) as resolve,
+            patch.object(
+                migration,
+                "build_migration_plan",
+                return_value=plan,
+            ) as build,
+            patch.object(migration, "_write_plan") as write,
+        ):
+            result = migration.main(["--all-pages"])
+
+        self.assertEqual(result, 0)
+        resolve.assert_called_once_with("token", "database-id")
+        build.assert_called_once_with(
+            "token",
+            "data-source",
+            [],
+            all_pages=True,
+        )
+        write.assert_called_once_with(plan, None)
+
+    def test_cli_apply_output_contains_counts_not_page_ids(self) -> None:
+        output = io.StringIO()
+        result = {
+            "applied": ["private-page-1"],
+            "already_applied": ["private-page-2", "private-page-3"],
+            "total": 3,
+        }
+
+        with (
+            patch.dict(
+                migration.os.environ,
+                {"NOTION_TOKEN": "token"},
+                clear=True,
+            ),
+            patch.object(migration, "_read_plan", return_value={}),
+            patch.object(
+                migration,
+                "apply_migration_plan",
+                return_value=result,
+            ),
+            patch.object(migration.sys, "stdout", output),
+        ):
+            status = migration.main(
+                [
+                    "--apply",
+                    "--plan",
+                    "plan.json",
+                    "--confirm",
+                    "confirm",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "applied": 1,
+                "already_applied": 2,
+                "total": 3,
+            },
+        )
+        self.assertNotIn("private-page", output.getvalue())
 
     def test_schema_blocker_is_reported_before_page_query(self) -> None:
         store = NotionStore()

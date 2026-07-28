@@ -13,7 +13,14 @@ from common import (
     extract_verified_detail_url_identity,
     rich_text_plain_text,
 )
-from notion_client import list_block_children, notion_request, retrieve_page
+from notion_client import (
+    NotionDataSourceResolutionError,
+    NotionRequestError,
+    list_block_children,
+    notion_request,
+    resolve_notion_data_source_id,
+    retrieve_page,
+)
 from settings import (
     NOTICE_ID_PROPERTY,
     SOURCE_KEY_PROPERTY,
@@ -42,7 +49,7 @@ from sync import (
 from utils import build_rich_text_chunks
 
 JsonObject = dict[str, Any]
-PLAN_VERSION = 3
+PLAN_VERSION = 4
 CONFIRMATION_PREFIX = "APPLY EXISTING PAGE MIGRATION"
 LOCAL_WRITE_CONFIRMATION = "ALLOW EXISTING PAGE METADATA MIGRATION"
 SYNC_PROPERTY_NAMES = (
@@ -342,10 +349,14 @@ def build_migration_plan(
     token: str,
     data_source_id: str,
     page_ids: Optional[list[str]] = None,
+    *,
+    all_pages: bool = False,
 ) -> JsonObject:
     data_source_id = _safe_id(data_source_id, "데이터 소스 ID")
     requested_ids = [_safe_id(page_id, "페이지 ID") for page_id in page_ids or []]
-    if not requested_ids:
+    if all_pages and requested_ids:
+        raise MigrationError("--all-pages와 --page-id를 함께 사용할 수 없습니다")
+    if not all_pages and not requested_ids:
         raise MigrationError(
             "계획 생성에는 --page-id를 하나 이상 명시해야 합니다"
         )
@@ -358,6 +369,17 @@ def build_migration_plan(
         _safe_id(page.get("id"), "페이지 ID"): page
         for page in queried_pages
     }
+    if all_pages:
+        requested_ids = sorted(
+            page_id
+            for page_id, page in queried_by_id.items()
+            if (
+                not page.get("in_trash")
+                and _is_target_parent(page, data_source_id)
+            )
+        )
+        if not requested_ids:
+            raise MigrationError("이관할 활성 페이지가 없습니다")
     missing = sorted(set(requested_ids) - set(queried_by_id))
     if missing:
         raise MigrationError(
@@ -377,17 +399,6 @@ def build_migration_plan(
             page_blockers.append("공식 공지 상세 URL이 정확하지 않음")
         if not _page_title(page):
             page_blockers.append("페이지 제목이 비어 있음")
-        populated = [
-            name
-            for name, value in _sync_values(page).items()
-            if value
-        ]
-        if populated:
-            page_blockers.append(
-                "새 동기화 필드가 비어 있지 않음("
-                + ",".join(populated)
-                + ")"
-            )
         blocks = list_block_children(token, page_id)
         quote_id: Optional[str] = None
         quote_hash: Optional[str] = None
@@ -408,21 +419,32 @@ def build_migration_plan(
         if identity is None:
             raise AssertionError("검증된 공지 식별자가 누락되었습니다")
         source_id, notice_id = identity
-        entries.append(
-            {
-                "page_id": page_id,
-                "title": _page_title(page),
-                "url": _page_url(page),
-                "source_id": source_id,
-                "notice_id": notice_id,
-                "page_fingerprint": _page_fingerprint(page),
-                "root_fingerprint": _root_fingerprint(blocks),
-                "quote_id": quote_id,
-                "quote_hash": quote_hash,
-                "quote_marker": quote_marker,
-                "quote_preview": quote_preview,
-            }
-        )
+        entry = {
+            "page_id": page_id,
+            "title": _page_title(page),
+            "url": _page_url(page),
+            "source_id": source_id,
+            "notice_id": notice_id,
+            "page_fingerprint": _page_fingerprint(page),
+            "root_fingerprint": _root_fingerprint(blocks),
+            "quote_id": quote_id,
+            "quote_hash": quote_hash,
+            "quote_marker": quote_marker,
+            "quote_preview": quote_preview,
+        }
+        populated = [
+            name
+            for name, value in _sync_values(page).items()
+            if value
+        ]
+        if populated and not _is_exactly_applied(page, entry):
+            blockers[page_id] = [
+                "새 동기화 필드가 예상 이관 상태와 다름("
+                + ",".join(populated)
+                + ")"
+            ]
+            continue
+        entries.append(entry)
     if blockers:
         details = "; ".join(
             f"{page_id}=" + ", ".join(reasons)
@@ -431,6 +453,7 @@ def build_migration_plan(
         raise MigrationError(f"이관 차단 항목: {details}")
     plan: JsonObject = {
         "version": PLAN_VERSION,
+        "selection": "all_pages" if all_pages else "explicit_pages",
         "data_source_id": data_source_id,
         "sync_schema_fingerprint": schema_fingerprint,
         "page_id_allowlist": [str(entry["page_id"]) for entry in entries],
@@ -442,6 +465,8 @@ def build_migration_plan(
 def _validated_plan_entries(plan: JsonObject) -> list[JsonObject]:
     if plan.get("version") != PLAN_VERSION:
         raise MigrationError("지원하지 않는 이관 계획 버전입니다")
+    if plan.get("selection") not in {"all_pages", "explicit_pages"}:
+        raise MigrationError("이관 계획의 선택 범위가 유효하지 않습니다")
     _safe_id(plan.get("data_source_id"), "데이터 소스 ID")
     if not re.fullmatch(
         r"[0-9a-f]{64}",
@@ -622,12 +647,18 @@ def _full_preflight(
     token: str,
     data_source_id: str,
     entries: list[JsonObject],
+    *,
+    require_exact_scope: bool,
 ) -> dict[str, str]:
     queried_pages = _query_all_pages(token, data_source_id)
     _assert_no_identity_duplicates(queried_pages, data_source_id)
     queried_ids = {
         _safe_id(page.get("id"), "페이지 ID")
         for page in queried_pages
+        if (
+            not page.get("in_trash")
+            and _is_target_parent(page, data_source_id)
+        )
     }
     missing = [
         str(entry["page_id"])
@@ -637,6 +668,11 @@ def _full_preflight(
     if missing:
         raise MigrationError(
             f"데이터 소스에서 계획 페이지를 찾을 수 없습니다: {','.join(missing)}"
+        )
+    planned_ids = {str(entry["page_id"]) for entry in entries}
+    if require_exact_scope and queried_ids != planned_ids:
+        raise MigrationError(
+            "전체 페이지 범위가 계획 생성 이후 변경되었습니다"
         )
     return {
         str(entry["page_id"]): _current_entry_state(
@@ -734,8 +770,19 @@ def apply_migration_plan(
         raise MigrationError(
             "Notion 동기화 속성 스키마가 계획 생성 이후 변경되었습니다"
         )
-    first_states = _full_preflight(token, data_source_id, entries)
-    second_states = _full_preflight(token, data_source_id, entries)
+    require_exact_scope = plan["selection"] == "all_pages"
+    first_states = _full_preflight(
+        token,
+        data_source_id,
+        entries,
+        require_exact_scope=require_exact_scope,
+    )
+    second_states = _full_preflight(
+        token,
+        data_source_id,
+        entries,
+        require_exact_scope=require_exact_scope,
+    )
     if first_states != second_states:
         raise MigrationError("전체 사전 검증 사이에 페이지 상태가 변경되었습니다")
     applied_now: list[JsonObject] = []
@@ -802,6 +849,19 @@ def _write_plan(plan: JsonObject, output: Optional[Path]) -> None:
             handle.write(text)
     except FileExistsError as exc:
         raise MigrationError(f"출력 파일이 이미 존재합니다: {output}") from exc
+    sys.stdout.write(
+        json.dumps(
+            {
+                "selection": plan["selection"],
+                "total": len(cast(list[JsonObject], plan["pages"])),
+                "confirmation": plan["confirmation"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -809,7 +869,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         description="기존 Notion 공지 페이지의 동기화 메타데이터 이관 계획을 생성하거나 적용합니다"
     )
     parser.add_argument("--data-source-id")
-    parser.add_argument("--page-id", action="append", default=[])
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--page-id", action="append", default=[])
+    selection.add_argument("--all-pages", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--plan", type=Path)
@@ -827,9 +889,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.apply:
         if args.plan is None:
             raise MigrationError("--apply에는 --plan이 필요합니다")
-        if args.output is not None or args.page_id or args.data_source_id:
+        if (
+            args.output is not None
+            or args.page_id
+            or args.all_pages
+            or args.data_source_id
+        ):
             raise MigrationError(
-                "--apply에는 --output, --page-id 또는 --data-source-id를 사용할 수 없습니다"
+                "--apply에는 계획 생성 옵션을 사용할 수 없습니다"
             )
         plan = _read_plan(args.plan)
         result = apply_migration_plan(
@@ -843,7 +910,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             ),
         )
         sys.stdout.write(
-            json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            json.dumps(
+                {
+                    "applied": len(cast(list[str], result["applied"])),
+                    "already_applied": len(
+                        cast(list[str], result["already_applied"])
+                    ),
+                    "total": result["total"],
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
         )
         return 0
     if args.plan is not None or args.confirm or args.allow_write:
@@ -855,12 +934,31 @@ def main(argv: Optional[list[str]] = None) -> int:
         or os.environ.get("NOTION_DATA_SOURCE_ID", "")
     ).strip()
     if not data_source_id:
+        database_id = os.environ.get("NOTION_DB_ID", "").strip()
+        if not database_id:
+            raise MigrationError(
+                "--data-source-id, NOTION_DATA_SOURCE_ID 또는 "
+                "NOTION_DB_ID가 필요합니다"
+            )
+        try:
+            data_source_id = resolve_notion_data_source_id(token, database_id)
+        except (
+            NotionDataSourceResolutionError,
+            NotionRequestError,
+        ) as exc:
+            raise MigrationError(
+                f"Notion 데이터 소스를 확인할 수 없습니다: {exc}"
+            ) from exc
+    if not args.page_id and not args.all_pages:
         raise MigrationError(
-            "--data-source-id 또는 NOTION_DATA_SOURCE_ID가 필요합니다"
+            "계획 생성에는 --page-id 또는 --all-pages가 필요합니다"
         )
-    if not args.page_id:
-        raise MigrationError("계획 생성에는 --page-id를 하나 이상 지정해야 합니다")
-    plan = build_migration_plan(token, data_source_id, list(args.page_id))
+    plan = build_migration_plan(
+        token,
+        data_source_id,
+        list(args.page_id),
+        all_pages=bool(args.all_pages),
+    )
     _write_plan(plan, args.output)
     return 0
 
