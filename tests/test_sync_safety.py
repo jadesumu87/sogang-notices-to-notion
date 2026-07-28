@@ -4404,6 +4404,11 @@ class SyncSafetyTests(unittest.TestCase):
             ),
             patch.object(
                 sync_engine,
+                "retrieve_page",
+                return_value=existing,
+            ),
+            patch.object(
+                sync_engine,
                 "destination_quote_fingerprint",
                 return_value="quote-state",
             ),
@@ -4471,7 +4476,7 @@ class SyncSafetyTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
-                "사전검증 이후 대상",
+                "적용 직전 대상",
             ):
                 sync_engine.apply_report(
                     "token",
@@ -4513,7 +4518,12 @@ class SyncSafetyTests(unittest.TestCase):
             patch.object(
                 sync_engine,
                 "find_existing_page",
-                side_effect=[initial, initial, edited],
+                side_effect=[initial, initial],
+            ),
+            patch.object(
+                sync_engine,
+                "retrieve_page",
+                return_value=edited,
             ),
             patch.object(
                 sync_engine,
@@ -4582,6 +4592,11 @@ class SyncSafetyTests(unittest.TestCase):
                 sync_engine,
                 "find_existing_page",
                 side_effect=find_page,
+            ),
+            patch.object(
+                sync_engine,
+                "retrieve_page",
+                return_value=initial,
             ),
             patch.object(
                 sync_engine,
@@ -4932,6 +4947,11 @@ class SyncSafetyTests(unittest.TestCase):
             ),
             patch.object(
                 sync_engine,
+                "retrieve_page",
+                return_value=existing,
+            ),
+            patch.object(
+                sync_engine,
                 "destination_quote_fingerprint",
                 return_value="quote-state",
             ),
@@ -4975,6 +4995,11 @@ class SyncSafetyTests(unittest.TestCase):
             patch.object(
                 sync_engine,
                 "find_existing_page",
+                return_value=existing,
+            ),
+            patch.object(
+                sync_engine,
+                "retrieve_page",
                 return_value=existing,
             ),
             patch.object(
@@ -5474,6 +5499,11 @@ class SyncSafetyTests(unittest.TestCase):
             patch.object(
                 sync_engine,
                 "validate_destination_preflight_entry",
+                return_value=existing,
+            ),
+            patch.object(
+                sync_engine,
+                "retrieve_page",
                 return_value=existing,
             ),
             patch.object(

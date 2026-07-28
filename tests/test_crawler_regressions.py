@@ -2852,6 +2852,11 @@ class DestructiveMutationRegressionTests(unittest.TestCase):
             ),
             patch.object(
                 sync_engine,
+                "retrieve_page",
+                return_value=preflight.existing_page,
+            ),
+            patch.object(
+                sync_engine,
                 "apply_item",
                 side_effect=lambda *args, **kwargs: applied.append(
                     "applied"

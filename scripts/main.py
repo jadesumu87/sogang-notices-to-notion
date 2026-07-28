@@ -294,7 +294,8 @@ def collect_report(
             )
             LOGGER.info(
                 "수집 계획: 출처=%s, 모드=%s, 상세 한도=%s, "
-                "시작 페이지=%s, 백필=%s, 최근 조정 시도=%s",
+                "시작 페이지=%s, 백필=%s, 최근 조정 시도=%s, "
+                "재확인 대상=%s",
                 config_fk,
                 (
                     "과거 보강"
@@ -321,6 +322,7 @@ def collect_report(
                     if isinstance(source_state, dict)
                     else "-"
                 ),
+                len(refresh_ids_by_source[config_fk]),
             )
         report: CrawlReport = crawl_sources(
             known_ids_by_source=known_ids_by_source,

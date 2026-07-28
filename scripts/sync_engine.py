@@ -1670,6 +1670,8 @@ def apply_item(
 def resolve_destination_preflight(
     context: DestinationContext,
     items: list[dict[str, Any]],
+    *,
+    atomic_recheck: bool = True,
 ) -> list[DestinationPreflight]:
     resolved: list[DestinationPreflight] = []
     page_owners: dict[str, str] = {}
@@ -1808,47 +1810,54 @@ def resolve_destination_preflight(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    for entry_index, entry in enumerate(resolved, start=1):
-        log_destination_progress(
-            "원자성 재확인",
-            entry_index,
+    if atomic_recheck:
+        for entry_index, entry in enumerate(resolved, start=1):
+            log_destination_progress(
+                "원자성 재확인",
+                entry_index,
+                len(resolved),
+                entry.item,
+            )
+            current = find_existing_page(
+                context.token,
+                context.database_id,
+                entry.item.get("url"),
+                entry.item["title"],
+                entry.item.get("date"),
+                source_id=str(entry.item["source_id"]),
+                notice_id=str(entry.item["notice_id"]),
+            )
+            expected_page_id = (
+                str(entry.existing_page.get("id") or "").strip()
+                if entry.existing_page
+                else ""
+            )
+            current_page_id = (
+                str(current.get("id") or "").strip()
+                if current
+                else ""
+            )
+            if current_page_id != expected_page_id:
+                raise RuntimeError(
+                    "목적지 사전검증 이후 대상이 변경되었습니다: "
+                    f"{entry.shrink_key}"
+                )
+            if managed_page_fingerprint(current) != entry.page_fingerprint:
+                raise RuntimeError(
+                    "목적지 사전검증 이후 관리 상태가 변경되었습니다: "
+                    f"{entry.shrink_key}"
+                )
+        LOGGER.info(
+            "목적지 원자적 사전검증 완료: 항목=%s, 계획=%s",
             len(resolved),
-            entry.item,
+            plan_hash[:16],
         )
-        current = find_existing_page(
-            context.token,
-            context.database_id,
-            entry.item.get("url"),
-            entry.item["title"],
-            entry.item.get("date"),
-            source_id=str(entry.item["source_id"]),
-            notice_id=str(entry.item["notice_id"]),
+    else:
+        LOGGER.info(
+            "목적지 원자성 재확인 통합: 항목=%s, 계획=%s",
+            len(resolved),
+            plan_hash[:16],
         )
-        expected_page_id = (
-            str(entry.existing_page.get("id") or "").strip()
-            if entry.existing_page
-            else ""
-        )
-        current_page_id = (
-            str(current.get("id") or "").strip()
-            if current
-            else ""
-        )
-        if current_page_id != expected_page_id:
-            raise RuntimeError(
-                "목적지 사전검증 이후 대상이 변경되었습니다: "
-                f"{entry.shrink_key}"
-            )
-        if managed_page_fingerprint(current) != entry.page_fingerprint:
-            raise RuntimeError(
-                "목적지 사전검증 이후 관리 상태가 변경되었습니다: "
-                f"{entry.shrink_key}"
-            )
-    LOGGER.info(
-        "목적지 원자적 사전검증 완료: 항목=%s, 계획=%s",
-        len(resolved),
-        plan_hash[:16],
-    )
     return resolved
 
 
@@ -1906,6 +1915,26 @@ def validate_destination_preflight_entry(
                 "목적지 적용 직전 본문 블록이 변경되었습니다: "
                 f"{entry.shrink_key}"
             )
+    return current
+
+
+def refresh_destination_preflight_entry(
+    context: DestinationContext,
+    entry: DestinationPreflight,
+) -> Optional[dict[str, Any]]:
+    expected_page_id = (
+        str(entry.existing_page.get("id") or "").strip()
+        if entry.existing_page
+        else ""
+    )
+    if not expected_page_id:
+        return validate_destination_preflight_entry(context, entry)
+    current = retrieve_page(context.token, expected_page_id)
+    if managed_page_fingerprint(current) != entry.page_fingerprint:
+        raise RuntimeError(
+            "목적지 적용 직전 대상이 변경되었습니다: "
+            f"{entry.shrink_key}"
+        )
     return current
 
 
@@ -2195,7 +2224,11 @@ def _apply_report(
         for item in prepare_source_items(result)
     ]
     context = prepare_destination(token, database_id, items)
-    preflight = resolve_destination_preflight(context, items)
+    preflight = resolve_destination_preflight(
+        context,
+        items,
+        atomic_recheck=False,
+    )
     state = previous_state or {}
     source_states = state.get("sources", {})
     shrink_candidates = state.get("shrink_candidates", {})
@@ -2305,7 +2338,7 @@ def _apply_report(
             counters.unchanged += 1
             continue
         counters.shrink_candidate_clears.append(entry.shrink_key)
-        current_page = validate_destination_preflight_entry(
+        current_page = refresh_destination_preflight_entry(
             context,
             entry,
         )
