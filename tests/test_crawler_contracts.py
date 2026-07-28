@@ -541,6 +541,26 @@ class CrawlerContractTests(unittest.TestCase):
         self.assertEqual(result.observed_count, 1)
         self.assertEqual(len(result.items), 1)
 
+    def test_crawl_accepts_top_entry_after_non_top_entry(self):
+        top_entry = {
+            **NORMAL_ENTRY,
+            "pkId": "1002",
+            "isTop": "Y",
+        }
+        result = self.crawl_with_pages(
+            [
+                list_page([NORMAL_ENTRY, top_entry]),
+                list_page([]),
+            ]
+        )
+
+        self.assertTrue(result.write_safe)
+        self.assertEqual(result.observed_ids, ["1001", "1002"])
+        self.assertEqual(
+            [item["top"] for item in result.items],
+            [False, True],
+        )
+
     def test_crawl_confirmed_empty_result_is_write_safe(self):
         result = self.crawl_with_pages([list_page([])])
 

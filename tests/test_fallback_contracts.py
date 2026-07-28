@@ -212,6 +212,22 @@ class FallbackContractTests(unittest.TestCase):
         self.assertEqual(result.fallback_from_error, "api_failed")
         self.assertEqual([item["notice_id"] for item in result.items], ["1001"])
 
+    def test_fallback_accepts_top_entry_after_non_top_entry(self):
+        first = self.entry("1001")
+        pinned = self.entry("1002", top=True)
+        result = self.crawl(
+            {
+                1: self.page(1, [first, pinned]),
+                2: self.page(2, [], explicit_empty=True),
+            }
+        )
+
+        self.assertTrue(result.write_safe)
+        self.assertEqual(
+            [item["top"] for item in result.items],
+            [False, True],
+        )
+
     def test_missing_selector_waf_and_unverified_empty_are_not_write_safe(self):
         for failure in (
             self.page(1, [], ok=False, error="fallback_list_contract_invalid"),

@@ -15,6 +15,16 @@ on:
         required: true
         type: boolean
         default: false
+      existing_pages_migration:
+        description: 기존 공지 페이지의 이관 계획을 생성하거나 적용
+        required: true
+        type: boolean
+        default: false
+      existing_pages_confirmation:
+        description: 계획 실행 로그의 전체 확인 문자열
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -28,7 +38,7 @@ jobs:
     name: Crawl and sync
     if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 60
     env:
       TZ: Asia/Seoul
       PYTHONHASHSEED: "0"
@@ -70,9 +80,23 @@ jobs:
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           SCHEMA_MIGRATION: ${{ inputs.schema_migration }}
+          EXISTING_PAGES_MIGRATION: ${{ inputs.existing_pages_migration }}
+          EXISTING_PAGES_CONFIRMATION: ${{ inputs.existing_pages_confirmation }}
         run: |
           if [[ "$DRY_RUN" == "true" && "$SCHEMA_MIGRATION" == "true" ]]; then
             echo "::error::드라이런과 스키마 갱신을 동시에 선택할 수 없습니다."
+            exit 1
+          fi
+          if [[ "$SCHEMA_MIGRATION" == "true" && "$EXISTING_PAGES_MIGRATION" == "true" ]]; then
+            echo "::error::스키마 갱신과 기존 페이지 이관을 동시에 실행할 수 없습니다."
+            exit 1
+          fi
+          if [[ "$EXISTING_PAGES_MIGRATION" != "true" && -n "$EXISTING_PAGES_CONFIRMATION" ]]; then
+            echo "::error::기존 페이지 이관을 선택하지 않은 실행에는 확인 문자열을 사용할 수 없습니다."
+            exit 1
+          fi
+          if [[ "$DRY_RUN" == "true" && -n "$EXISTING_PAGES_CONFIRMATION" ]]; then
+            echo "::error::기존 페이지 이관 적용에는 드라이런을 해제해야 합니다."
             exit 1
           fi
 
@@ -86,9 +110,11 @@ jobs:
         run: python -m pip check
 
       - name: Install Playwright browser
+        if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.schema_migration && !inputs.existing_pages_migration) }}
         run: python -m playwright install --with-deps chromium
 
       - name: Run crawler
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.existing_pages_migration }}
         run: python main.py
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -97,6 +123,25 @@ jobs:
           SYNC_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
           NOTION_SCHEMA_MIGRATION: ${{ github.event_name == 'workflow_dispatch' && inputs.schema_migration && '1' || '0' }}
           NOTION_SCHEMA_MIGRATION_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.schema_migration && '1' || '0' }}
+
+      - name: Run existing page migration
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.existing_pages_migration }}
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+          NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+          MIGRATION_CONFIRMATION: ${{ inputs.existing_pages_confirmation }}
+        run: |
+          mkdir -p .runtime
+          python scripts/migrate_existing_pages.py \
+            --all-pages \
+            --output .runtime/existing-pages-migration.json
+          if [[ -n "$MIGRATION_CONFIRMATION" ]]; then
+            python scripts/migrate_existing_pages.py \
+              --apply \
+              --plan .runtime/existing-pages-migration.json \
+              --confirm "$MIGRATION_CONFIRMATION"
+          fi
 
       - name: Prepare public crawler state
         if: ${{ always() && hashFiles('.runtime/run-state.json') != '' }}

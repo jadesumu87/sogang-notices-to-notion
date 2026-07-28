@@ -452,14 +452,14 @@ def persist_failed_run(
         report,
         exception=exc,
     )
-    suppressed = apply_failure_signal_policy(state, incident)
+    deduplicated = apply_failure_signal_policy(state, incident)
     append_run_record(state, record)
     write_run_state_atomic(state_path, state)
     write_json_atomic(incident_path, incident)
-    return incident, suppressed
+    return incident, deduplicated
 
 
-def should_suppress_repeated_scheduled_failure(
+def should_deduplicate_scheduled_failure_notice(
     incident: dict[str, Any],
 ) -> bool:
     return (
@@ -474,25 +474,26 @@ def apply_failure_signal_policy(
     state: dict[str, Any],
     incident: dict[str, Any],
 ) -> bool:
-    suppressed = should_suppress_repeated_scheduled_failure(incident)
-    if not suppressed and not mark_failure_signaled(state, incident):
+    deduplicated = should_deduplicate_scheduled_failure_notice(incident)
+    if not deduplicated and not mark_failure_signaled(state, incident):
         raise RuntimeError("반복 실패 상태를 기록할 수 없습니다")
-    return suppressed
+    return deduplicated
 
 
-def report_suppressed_failure(incident: dict[str, Any]) -> None:
+def report_deduplicated_failure(incident: dict[str, Any]) -> None:
     category = str(incident.get("category") or "unknown")
     count = int(incident.get("count") or 1)
     LOGGER.warning(
-        "동일한 예약 실행 실패가 반복되어 이번 종료 신호를 생략합니다: "
+        "동일한 예약 실행 실패 알림을 중복 기록하지 않습니다. "
+        "실행 결과는 실패로 유지됩니다: "
         "유형=%s, 누적=%s",
         category,
         count,
     )
     if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
         print(
-            "::warning title=반복 실패 대기::"
-            "동일 장애의 반복 종료 신호를 설정된 간격까지 생략했습니다. "
+            "::warning title=반복 실패 지속::"
+            "동일 장애 알림 지문은 유지했으며 Actions 실행 결과는 실패로 기록합니다. "
             f"유형={category}, 누적={count}"
         )
 
@@ -536,7 +537,7 @@ def main() -> None:
     lock_path = state_path.with_name("run.lock")
     deferred_error: Optional[RuntimeError] = None
     deferred_incident: Optional[dict[str, Any]] = None
-    deferred_failure_suppressed = False
+    deferred_failure_deduplicated = False
 
     with exclusive_run_lock(lock_path):
         state = load_run_state(state_path)
@@ -836,14 +837,14 @@ def main() -> None:
                         counters.writes,
                     )
             if deferred_error is not None and deferred_incident is not None:
-                deferred_failure_suppressed = apply_failure_signal_policy(
+                deferred_failure_deduplicated = apply_failure_signal_policy(
                     state,
                     deferred_incident,
                 )
                 write_run_state_atomic(state_path, state)
                 write_json_atomic(incident_path, deferred_incident)
         except Exception as exc:
-            incident, failure_suppressed = persist_failed_run(
+            incident, failure_deduplicated = persist_failed_run(
                 state,
                 record,
                 exc,
@@ -851,20 +852,18 @@ def main() -> None:
                 state_path,
                 incident_path,
             )
-            if failure_suppressed:
+            if failure_deduplicated:
                 LOGGER.warning(
                     "전체 동기화 실패가 반복됐습니다",
                     exc_info=True,
                 )
-                report_suppressed_failure(incident)
-                return
+                report_deduplicated_failure(incident)
             LOGGER.exception("전체 동기화 실패")
             raise
 
     if deferred_error is not None:
-        if deferred_failure_suppressed and deferred_incident is not None:
-            report_suppressed_failure(deferred_incident)
-            return
+        if deferred_failure_deduplicated and deferred_incident is not None:
+            report_deduplicated_failure(deferred_incident)
         LOGGER.error("동기화 안전 차단: %s", deferred_error)
         raise deferred_error
 

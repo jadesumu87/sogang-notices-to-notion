@@ -104,6 +104,23 @@ class CiScriptTests(unittest.TestCase):
             "NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}",
             workflow,
         )
+        self.assertGreaterEqual(
+            workflow.count("NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}"),
+            2,
+        )
+        self.assertIn("existing_pages_migration:", workflow)
+        self.assertIn("existing_pages_confirmation:", workflow)
+        self.assertIn("--all-pages", workflow)
+        self.assertIn(
+            'if [[ -n "$MIGRATION_CONFIRMATION" ]]',
+            workflow,
+        )
+        self.assertIn(
+            "github.event_name != 'workflow_dispatch' || "
+            "(!inputs.schema_migration && "
+            "!inputs.existing_pages_migration)",
+            workflow,
+        )
         self.assertIn(
             "hashFiles('.runtime/run-state.json') != '' && "
             "hashFiles('.runtime/public-run-state.json') != ''",

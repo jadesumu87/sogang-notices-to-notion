@@ -490,7 +490,7 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertTrue(rate_limit_incident["should_signal_failure"])
         self.assertEqual(rate_limit_incident["count"], 1)
 
-    def test_scheduled_duplicate_failure_is_suppressed_until_repeat(self):
+    def test_scheduled_duplicate_failure_notice_is_deduplicated_until_repeat(self):
         state = default_run_state()
         fixed_now = datetime.now(timezone.utc).replace(
             microsecond=0
@@ -512,7 +512,7 @@ class CrawlerRegressionTests(unittest.TestCase):
                 "출처 실패",
                 "동일 장애",
             )
-            first_suppressed = (
+            first_deduplicated = (
                 crawler_main.apply_failure_signal_policy(state, first)
             )
             second = build_incident(
@@ -521,17 +521,17 @@ class CrawlerRegressionTests(unittest.TestCase):
                 "출처 실패",
                 "동일 장애",
             )
-            second_suppressed = (
+            second_deduplicated = (
                 crawler_main.apply_failure_signal_policy(state, second)
             )
 
-        self.assertFalse(first_suppressed)
-        self.assertTrue(second_suppressed)
+        self.assertFalse(first_deduplicated)
+        self.assertTrue(second_deduplicated)
         self.assertTrue(first["should_signal_failure"])
         self.assertFalse(second["should_signal_failure"])
         self.assertEqual(second["count"], 2)
 
-    def test_manual_duplicate_failure_is_never_suppressed(self):
+    def test_manual_duplicate_failure_notice_is_never_deduplicated(self):
         state = default_run_state()
         fixed_now = datetime.now(timezone.utc).replace(
             microsecond=0
@@ -562,15 +562,15 @@ class CrawlerRegressionTests(unittest.TestCase):
                 "출처 실패",
                 "동일 장애",
             )
-            suppressed = crawler_main.apply_failure_signal_policy(
+            deduplicated = crawler_main.apply_failure_signal_policy(
                 state,
                 second,
             )
 
-        self.assertFalse(suppressed)
+        self.assertFalse(deduplicated)
         self.assertTrue(second["should_signal_failure"])
 
-    def test_scheduled_job_rerun_is_never_suppressed(self):
+    def test_scheduled_job_rerun_notice_is_never_deduplicated(self):
         state = default_run_state()
         fixed_now = datetime.now(timezone.utc).replace(
             microsecond=0
@@ -611,13 +611,82 @@ class CrawlerRegressionTests(unittest.TestCase):
                 "출처 실패",
                 "동일 장애",
             )
-            suppressed = crawler_main.apply_failure_signal_policy(
+            deduplicated = crawler_main.apply_failure_signal_policy(
                 state,
                 rerun,
             )
 
-        self.assertFalse(suppressed)
+        self.assertFalse(deduplicated)
         self.assertTrue(rerun["should_signal_failure"])
+
+    def test_scheduled_duplicate_failure_still_raises_from_main(self):
+        state = default_run_state()
+        error = RuntimeError("scheduled failure sentinel")
+        first = build_incident(
+            state,
+            FailureCategory.INTERNAL,
+            "서강대 공지 동기화 실패",
+            str(error),
+            exception=error,
+        )
+        self.assertTrue(run_state.mark_failure_signaled(state, first))
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+        temp_dir = Path(temp_directory.name)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "NOTION_TOKEN": "token",
+                    "NOTION_DB_ID": "database",
+                    "GITHUB_ACTIONS": "true",
+                    "GITHUB_EVENT_NAME": "schedule",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "FAILURE_REPEAT_SECONDS": "21600",
+                },
+            ),
+            patch.multiple(
+                crawler_main,
+                setup_logging=Mock(),
+                load_dotenv=Mock(),
+                log_environment_info=Mock(),
+                install_run_control=Mock(),
+                is_writer_context_confirmed=Mock(return_value=True),
+                should_run_dry_run=Mock(return_value=False),
+                should_run_notion_schema_migration_only=Mock(
+                    return_value=False
+                ),
+                should_use_incremental_crawl=Mock(return_value=True),
+                get_bbs_config_fks=Mock(return_value=["141"]),
+                should_full_reconcile=Mock(return_value=False),
+                get_run_state_path=Mock(
+                    return_value=temp_dir / "run-state.json"
+                ),
+                get_snapshot_path=Mock(
+                    return_value=temp_dir / "snapshot.json"
+                ),
+                get_incident_path=Mock(
+                    return_value=temp_dir / "incident.json"
+                ),
+                load_run_state=Mock(return_value=state),
+                collect_report=Mock(side_effect=error),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "scheduled failure sentinel",
+            ),
+        ):
+            crawler_main.main()
+
+        incident = json.loads(
+            (temp_dir / "incident.json").read_text(encoding="utf-8")
+        )
+        recorded_state = json.loads(
+            (temp_dir / "run-state.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(incident["should_signal_failure"])
+        self.assertEqual(recorded_state["runs"][-1]["status"], "failed")
 
     def test_main_passes_configured_sources_to_validation(self):
         collected = CrawlReport(sources=[crawl_result()])
