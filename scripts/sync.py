@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -2311,6 +2312,21 @@ def rich_text_value_from_payload(value: JsonObject) -> str:
     return "".join(parts).strip()
 
 
+def canonical_date_value(value: object) -> str:
+    text = str(value or "").strip()
+    if not text or re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    normalized = f"{text[:-1]}+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return text
+    parsed = parsed.replace(second=0, microsecond=0)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat(timespec="minutes")
+
+
 def canonical_property_value(value: JsonObject) -> object:
     property_type = value.get("type")
     if property_type in {"title", "rich_text"}:
@@ -2325,7 +2341,11 @@ def canonical_property_value(value: JsonObject) -> object:
         return bool(value.get("checkbox"))
     if "date" in value:
         date_value = value.get("date")
-        return str(date_value.get("start") or "") if isinstance(date_value, dict) else ""
+        return (
+            canonical_date_value(date_value.get("start"))
+            if isinstance(date_value, dict)
+            else ""
+        )
     if "select" in value:
         select = value.get("select")
         return str(select.get("name") or "") if isinstance(select, dict) else ""
