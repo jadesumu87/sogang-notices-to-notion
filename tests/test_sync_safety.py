@@ -627,6 +627,42 @@ class SyncSafetyTests(unittest.TestCase):
             [paragraph_block("둘째 문단")],
         )
 
+    def test_default_block_color_matches_omitted_source_color(self):
+        for block_type in sync.DEFAULT_COLOR_BLOCK_TYPES:
+            with self.subTest(block_type=block_type):
+                source = {
+                    "type": block_type,
+                    block_type: {},
+                }
+                notion = copy.deepcopy(source)
+                notion[block_type]["color"] = "default"
+
+                self.assertEqual(
+                    sync.block_content_signature(
+                        "token",
+                        source,
+                        False,
+                    ),
+                    sync.block_content_signature(
+                        "token",
+                        notion,
+                        False,
+                    ),
+                )
+                notion[block_type]["color"] = "red"
+                self.assertNotEqual(
+                    sync.block_content_signature(
+                        "token",
+                        source,
+                        False,
+                    ),
+                    sync.block_content_signature(
+                        "token",
+                        notion,
+                        False,
+                    ),
+                )
+
     def test_split_body_parts_preserves_first_real_block_after_empty_prefix(self):
         visible = paragraph_block("첫 문단")
         heading = {
