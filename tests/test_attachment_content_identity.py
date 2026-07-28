@@ -633,6 +633,65 @@ class BodyMediaContentIdentityTests(unittest.TestCase):
             self.old_hash,
         )
 
+    def test_verified_legacy_media_without_upload_id_is_drift(self) -> None:
+        state = self.media_state("image", "stable/path")
+        state[0].pop("upload_id")
+        with (
+            patch.object(
+                sync,
+                "find_sync_container_block",
+                return_value={"id": "container"},
+            ),
+            patch.object(
+                sync,
+                "list_block_children",
+                return_value=[
+                    self.hosted_block("image", "stable/path")
+                ],
+            ),
+        ):
+            reusable, status = (
+                sync.inspect_existing_uploaded_media_blocks(
+                    "token",
+                    "page",
+                    state,
+                )
+            )
+
+        self.assertEqual(reusable, {})
+        self.assertEqual(status, "drift")
+
+    def test_ambiguous_legacy_media_without_upload_id_is_unavailable(
+        self,
+    ) -> None:
+        state = self.media_state("image", "stable/path")
+        state[0].pop("upload_id")
+        state[0].pop("hosted_file_key")
+        with (
+            patch.object(
+                sync,
+                "find_sync_container_block",
+                return_value={"id": "container"},
+            ),
+            patch.object(
+                sync,
+                "list_block_children",
+                return_value=[
+                    self.hosted_block("image", "stable/path")
+                ],
+            ),
+        ):
+            reusable, status = (
+                sync.inspect_existing_uploaded_media_blocks(
+                    "token",
+                    "page",
+                    state,
+                )
+            )
+
+        self.assertEqual(reusable, {})
+        self.assertEqual(status, "unavailable")
+
     def test_hosted_media_read_failure_is_unavailable(self) -> None:
         with patch.object(
             sync,

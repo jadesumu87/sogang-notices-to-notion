@@ -1078,16 +1078,17 @@ def inspect_existing_uploaded_media_blocks(
             upload_id = str(meta.get("upload_id") or "").strip()
             block_id = str(meta.get("block_id") or "").strip()
             hosted_file_key = str(meta.get("hosted_file_key") or "").strip()
-            if not upload_id or not block_id:
+            if not block_id:
                 LOGGER.info("기존 본문 미디어 재사용 생략: 상태 값 누락")
                 return {}, "unavailable"
-            if upload_id in seen_upload_ids:
+            if upload_id and upload_id in seen_upload_ids:
                 LOGGER.info(
                     "기존 본문 미디어 재사용 생략: 상태에서 중복 업로드 ID 감지 (%s)",
                     upload_id,
                 )
                 return {}, "unavailable"
-            seen_upload_ids.add(upload_id)
+            if upload_id:
+                seen_upload_ids.add(upload_id)
             matched_block = blocks_by_id.get(block_id)
             if not matched_block:
                 LOGGER.info(
@@ -1119,6 +1120,16 @@ def inspect_existing_uploaded_media_blocks(
                         block_id,
                     )
                     return {}, "drift"
+            if not upload_id:
+                if not hosted_file_key:
+                    LOGGER.info(
+                        "기존 본문 미디어 재사용 생략: 과거 상태의 호스팅 파일 식별자 누락"
+                    )
+                    return {}, "unavailable"
+                LOGGER.info(
+                    "기존 본문 미디어 재사용 생략: 과거 상태의 업로드 ID 누락"
+                )
+                return {}, "drift"
             sanitized = sanitize_uploaded_media_block(
                 matched_block,
                 upload_id,
