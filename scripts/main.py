@@ -203,6 +203,7 @@ def collect_report(
     state: dict[str, Any],
     full_reconcile: bool,
     force_all_reconcile: bool = False,
+    record_reconcile_attempts: bool = False,
 ) -> CrawlReport:
     html_path = resolve_html_path()
     if html_path is None:
@@ -226,6 +227,16 @@ def collect_report(
             )
             for config_fk in config_fks
         }
+        if record_reconcile_attempts:
+            reconcile_attempt_at = utc_now_iso()
+            for config_fk, reconcile_requested in reconcile_by_source.items():
+                if not reconcile_requested:
+                    continue
+                source_state = source_states.setdefault(config_fk, {})
+                if isinstance(source_state, dict):
+                    source_state["last_reconcile_attempt_at"] = (
+                        reconcile_attempt_at
+                    )
         incremental_by_source = {
             config_fk: bool(
                 not force_all_reconcile
@@ -265,6 +276,52 @@ def collect_report(
             )
             for config_fk in config_fks
         }
+        resume_pages_by_source = {
+            config_fk: (
+                backfill_resume_page(
+                    source_states.get(config_fk, {})
+                )
+                if reconcile_by_source[config_fk]
+                else 1
+            )
+            for config_fk in config_fks
+        }
+        for config_fk in config_fks:
+            source_state = source_states.get(config_fk, {})
+            backfill_active = bool(
+                isinstance(source_state, dict)
+                and source_state.get("backfill_active")
+            )
+            LOGGER.info(
+                "수집 계획: 출처=%s, 모드=%s, 상세 한도=%s, "
+                "시작 페이지=%s, 백필=%s, 최근 조정 시도=%s",
+                config_fk,
+                (
+                    "과거 보강"
+                    if reconcile_by_source[config_fk]
+                    else "증분"
+                ),
+                (
+                    get_backfill_detail_limit()
+                    if reconcile_by_source[config_fk]
+                    else "-"
+                ),
+                resume_pages_by_source[config_fk],
+                (
+                    "진행"
+                    if reconcile_by_source[config_fk] and backfill_active
+                    else ("대기" if backfill_active else "-")
+                ),
+                (
+                    str(
+                        source_state.get("last_reconcile_attempt_at")
+                        or source_state.get("last_success_at")
+                        or "-"
+                    )
+                    if isinstance(source_state, dict)
+                    else "-"
+                ),
+            )
         report: CrawlReport = crawl_sources(
             known_ids_by_source=known_ids_by_source,
             source_state_by_source=source_states,
@@ -273,16 +330,7 @@ def collect_report(
             reconcile_mode=full_reconcile,
             reconcile_mode_by_source=reconcile_by_source,
             refresh_ids_by_source=refresh_ids_by_source,
-            resume_page_by_source={
-                config_fk: (
-                    backfill_resume_page(
-                        source_states.get(config_fk, {})
-                    )
-                    if reconcile_by_source[config_fk]
-                    else 1
-                )
-                for config_fk in config_fks
-            },
+            resume_page_by_source=resume_pages_by_source,
             resume_anchor_ids_by_source={
                 config_fk: (
                     {
@@ -604,6 +652,7 @@ def main() -> None:
                     state,
                     full_reconcile,
                     force_all_reconcile=not incremental_enabled,
+                    record_reconcile_attempts=not dry_run,
                 ),
                 state,
                 full_reconcile=full_reconcile,

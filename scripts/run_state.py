@@ -43,6 +43,7 @@ PUBLIC_CACHE_SOURCE_FIELDS = frozenset(
         "last_fallback_failure_at",
         "last_full_reconcile_at",
         "last_item_count",
+        "last_reconcile_attempt_at",
         "last_success_at",
         "last_top_observed_ids",
         "method",
@@ -454,6 +455,7 @@ def validate_run_state_payload(payload: Any) -> dict[str, Any]:
         for timestamp_name in (
             "last_coverage_reconcile_at",
             "last_full_reconcile_at",
+            "last_reconcile_attempt_at",
         ):
             timestamp = source_state.get(timestamp_name)
             if (
@@ -702,21 +704,38 @@ def source_reconcile_due(
     source_state = sources.get(config_fk)
     if not isinstance(source_state, dict):
         return True
-    if (
-        source_state.get("backfill_active")
-        or source_state.get("empty_confirmation_pending")
-    ):
+    if source_state.get("empty_confirmation_pending"):
         return True
     if interval_hours <= 0:
         return True
-    last = parse_iso_datetime(
-        str(
-            source_state.get("last_coverage_reconcile_at")
-            or state.get("last_coverage_reconcile_at")
-            or state.get("last_full_reconcile_at")
-            or ""
-        )
+    last_attempt = parse_iso_datetime(
+        str(source_state.get("last_reconcile_attempt_at") or "")
     )
+    if last_attempt is None and source_state.get("backfill_active"):
+        last_attempt = parse_iso_datetime(
+            str(
+                source_state.get("last_success_at")
+                or source_state.get("last_attempt_at")
+                or source_state.get("backfill_started_at")
+                or ""
+            )
+        )
+    references = [
+        value
+        for value in (
+            last_attempt,
+            parse_iso_datetime(
+                str(
+                    source_state.get("last_coverage_reconcile_at")
+                    or state.get("last_coverage_reconcile_at")
+                    or state.get("last_full_reconcile_at")
+                    or ""
+                )
+            ),
+        )
+        if value is not None
+    ]
+    last = max(references) if references else None
     if last is None:
         return True
     age_seconds = (datetime.now(timezone.utc) - last).total_seconds()
@@ -848,9 +867,30 @@ def update_state_from_report(
             else result.reconcile_requested
         )
         source_state = state["sources"].setdefault(result.source.config_fk, {})
+        previous_last_attempt_at = source_state.get("last_attempt_at")
+        previous_last_success_at = source_state.get("last_success_at")
         source_state["last_attempt_at"] = now
         source_state["status"] = result.status.value
         source_state["method"] = result.method
+        if reconcile_requested:
+            source_state["last_reconcile_attempt_at"] = now
+        elif (
+            source_state.get("backfill_active")
+            and not source_state.get("last_reconcile_attempt_at")
+        ):
+            legacy_reference = parse_iso_datetime(
+                str(
+                    previous_last_success_at
+                    or previous_last_attempt_at
+                    or source_state.get("backfill_started_at")
+                    or ""
+                )
+            )
+            source_state["last_reconcile_attempt_at"] = (
+                legacy_reference.isoformat()
+                if legacy_reference is not None
+                else now
+            )
         if result.write_safe:
             source_state["fallback_consecutive_failures"] = 0
             source_state.pop("fallback_circuit_open_until", None)

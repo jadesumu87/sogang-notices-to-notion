@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -362,6 +362,101 @@ class RunStateTests(unittest.TestCase):
 
         self.assertTrue(
             run_state.source_reconcile_due(state, "new-source", 24)
+        )
+
+    def test_recent_reconcile_attempt_throttles_incomplete_backfill(self):
+        now = datetime.now(timezone.utc)
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "backfill_active": True,
+            "last_reconcile_attempt_at": now.isoformat(),
+            "last_coverage_reconcile_at": (
+                now - timedelta(days=7)
+            ).isoformat(),
+        }
+
+        self.assertFalse(
+            run_state.source_reconcile_due(state, "141", 24)
+        )
+
+        state["sources"]["141"]["last_reconcile_attempt_at"] = (
+            now - timedelta(hours=25)
+        ).isoformat()
+
+        self.assertTrue(
+            run_state.source_reconcile_due(state, "141", 24)
+        )
+
+    def test_legacy_backfill_uses_recent_success_as_attempt_watermark(self):
+        now = datetime.now(timezone.utc)
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "backfill_active": True,
+            "last_success_at": now.isoformat(),
+        }
+
+        self.assertFalse(
+            run_state.source_reconcile_due(state, "141", 24)
+        )
+
+    def test_reconcile_attempt_is_recorded_even_when_source_fails(self):
+        fixed_now = "2026-07-28T00:00:00+00:00"
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "backfill_active": True,
+            "observed_ids": ["old"],
+        }
+        failed = source_result(
+            "141",
+            SourceStatus.FAILED,
+            [],
+            error="temporary_source_error",
+            category=FailureCategory.SOURCE_UPSTREAM,
+        )
+        failed.reconcile_requested = True
+
+        with patch.object(
+            run_state,
+            "utc_now_iso",
+            return_value=fixed_now,
+        ):
+            run_state.update_state_from_report(
+                state,
+                CrawlReport([failed]),
+                full_reconcile=True,
+                applied_source_ids=set(),
+            )
+
+        self.assertEqual(
+            state["sources"]["141"]["last_reconcile_attempt_at"],
+            fixed_now,
+        )
+
+    def test_incremental_run_materializes_legacy_backfill_watermark(self):
+        previous_success = "2026-07-27T00:00:00+00:00"
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "backfill_active": True,
+            "last_success_at": previous_success,
+            "observed_ids": ["old"],
+        }
+        result = source_result(
+            "141",
+            SourceStatus.SUCCESS,
+            ["new"],
+        )
+        result.reconcile_requested = False
+
+        run_state.update_state_from_report(
+            state,
+            CrawlReport([result]),
+            full_reconcile=False,
+            applied_source_ids={"141"},
+        )
+
+        self.assertEqual(
+            state["sources"]["141"]["last_reconcile_attempt_at"],
+            previous_success,
         )
 
     def test_only_successful_source_checkpoint_advances(self):
@@ -764,6 +859,10 @@ class RunStateTests(unittest.TestCase):
         state["active_incidents"][incident["fingerprint"]][
             "private_summary"
         ] = "노출되면 안 되는 값"
+        state["sources"]["141"] = {
+            "backfill_active": True,
+            "last_reconcile_attempt_at": "2026-07-28T00:00:00+00:00",
+        }
         state["state_checksum"] = run_state.state_checksum(state)
 
         projected = run_state.build_public_cache_state(state)
@@ -775,6 +874,10 @@ class RunStateTests(unittest.TestCase):
         )
         self.assertNotIn("private_summary", json.dumps(projected))
         self.assertEqual(projected["last_incident"], active)
+        self.assertEqual(
+            projected["sources"]["141"]["last_reconcile_attempt_at"],
+            "2026-07-28T00:00:00+00:00",
+        )
 
     def test_atomic_json_write_replaces_complete_document(self):
         with tempfile.TemporaryDirectory() as temp_dir:
