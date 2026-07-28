@@ -145,6 +145,22 @@ class DestinationPreflight:
             )
 
 
+def log_destination_progress(
+    stage: str,
+    index: int,
+    total: int,
+    item: dict[str, Any],
+) -> None:
+    LOGGER.info(
+        "목적지 %s 진행: %s/%s, 출처=%s, 공지=%s",
+        stage,
+        index,
+        total,
+        str(item.get("source_id") or "-"),
+        str(item.get("notice_id") or "-"),
+    )
+
+
 def body_sync_requested(item: dict[str, Any]) -> bool:
     return bool(
         item.get("body_blocks")
@@ -1657,7 +1673,14 @@ def resolve_destination_preflight(
 ) -> list[DestinationPreflight]:
     resolved: list[DestinationPreflight] = []
     page_owners: dict[str, str] = {}
-    for item in items:
+    total_items = len(items)
+    for item_index, item in enumerate(items, start=1):
+        log_destination_progress(
+            "사전검증 준비",
+            item_index,
+            total_items,
+            item,
+        )
         if context.has_attachments_property:
             normalize_item_attachments(item)
         source_id = str(item["source_id"])
@@ -1764,6 +1787,7 @@ def resolve_destination_preflight(
                 ),
             )
         )
+    LOGGER.info("목적지 사전검증 준비 완료: 항목=%s", len(resolved))
     plan_hash = hashlib.sha256(
         json.dumps(
             [
@@ -1784,7 +1808,13 @@ def resolve_destination_preflight(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    for entry in resolved:
+    for entry_index, entry in enumerate(resolved, start=1):
+        log_destination_progress(
+            "원자성 재확인",
+            entry_index,
+            len(resolved),
+            entry.item,
+        )
         current = find_existing_page(
             context.token,
             context.database_id,
@@ -1883,8 +1913,19 @@ def validate_destination_preflight_entries(
     context: DestinationContext,
     entries: list[DestinationPreflight],
 ) -> None:
-    for entry in entries:
+    total_entries = len(entries)
+    for entry_index, entry in enumerate(entries, start=1):
+        log_destination_progress(
+            "적용 전 일괄검증",
+            entry_index,
+            total_entries,
+            entry.item,
+        )
         validate_destination_preflight_entry(context, entry)
+    LOGGER.info(
+        "목적지 적용 전 일괄검증 완료: 항목=%s",
+        total_entries,
+    )
 
 
 def current_top_notice_ids(result: SourceCrawlResult) -> set[str]:
@@ -2243,7 +2284,14 @@ def _apply_report(
         active_preflight,
     )
     verified_pending_page_ids: set[str] = set()
-    for entry in active_preflight:
+    total_active_entries = len(active_preflight)
+    for entry_index, entry in enumerate(active_preflight, start=1):
+        log_destination_progress(
+            "항목 처리",
+            entry_index,
+            total_active_entries,
+            entry.item,
+        )
         candidate_confirmed = shrink_candidate_confirmed(
             entry,
             state,
@@ -2312,6 +2360,10 @@ def _apply_report(
         )
         if entry_page_id in pending_page_ids:
             verified_pending_page_ids.add(entry_page_id)
+    LOGGER.info(
+        "목적지 항목 처리 완료: 항목=%s",
+        total_active_entries,
+    )
     remaining_pending = inspect_pending_pages(token, database_id)
     (
         remaining_ids,

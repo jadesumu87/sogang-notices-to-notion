@@ -1648,6 +1648,54 @@ class SyncSafetyTests(unittest.TestCase):
             sync.managed_page_fingerprint(changed),
         )
 
+    def test_preflight_batch_validation_logs_each_item_progress(self):
+        context = sync_engine.DestinationContext("token", "database")
+        entries = [
+            sync_engine.DestinationPreflight(
+                item={"source_id": "141", "notice_id": "1"},
+                existing_page=None,
+                operation_id="operation-1",
+                shrink_key="141:1",
+                shrink_candidate=None,
+            ),
+            sync_engine.DestinationPreflight(
+                item={"source_id": "2", "notice_id": "2"},
+                existing_page=None,
+                operation_id="operation-2",
+                shrink_key="2:2",
+                shrink_candidate=None,
+            ),
+        ]
+
+        with (
+            patch.object(
+                sync_engine,
+                "validate_destination_preflight_entry",
+            ) as validate,
+            self.assertLogs(sync_engine.LOGGER, level="INFO") as logs,
+        ):
+            sync_engine.validate_destination_preflight_entries(
+                context,
+                entries,
+            )
+
+        self.assertEqual(validate.call_count, 2)
+        output = "\n".join(logs.output)
+        self.assertIn(
+            "목적지 적용 전 일괄검증 진행: "
+            "1/2, 출처=141, 공지=1",
+            output,
+        )
+        self.assertIn(
+            "목적지 적용 전 일괄검증 진행: "
+            "2/2, 출처=2, 공지=2",
+            output,
+        )
+        self.assertIn(
+            "목적지 적용 전 일괄검증 완료: 항목=2",
+            output,
+        )
+
     def test_untracked_quote_is_detected_before_destination_mutation(self):
         item = {
             "source_id": "2",
