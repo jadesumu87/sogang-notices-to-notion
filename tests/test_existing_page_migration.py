@@ -60,6 +60,14 @@ def make_page(
                     f"?bbsConfigFk={source_id}"
                 ),
             },
+            "생성 및 편집": {
+                "id": "computed-edit",
+                "type": "formula",
+                "formula": {
+                    "type": "string",
+                    "string": "2026-01-01T00:00:00.000Z",
+                },
+            },
             sync.SYNC_OWNER_PROPERTY: rich_text_property(),
             sync.SOURCE_KEY_PROPERTY: rich_text_property(),
             sync.NOTICE_ID_PROPERTY: rich_text_property(),
@@ -174,6 +182,11 @@ class NotionStore:
                 f"2026-01-01T00:00:0{len(self.patch_payloads)}.000Z"
             )
             self.pages[page_id]["last_edited_by"] = {"id": "integration"}
+            self.pages[page_id]["properties"]["생성 및 편집"]["formula"][
+                "string"
+            ] = (
+                f"2026-01-01T00:00:0{len(self.patch_payloads)}.000Z"
+            )
             if self.corrupt_after_patch and any(
                 value.get("rich_text") for value in properties.values()
             ):
@@ -575,6 +588,41 @@ class ExistingPageMigrationTests(unittest.TestCase):
         self.assertEqual(
             second_plan["pages"][0]["page_fingerprint"],
             first_plan["pages"][0]["page_fingerprint"],
+        )
+
+    def test_page_fingerprint_ignores_computed_property_results(self) -> None:
+        first = make_page()
+        first["properties"]["최근 편집"] = {
+            "id": "last-edit",
+            "type": "last_edited_time",
+            "last_edited_time": "2026-07-28T10:00:00Z",
+        }
+        first["properties"]["관련 공지 수"] = {
+            "id": "rollup",
+            "type": "rollup",
+            "rollup": {
+                "type": "number",
+                "number": 1,
+                "function": "count_all",
+            },
+        }
+        second = copy.deepcopy(first)
+        second["properties"]["생성 및 편집"]["formula"]["string"] = (
+            "2026-07-28T11:00:00Z"
+        )
+        second["properties"]["최근 편집"]["last_edited_time"] = (
+            "2026-07-28T11:00:00Z"
+        )
+        second["properties"]["관련 공지 수"]["rollup"]["number"] = 2
+
+        self.assertEqual(
+            migration._page_fingerprint(first),
+            migration._page_fingerprint(second),
+        )
+        second["properties"][sync.TOP_PROPERTY]["checkbox"] = False
+        self.assertNotEqual(
+            migration._page_fingerprint(first),
+            migration._page_fingerprint(second),
         )
 
     def test_root_fingerprint_uses_stable_content_and_block_identity(self) -> None:

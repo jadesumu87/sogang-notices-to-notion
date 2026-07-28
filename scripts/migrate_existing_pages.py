@@ -50,7 +50,7 @@ from sync import (
 from utils import build_rich_text_chunks
 
 JsonObject = dict[str, Any]
-PLAN_VERSION = 5
+PLAN_VERSION = 6
 CONFIRMATION_PREFIX = "APPLY EXISTING PAGE MIGRATION"
 LOCAL_WRITE_CONFIRMATION = "ALLOW EXISTING PAGE METADATA MIGRATION"
 SYNC_PROPERTY_NAMES = (
@@ -116,6 +116,45 @@ def _stable_notion_projection(value: object) -> object:
     return projected
 
 
+def _stable_page_property_projection(value: object) -> object:
+    if not isinstance(value, dict):
+        return _stable_notion_projection(value)
+    property_type = value.get("type")
+    if property_type in {"last_edited_by", "last_edited_time"}:
+        return {
+            key: _stable_notion_projection(value[key])
+            for key in ("id", "type")
+            if key in value
+        }
+    if property_type == "formula":
+        projected = {
+            key: _stable_notion_projection(value[key])
+            for key in ("id", "type")
+            if key in value
+        }
+        formula = value.get("formula")
+        if isinstance(formula, dict):
+            projected["formula"] = {
+                "type": _stable_notion_projection(formula.get("type"))
+            }
+        return projected
+    if property_type == "rollup":
+        projected = {
+            key: _stable_notion_projection(value[key])
+            for key in ("id", "type")
+            if key in value
+        }
+        rollup = value.get("rollup")
+        if isinstance(rollup, dict):
+            projected["rollup"] = {
+                key: _stable_notion_projection(rollup[key])
+                for key in ("type", "function")
+                if key in rollup
+            }
+        return projected
+    return _stable_notion_projection(value)
+
+
 def _page_fingerprint(page: JsonObject) -> str:
     protected = copy.deepcopy(page)
     protected.pop("last_edited_time", None)
@@ -126,6 +165,10 @@ def _page_fingerprint(page: JsonObject) -> str:
         raise MigrationError("페이지 속성 형식이 올바르지 않습니다")
     for name in SYNC_PROPERTY_NAMES:
         properties.pop(name, None)
+    protected["properties"] = {
+        name: _stable_page_property_projection(value)
+        for name, value in properties.items()
+    }
     return _canonical_hash(_stable_notion_projection(protected))
 
 
