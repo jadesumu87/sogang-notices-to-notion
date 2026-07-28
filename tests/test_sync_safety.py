@@ -341,6 +341,119 @@ class StatefulBlockStore:
 
 
 class SyncSafetyTests(unittest.TestCase):
+    def test_property_comparison_accepts_notion_minute_precision_date(self):
+        existing = {
+            sync.DATE_PROPERTY: {
+                "type": "date",
+                "date": {
+                    "start": "2026-07-13T10:08:00.000+09:00"
+                },
+            }
+        }
+        desired = {
+            sync.DATE_PROPERTY: {
+                "date": {"start": "2026-07-13T10:08:24+09:00"}
+            }
+        }
+
+        self.assertEqual(
+            sync.filter_changed_properties(existing, desired),
+            {},
+        )
+
+    def test_property_comparison_rejects_different_notion_date_minute(self):
+        existing = {
+            sync.DATE_PROPERTY: {
+                "type": "date",
+                "date": {
+                    "start": "2026-07-13T10:08:00.000+09:00"
+                },
+            }
+        }
+        desired = {
+            sync.DATE_PROPERTY: {
+                "date": {"start": "2026-07-13T10:09:00+09:00"}
+            }
+        }
+
+        self.assertEqual(
+            sync.filter_changed_properties(existing, desired),
+            desired,
+        )
+
+    def test_property_comparison_accepts_equivalent_date_timezone(self):
+        existing = {
+            sync.DATE_PROPERTY: {
+                "type": "date",
+                "date": {"start": "2026-07-13T01:08:00.000Z"},
+            }
+        }
+        desired = {
+            sync.DATE_PROPERTY: {
+                "date": {"start": "2026-07-13T10:08:59+09:00"}
+            }
+        }
+
+        self.assertEqual(
+            sync.filter_changed_properties(existing, desired),
+            {},
+        )
+
+    def test_committed_readback_accepts_notion_truncated_date_seconds(self):
+        item = {
+            "source_id": "141",
+            "notice_id": "550491",
+            "title": "[교외] 가송재단 장학생 선발 안내",
+            "author": "학생지원팀",
+            "date": "2026-07-13T10:08:24+09:00",
+            "views": 1252,
+            "top": True,
+            "url": (
+                "https://www.sogang.ac.kr/ko/detail/550491"
+                "?bbsConfigFk=141"
+            ),
+            "type": "교외",
+            "classification": "장학공지",
+        }
+        operation_id = sync_engine.operation_id_for_item(item)
+        committed_item = {
+            **item,
+            "operation_id": operation_id,
+            "generation_id": "generation",
+            "sync_status": "committed",
+        }
+        properties = notion_read_properties(
+            sync_engine.build_properties(
+                committed_item,
+                True,
+                True,
+                True,
+            )
+        )
+        properties[sync.DATE_PROPERTY]["date"]["start"] = (
+            "2026-07-13T10:08:00.000+09:00"
+        )
+        page = {
+            "id": "page-550491",
+            "properties": properties,
+        }
+
+        reasons = sync_engine.committed_item_readback_reasons(
+            "token",
+            page,
+            item,
+            sync_engine.DestinationContext("token", "database"),
+            "page-550491",
+            operation_id,
+            "generation",
+            "",
+            [],
+            [],
+            False,
+        )
+
+        self.assertEqual(reasons, [])
+
     def setUp(self):
         self.network_guards = [
             patch.object(
