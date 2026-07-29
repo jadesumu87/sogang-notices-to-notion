@@ -1896,6 +1896,95 @@ class CrawlerRegressionTests(unittest.TestCase):
             ["3"],
         )
 
+    def test_targeted_refresh_skips_incomplete_backfill_history(self):
+        known_ids = {"1009", "1008", "1007", "1006", "1003"}
+        pages = {
+            1: api_page(
+                [api_entry("1010"), api_entry("1009")],
+                total_count=10,
+            ),
+            2: api_page(
+                [api_entry("1008"), api_entry("1007")],
+                total_count=10,
+            ),
+            3: api_page(
+                [api_entry("1006"), api_entry("1005")],
+                total_count=10,
+            ),
+            4: api_page(
+                [
+                    api_entry("1004"),
+                    api_entry("1003"),
+                    api_entry("1002"),
+                ],
+                total_count=10,
+            ),
+        }
+        page_calls = []
+        detail_calls = []
+
+        def fetch_page(page, *args, **kwargs):
+            page_calls.append(page)
+            if page not in pages:
+                raise AssertionError(f"unexpected page:{page}")
+            return pages[page]
+
+        def fetch_detail(notice_id, **kwargs):
+            detail_calls.append(notice_id)
+            return api_detail(notice_id)
+
+        with (
+            patch.object(
+                crawler,
+                "fetch_bbs_list_result",
+                side_effect=fetch_page,
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_detail",
+                side_effect=fetch_detail,
+            ),
+            patch.object(
+                crawler,
+                "get_detail_html_fallback_reason",
+                return_value=None,
+            ),
+            patch.object(
+                crawler,
+                "extract_body_blocks_from_html",
+                return_value=BODY,
+            ),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                known_ids=known_ids,
+                incremental=True,
+                refresh_known_ids={"1003"},
+                targeted_refresh_ids={"1003"},
+            )
+
+        self.assertTrue(result.write_safe)
+        self.assertEqual(
+            result.termination_reason,
+            "incremental_checkpoint",
+        )
+        self.assertNotIn(5, page_calls)
+        self.assertEqual(set(detail_calls), {"1010", "1003"})
+        self.assertEqual(
+            [
+                crawler.extract_detail_id_from_text(item["url"])
+                for item in result.items
+            ],
+            ["1010", "1003"],
+        )
+        self.assertTrue(
+            {"1005", "1004", "1002"}.isdisjoint(
+                result.observed_ids
+            )
+        )
+
     def test_incremental_checkpoint_stops_after_verified_overlap(self):
         known_ids = {"1004", "1003", "1002", "1001", "1000"}
         pages = {
@@ -2235,6 +2324,120 @@ class CrawlerRegressionTests(unittest.TestCase):
             ["1005"],
         )
 
+    def test_fallback_targeted_refresh_skips_backfill_history(self):
+        known_ids = {"1009", "1008", "1007", "1006", "1003"}
+        date = "2026-07-27T12:00:00+09:00"
+
+        def entry(notice_id):
+            return {
+                "title": f"공지 {notice_id}",
+                "date": date,
+                "top": False,
+                "url": (
+                    "https://www.sogang.ac.kr/ko/detail/"
+                    f"{notice_id}?bbsConfigFk=141"
+                ),
+            }
+
+        def page(number, notice_ids):
+            values = [entry(notice_id) for notice_id in notice_ids]
+            return FallbackPageResult(
+                ok=True,
+                requested_page=number,
+                effective_page=number,
+                source_config_fk="141",
+                entries=values,
+                final_url=f"{SOURCE.list_url}?page={number}",
+                contract_verified=True,
+                raw_entry_count=len(values),
+            )
+
+        pages = {
+            1: page(1, ["1010", "1009"]),
+            2: page(2, ["1008", "1007"]),
+            3: page(3, ["1006", "1005"]),
+            4: page(4, ["1004", "1003", "1002"]),
+        }
+        page_calls = []
+        detail_calls = []
+
+        def fetch_page(number):
+            page_calls.append(number)
+            if number not in pages:
+                raise AssertionError(f"unexpected page:{number}")
+            return pages[number]
+
+        def fetch_detail(item, _number):
+            notice_id = (
+                crawler.extract_detail_id_from_text(item["url"]) or ""
+            )
+            detail_calls.append(notice_id)
+            return FallbackDetailResult(
+                ok=True,
+                notice_id=notice_id,
+                url=item["url"],
+                title=item["title"],
+                date=date,
+                body_blocks=BODY,
+                body_status=crawler.BODY_STATUS_PRESENT,
+                attachments=[
+                    {
+                        "name": "attachment.pdf",
+                        "type": "external",
+                        "external": {
+                            "url": (
+                                "https://www.sogang.ac.kr/"
+                                "file-fe-prd/board/attachment.pdf"
+                            )
+                        },
+                    }
+                ],
+                attachments_status=(
+                    crawler.ATTACHMENTS_STATUS_KNOWN
+                ),
+            )
+
+        original = SourceCrawlResult(
+            source=SOURCE,
+            status=SourceStatus.FAILED,
+            method="api",
+            category=FailureCategory.SOURCE_UPSTREAM,
+            error="api_failed",
+        )
+        result = crawler.crawl_fallback_with_fetchers(
+            SOURCE,
+            True,
+            0,
+            known_ids,
+            True,
+            "fallback_http",
+            original,
+            fetch_page,
+            fetch_detail,
+            refresh_known_ids={"1003"},
+            targeted_refresh_ids={"1003"},
+        )
+
+        self.assertTrue(
+            result.write_safe,
+            result.to_dict(include_items=True),
+        )
+        self.assertEqual(
+            result.termination_reason,
+            "incremental_checkpoint",
+        )
+        self.assertNotIn(5, page_calls)
+        self.assertEqual(set(detail_calls), {"1010", "1003"})
+        self.assertEqual(
+            [item["notice_id"] for item in result.items],
+            ["1010", "1003"],
+        )
+        self.assertTrue(
+            {"1005", "1004", "1002"}.isdisjoint(
+                result.observed_ids
+            )
+        )
+
     def test_repeated_new_pinned_top_does_not_dirty_fallback_overlap(
         self,
     ):
@@ -2443,6 +2646,10 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             captured["refresh_ids_by_source"]["2"],
+            {"548926"},
+        )
+        self.assertEqual(
+            captured["targeted_refresh_ids_by_source"]["2"],
             {"548926"},
         )
 

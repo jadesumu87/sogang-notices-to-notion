@@ -126,6 +126,25 @@ def pending_shrink_ids(
     )[:get_backfill_detail_limit()]
 
 
+def pending_notice_ids(
+    state: dict[str, Any],
+    source_id: str,
+) -> list[str]:
+    source_state = state.get("sources", {}).get(source_id, {})
+    if not isinstance(source_state, dict):
+        return []
+    values = source_state.get("pending_notice_ids", [])
+    if not isinstance(values, list):
+        return []
+    return list(
+        dict.fromkeys(
+            str(value).strip()
+            for value in values
+            if str(value).strip()
+        )
+    )[:get_backfill_detail_limit()]
+
+
 def should_refresh_destination_pending_state(
     state: dict[str, Any],
 ) -> bool:
@@ -361,6 +380,12 @@ def collect_report(
             )
             for config_fk in config_fks
         }
+        targeted_refresh_ids_by_source = {
+            config_fk: set(
+                pending_notice_ids(state, config_fk)
+            )
+            for config_fk in config_fks
+        }
         resume_pages_by_source = {
             config_fk: (
                 backfill_resume_page(
@@ -445,6 +470,9 @@ def collect_report(
                 )
                 for config_fk in config_fks
             },
+            targeted_refresh_ids_by_source=(
+                targeted_refresh_ids_by_source
+            ),
         )
         for result in report.sources:
             refresh_window = rotation_windows_by_source.get(

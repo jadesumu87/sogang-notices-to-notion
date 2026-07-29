@@ -1700,6 +1700,7 @@ def crawl_top_items_api_result(
     refresh_known_ids: Optional[set[str]] = None,
     resume_page: int = 1,
     resume_anchor_ids: Optional[set[str]] = None,
+    targeted_refresh_ids: Optional[set[str]] = None,
 ) -> SourceCrawlResult:
     config_fk = source.config_fk
     items: JsonObjectList = []
@@ -1747,6 +1748,10 @@ def crawl_top_items_api_result(
         get_incremental_checkpoint_overlap_pages()
     )
     required_refresh_ids = refresh_known_ids & known_ids
+    targeted_refresh_ids = (
+        (targeted_refresh_ids or set())
+        & required_refresh_ids
+    )
     classification = source.classification
     page_size_raw = os.environ.get("BBS_PAGE_SIZE", "20")
     try:
@@ -2039,6 +2044,9 @@ def crawl_top_items_api_result(
         page_has_checkpoint = False
         page_has_unknown_notice = False
         page_contract_failed = False
+        targeted_history_active = bool(
+            targeted_refresh_ids and checkpoint_found
+        )
 
         for entry_index, entry in enumerate(entries_to_process, start=1):
             check_run_control()
@@ -2046,9 +2054,6 @@ def crawl_top_items_api_result(
             if not pk_id:
                 rejected_count += 1
                 continue
-            if pk_id not in observed_id_set:
-                observed_id_set.add(pk_id)
-                observed_ids.append(pk_id)
             detail_url = normalize_detail_url(
                 build_detail_url(pk_id, config_fk)
             ) or build_detail_url(pk_id, config_fk)
@@ -2072,8 +2077,6 @@ def crawl_top_items_api_result(
                     break
             else:
                 seen_identities[pk_id] = identity
-                if pk_id not in known_ids:
-                    page_has_unknown_notice = True
             if top:
                 observed_top_ids.add(pk_id)
                 top_urls.add(detail_url)
@@ -2085,6 +2088,19 @@ def crawl_top_items_api_result(
                 continue
             if incremental and pk_id in known_ids and not top:
                 page_has_checkpoint = True
+                if targeted_refresh_ids:
+                    targeted_history_active = True
+            if (
+                targeted_history_active
+                and not top
+                and pk_id not in known_ids
+            ):
+                continue
+            if pk_id not in observed_id_set:
+                observed_id_set.add(pk_id)
+                observed_ids.append(pk_id)
+            if pk_id not in known_ids:
+                page_has_unknown_notice = True
             if (
                 incremental
                 and pk_id in known_ids
@@ -2319,6 +2335,18 @@ def crawl_top_items_api_result(
             checkpoint_found = True
             if checkpoint_page_number is None:
                 checkpoint_page_number = page_number
+        if (
+            incremental
+            and not reconcile_mode
+            and targeted_refresh_ids
+            and checkpoint_found
+            and targeted_refresh_ids.issubset(
+                set(refreshed_known_ids)
+            )
+        ):
+            terminal_reached = True
+            termination_reason = "incremental_checkpoint"
+            break
         if page_result.terminal_verified:
             if (
                 include_non_top
@@ -2602,6 +2630,7 @@ class SogangSourceAdapter:
         refresh_known_ids: Optional[set[str]] = None,
         resume_page: int = 1,
         resume_anchor_ids: Optional[set[str]] = None,
+        targeted_refresh_ids: Optional[set[str]] = None,
     ) -> SourceCrawlResult:
         source_cooldown_until = str(
             (source_state or {}).get("source_circuit_open_until") or ""
@@ -2640,6 +2669,7 @@ class SogangSourceAdapter:
                     refresh_known_ids,
                     resume_page,
                     resume_anchor_ids,
+                    targeted_refresh_ids,
                 )
         return self._crawl_active(
             source,
@@ -2650,6 +2680,7 @@ class SogangSourceAdapter:
             refresh_known_ids,
             resume_page,
             resume_anchor_ids,
+            targeted_refresh_ids,
         )
 
     def _crawl_active(
@@ -2662,6 +2693,7 @@ class SogangSourceAdapter:
         refresh_known_ids: Optional[set[str]],
         resume_page: int,
         resume_anchor_ids: Optional[set[str]],
+        targeted_refresh_ids: Optional[set[str]],
     ) -> SourceCrawlResult:
         include_non_top = should_include_non_top()
         non_top_max_pages = get_non_top_max_pages()
@@ -2675,6 +2707,7 @@ class SogangSourceAdapter:
             refresh_known_ids=refresh_known_ids,
             resume_page=resume_page,
             resume_anchor_ids=resume_anchor_ids,
+            targeted_refresh_ids=targeted_refresh_ids,
         )
         if api_result.write_safe:
             return api_result
@@ -2718,6 +2751,7 @@ class SogangSourceAdapter:
             refresh_known_ids,
             resume_page,
             resume_anchor_ids,
+            targeted_refresh_ids,
         )
 
 
@@ -2731,6 +2765,9 @@ def crawl_sources(
     refresh_ids_by_source: Optional[dict[str, set[str]]] = None,
     resume_page_by_source: Optional[dict[str, int]] = None,
     resume_anchor_ids_by_source: Optional[dict[str, set[str]]] = None,
+    targeted_refresh_ids_by_source: Optional[
+        dict[str, set[str]]
+    ] = None,
 ) -> CrawlReport:
     include_non_top = should_include_non_top()
     non_top_max_pages = get_non_top_max_pages()
@@ -2872,6 +2909,9 @@ def crawl_sources(
                     ).get(config_fk, 1),
                     resume_anchor_ids=(
                         resume_anchor_ids_by_source or {}
+                    ).get(config_fk, set()),
+                    targeted_refresh_ids=(
+                        targeted_refresh_ids_by_source or {}
                     ).get(config_fk, set()),
                 )
                 if (
@@ -3686,6 +3726,7 @@ def crawl_fallback_with_fetchers(
     refresh_known_ids: Optional[set[str]] = None,
     resume_page: int = 1,
     resume_anchor_ids: Optional[set[str]] = None,
+    targeted_refresh_ids: Optional[set[str]] = None,
 ) -> SourceCrawlResult:
     items: JsonObjectList = []
     observed_ids: list[str] = []
@@ -3734,6 +3775,10 @@ def crawl_fallback_with_fetchers(
         get_incremental_checkpoint_overlap_pages()
     )
     required_refresh_ids = refresh_known_ids & known_ids
+    targeted_refresh_ids = (
+        (targeted_refresh_ids or set())
+        & required_refresh_ids
+    )
 
     def consume_budget(label: str) -> bool:
         nonlocal request_count, last_request_at, terminal_error
@@ -3898,6 +3943,9 @@ def crawl_fallback_with_fetchers(
         page_contract_failed = False
         page_has_checkpoint = False
         page_has_unknown_notice = False
+        targeted_history_active = bool(
+            targeted_refresh_ids and checkpoint_found
+        )
         for entry_index, entry in enumerate(page.entries, start=1):
             top = bool(entry.get("top"))
             raw_url = str(
@@ -3939,10 +3987,6 @@ def crawl_fallback_with_fetchers(
                     break
                 continue
             seen_identity[notice_id] = identity
-            if notice_id not in known_ids:
-                page_has_unknown_notice = True
-            observed_id_set.add(notice_id)
-            observed_ids.append(notice_id)
             if top:
                 top_urls.add(normalized_url)
                 top_dates.setdefault(title, set()).add(
@@ -3950,6 +3994,19 @@ def crawl_fallback_with_fetchers(
                 )
             if incremental and notice_id in known_ids and not top:
                 page_has_checkpoint = True
+                if targeted_refresh_ids:
+                    targeted_history_active = True
+            if (
+                targeted_history_active
+                and not top
+                and notice_id not in known_ids
+            ):
+                continue
+            if notice_id not in observed_id_set:
+                observed_id_set.add(notice_id)
+                observed_ids.append(notice_id)
+            if notice_id not in known_ids:
+                page_has_unknown_notice = True
             if (
                 incremental
                 and notice_id in known_ids
@@ -4105,6 +4162,18 @@ def crawl_fallback_with_fetchers(
             checkpoint_found = True
             if checkpoint_page_number is None:
                 checkpoint_page_number = page_number
+        if (
+            incremental
+            and not reconcile_mode
+            and targeted_refresh_ids
+            and checkpoint_found
+            and targeted_refresh_ids.issubset(
+                set(refreshed_known_ids)
+            )
+        ):
+            terminal_reached = True
+            termination_reason = "incremental_checkpoint"
+            break
         if (
             reconcile_mode
             and include_non_top
@@ -4288,6 +4357,7 @@ def crawl_top_items_http_result(
     refresh_known_ids: Optional[set[str]] = None,
     resume_page: int = 1,
     resume_anchor_ids: Optional[set[str]] = None,
+    targeted_refresh_ids: Optional[set[str]] = None,
 ) -> SourceCrawlResult:
     return crawl_fallback_with_fetchers(
         source,
@@ -4310,6 +4380,7 @@ def crawl_top_items_http_result(
         refresh_known_ids,
         resume_page,
         resume_anchor_ids,
+        targeted_refresh_ids,
     )
 
 
@@ -4324,6 +4395,7 @@ def crawl_top_items_playwright_result(
     refresh_known_ids: Optional[set[str]] = None,
     resume_page: int = 1,
     resume_anchor_ids: Optional[set[str]] = None,
+    targeted_refresh_ids: Optional[set[str]] = None,
 ) -> SourceCrawlResult:
     if CURRENT_SOURCE_REQUEST_BUDGET.get() is None:
         with source_request_budget_scope():
@@ -4338,6 +4410,7 @@ def crawl_top_items_playwright_result(
                 refresh_known_ids,
                 resume_page,
                 resume_anchor_ids,
+                targeted_refresh_ids,
             )
     try:
         import playwright.sync_api as playwright_sync_api
@@ -4362,6 +4435,7 @@ def crawl_top_items_playwright_result(
             refresh_known_ids,
             resume_page,
             resume_anchor_ids,
+            targeted_refresh_ids,
         )
 
     browser_name = os.environ.get("BROWSER", "chromium")
@@ -4377,6 +4451,7 @@ def crawl_top_items_playwright_result(
             refresh_known_ids,
             resume_page,
             resume_anchor_ids,
+            targeted_refresh_ids,
         )
     headless = os.environ.get("HEADLESS", "1").strip().lower() not in {
         "0",
@@ -4473,6 +4548,7 @@ def crawl_top_items_playwright_result(
                 refresh_known_ids,
                 resume_page,
                 resume_anchor_ids,
+                targeted_refresh_ids,
             )
         browser_result: Optional[SourceCrawlResult] = None
         try:
@@ -4906,6 +4982,7 @@ def crawl_top_items_playwright_result(
                 refresh_known_ids,
                 resume_page,
                 resume_anchor_ids,
+                targeted_refresh_ids,
             )
         except PlaywrightError as exc:
             browser_result = SourceCrawlResult(
@@ -4934,6 +5011,7 @@ def crawl_top_items_playwright_result(
             refresh_known_ids,
             resume_page,
             resume_anchor_ids,
+            targeted_refresh_ids,
         )
         http_result.fallback_from_error = ";".join(
             value
