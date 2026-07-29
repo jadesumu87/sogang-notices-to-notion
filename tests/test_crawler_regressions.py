@@ -677,6 +677,9 @@ class CrawlerRegressionTests(unittest.TestCase):
                     return_value=temp_dir / "incident.json"
                 ),
                 load_run_state=Mock(return_value=state),
+                refresh_destination_pending_notice_state=Mock(
+                    return_value=0
+                ),
                 collect_report=Mock(side_effect=error),
             ),
             self.assertRaisesRegex(
@@ -2348,6 +2351,101 @@ class CrawlerRegressionTests(unittest.TestCase):
 
 
 class SourceSchedulingRegressionTests(unittest.TestCase):
+    def test_failed_run_refreshes_pending_notice_before_next_crawl(self):
+        state = fresh_state()
+        state["runs"].append({"status": "failed"})
+        state["active_incidents"] = {"incident": {"count": 1}}
+        state["sources"]["2"] = {
+            "observed_ids": ["550000"],
+        }
+        context = sync_engine.DestinationContext(
+            "token",
+            "database",
+            pending_page_ids=("pending-page",),
+            pending_page_sources={"pending-page": "2"},
+            pending_page_notices={"pending-page": "548926"},
+        )
+
+        with patch.object(
+            crawler_main,
+            "inspect_destination_pending_context",
+            return_value=context,
+        ):
+            count = (
+                crawler_main.refresh_destination_pending_notice_state(
+                    state,
+                    "token",
+                    "database",
+                    {"141", "2"},
+                )
+            )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            state["sources"]["2"]["pending_notice_ids"],
+            ["548926"],
+        )
+        self.assertTrue(
+            crawler_main.should_refresh_destination_pending_state(state)
+        )
+
+    def test_collect_report_forces_pending_notice_detail_refresh(self):
+        state = fresh_state()
+        state["sources"]["2"] = {
+            "observed_ids": ["550000"],
+            "pending_notice_ids": ["548926"],
+        }
+        captured = {}
+
+        def crawl_sources(**kwargs):
+            captured.update(kwargs)
+            return CrawlReport(
+                [
+                    SourceCrawlResult(
+                        source=SourceSpec(
+                            config_fk="2",
+                            classification="학사공지",
+                            list_url=(
+                                "https://www.sogang.ac.kr/ko/"
+                                "academic-notice"
+                            ),
+                        ),
+                        status=SourceStatus.SUCCESS,
+                    )
+                ]
+            )
+
+        with (
+            patch.object(
+                crawler_main,
+                "resolve_html_path",
+                return_value=None,
+            ),
+            patch.object(
+                crawler_main,
+                "get_bbs_config_fks",
+                return_value=["2"],
+            ),
+            patch.object(
+                crawler_main,
+                "crawl_sources",
+                side_effect=crawl_sources,
+            ),
+        ):
+            crawler_main.collect_report(
+                state,
+                full_reconcile=False,
+            )
+
+        self.assertEqual(
+            captured["known_ids_by_source"]["2"],
+            {"550000", "548926"},
+        )
+        self.assertEqual(
+            captured["refresh_ids_by_source"]["2"],
+            {"548926"},
+        )
+
     def test_backfill_source_runs_first_with_fair_budget(self):
         sources = {
             "141": SOURCE,

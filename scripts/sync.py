@@ -5,7 +5,7 @@ import re
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from common import (
     ATTACHMENTS_STATUS_KNOWN,
@@ -1296,7 +1296,48 @@ def update_quote_block(token: str, block_id: str, rich_text: list[JsonObject]) -
     notion_request("PATCH", url, token, payload)
 
 
-def rich_text_signature(parts: object) -> list[JsonObject]:
+def normalize_notion_link_identity(raw_link: object) -> str:
+    link = str(raw_link or "")
+    if not link:
+        return ""
+    try:
+        parsed = urlsplit(link)
+    except ValueError:
+        return link
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.query
+    ):
+        return link
+    try:
+        query = urlencode(
+            parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+                encoding="utf-8",
+                errors="strict",
+            ),
+            doseq=True,
+        )
+    except (UnicodeError, ValueError):
+        return link
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            query,
+            parsed.fragment,
+        )
+    )
+
+
+def rich_text_signature(
+    parts: object,
+    *,
+    normalize_links: bool = False,
+) -> list[JsonObject]:
     if not isinstance(parts, list):
         return []
     signature: list[JsonObject] = []
@@ -1330,18 +1371,27 @@ def rich_text_signature(parts: object) -> list[JsonObject]:
                     if key in supplied_annotations
                 }
             )
+        normalized_link = str(link or "")
+        if normalize_links:
+            normalized_link = normalize_notion_link_identity(
+                normalized_link
+            )
         signature.append(
             {
                 "type": str(part.get("type") or "text"),
                 "content": str(content or ""),
-                "link": str(link or ""),
+                "link": normalized_link,
                 "annotations": annotations,
             }
         )
     return signature
 
 
-def media_signature(payload: JsonObject) -> JsonObject:
+def media_signature(
+    payload: JsonObject,
+    *,
+    normalize_links: bool = False,
+) -> JsonObject:
     media_type = str(payload.get("type") or "")
     if media_type == "external":
         external = payload.get("external", {})
@@ -1360,7 +1410,10 @@ def media_signature(payload: JsonObject) -> JsonObject:
     return {
         "type": normalized_type,
         "identity": identity,
-        "caption": rich_text_signature(payload.get("caption")),
+        "caption": rich_text_signature(
+            payload.get("caption"),
+            normalize_links=normalize_links,
+        ),
     }
 
 
@@ -1368,6 +1421,8 @@ def block_content_signature(
     token: str,
     block: JsonObject,
     resolve_children: bool,
+    *,
+    normalize_links: bool = False,
 ) -> JsonObject:
     block_type = str(block.get("type") or "")
     payload = block.get(block_type, {})
@@ -1375,11 +1430,20 @@ def block_content_signature(
         return {"type": block_type, "payload": "invalid"}
     signature: JsonObject = {"type": block_type}
     if "rich_text" in payload:
-        signature["rich_text"] = rich_text_signature(payload.get("rich_text"))
+        signature["rich_text"] = rich_text_signature(
+            payload.get("rich_text"),
+            normalize_links=normalize_links,
+        )
     if "cells" in payload:
         cells = payload.get("cells")
         signature["cells"] = (
-            [rich_text_signature(cell) for cell in cells]
+            [
+                rich_text_signature(
+                    cell,
+                    normalize_links=normalize_links,
+                )
+                for cell in cells
+            ]
             if isinstance(cells, list)
             else "invalid"
         )
@@ -1395,10 +1459,16 @@ def block_content_signature(
         if key in payload:
             signature[key] = payload[key]
     if block_type in {"image", "file", "pdf", "video", "audio"}:
-        signature["media"] = media_signature(payload)
+        signature["media"] = media_signature(
+            payload,
+            normalize_links=normalize_links,
+        )
     elif block_type in {"embed", "bookmark"}:
         signature["url"] = str(payload.get("url") or "")
-        signature["caption"] = rich_text_signature(payload.get("caption"))
+        signature["caption"] = rich_text_signature(
+            payload.get("caption"),
+            normalize_links=normalize_links,
+        )
     expected_children = payload.get("children")
     actual_children: object = None
     if isinstance(expected_children, list):
@@ -1412,7 +1482,12 @@ def block_content_signature(
         )
     if isinstance(actual_children, list):
         signature["children"] = [
-            block_content_signature(token, child, resolve_children)
+            block_content_signature(
+                token,
+                child,
+                resolve_children,
+                normalize_links=normalize_links,
+            )
             for child in actual_children
         ]
     elif actual_children is not None:
@@ -1424,9 +1499,16 @@ def sync_child_signature(
     token: str,
     blocks: list[JsonObject],
     resolve_children: bool,
+    *,
+    normalize_links: bool = False,
 ) -> list[JsonObject]:
     return [
-        block_content_signature(token, block, resolve_children)
+        block_content_signature(
+            token,
+            block,
+            resolve_children,
+            normalize_links=normalize_links,
+        )
         for block in blocks
     ]
 
@@ -1563,18 +1645,26 @@ def verify_sync_container_part(
         True,
     )
     return (
-        stored_hash == expected_hash == actual_hash
-        and rich_text_signature(body_rich_text)
-        == rich_text_signature(expected_body)
+        stored_hash in {expected_hash, actual_hash}
+        and rich_text_signature(
+            body_rich_text,
+            normalize_links=True,
+        )
+        == rich_text_signature(
+            expected_body,
+            normalize_links=True,
+        )
         and sync_child_signature(
-        token,
-        actual_children,
-        True,
+            token,
+            actual_children,
+            True,
+            normalize_links=True,
         )
         == sync_child_signature(
             token,
             expected_children,
             False,
+            normalize_links=True,
         )
     )
 
@@ -1592,8 +1682,14 @@ def sync_container_prefix_length(
     body_rich_text = sync_container_body_rich_text(block)
     if (
         body_rich_text is None
-        or rich_text_signature(body_rich_text)
-        != rich_text_signature(expected_rich_text)
+        or rich_text_signature(
+            body_rich_text,
+            normalize_links=True,
+        )
+        != rich_text_signature(
+            expected_rich_text,
+            normalize_links=True,
+        )
     ):
         return None
     actual_children = list_block_children(token, block_id)
@@ -1604,10 +1700,12 @@ def sync_container_prefix_length(
         token,
         actual_children,
         True,
+        normalize_links=True,
     ) != sync_child_signature(
         token,
         expected_children[:actual_count],
         False,
+        normalize_links=True,
     ):
         return None
     return actual_count
@@ -2162,11 +2260,14 @@ def sync_page_body_blocks(
         )
     ):
         raise RuntimeError("본문 세대 최종 검증 실패")
+    completed_hash = sync_container_actual_hash(token, completed)
+    if not BODY_GENERATION_HASH_RE.fullmatch(completed_hash):
+        raise RuntimeError("본문 세대 최종 해시를 확인할 수 없습니다")
     pending_manifest["p"] = [
         {
             "i": candidate_id,
             "n": 1,
-            "h": expected_hash,
+            "h": completed_hash,
         }
     ]
     write_body_generation_manifest(token, page_id, pending_manifest)

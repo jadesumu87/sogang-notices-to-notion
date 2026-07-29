@@ -61,6 +61,7 @@ from settings import (
 from sync_engine import (
     apply_report,
     build_dry_run_plan,
+    inspect_destination_pending_context,
     prepare_destination,
     safe_source_results,
 )
@@ -123,6 +124,90 @@ def pending_shrink_ids(
             ]
         )
     )[:get_backfill_detail_limit()]
+
+
+def should_refresh_destination_pending_state(
+    state: dict[str, Any],
+) -> bool:
+    active_incidents = state.get("active_incidents", {})
+    if isinstance(active_incidents, dict) and active_incidents:
+        return True
+    runs = state.get("runs", [])
+    if not isinstance(runs, list) or not runs:
+        return False
+    latest = runs[-1]
+    return bool(
+        isinstance(latest, dict)
+        and str(latest.get("status") or "")
+        in {"failed", "partial_failed"}
+    )
+
+
+def refresh_destination_pending_notice_state(
+    state: dict[str, Any],
+    token: str,
+    database_id: str,
+    configured_source_ids: set[str],
+) -> int:
+    context = inspect_destination_pending_context(
+        token,
+        database_id,
+    )
+    pending_page_ids = set(context.pending_page_ids)
+    if (
+        set(context.pending_page_sources) != pending_page_ids
+        or set(context.pending_page_notices) != pending_page_ids
+    ):
+        raise DestinationConsistencyError(
+            "대기 페이지 식별 정보가 완전하지 않습니다"
+        )
+    unknown_sources = (
+        set(context.pending_page_sources.values())
+        - configured_source_ids
+    )
+    if unknown_sources:
+        raise DestinationConsistencyError(
+            "설정에 없는 출처의 대기 페이지가 있습니다"
+        )
+    sources = state.get("sources")
+    if not isinstance(sources, dict):
+        raise DestinationConsistencyError(
+            "실행 상태의 출처 정보를 신뢰할 수 없습니다"
+        )
+    for page_id in sorted(pending_page_ids):
+        source_id = context.pending_page_sources[page_id]
+        notice_id = context.pending_page_notices[page_id]
+        source_state = sources.setdefault(source_id, {})
+        if not isinstance(source_state, dict):
+            raise DestinationConsistencyError(
+                "실행 상태의 출처 정보를 신뢰할 수 없습니다"
+            )
+        existing = source_state.get("pending_notice_ids", [])
+        if not isinstance(existing, list):
+            raise DestinationConsistencyError(
+                "실행 상태의 대기 공지 ID를 신뢰할 수 없습니다"
+            )
+        pending_notice_ids = sorted(
+            {
+                *(
+                    str(value)
+                    for value in existing
+                    if str(value).strip()
+                ),
+                notice_id,
+            }
+        )
+        if len(pending_notice_ids) > 1000:
+            raise DestinationConsistencyError(
+                "출처별 대기 공지 상태가 보존 한도를 초과했습니다"
+            )
+        source_state["pending_notice_ids"] = pending_notice_ids
+    if pending_page_ids:
+        LOGGER.info(
+            "이전 실패의 Notion 대기 공지를 수집 계획에 반영했습니다: %s",
+            len(pending_page_ids),
+        )
+    return len(pending_page_ids)
 
 
 def backfill_resume_page(source_state: object) -> int:
@@ -648,6 +733,16 @@ def main() -> None:
                 raise LocalConfigurationError(
                     "NOTION_TOKEN과 NOTION_DB_ID를 환경 변수나 .env에 설정해야 합니다",
                     "destination_auth",
+                )
+            if (
+                not dry_run
+                and should_refresh_destination_pending_state(state)
+            ):
+                refresh_destination_pending_notice_state(
+                    state,
+                    notion_token,
+                    database_id,
+                    set(configured_source_ids),
                 )
             report = validate_crawl_report(
                 collect_report(

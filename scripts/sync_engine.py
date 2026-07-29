@@ -883,6 +883,23 @@ def pending_page_context(
     return tuple(page_ids), sources, notices
 
 
+def inspect_destination_pending_context(
+    token: str,
+    database_id: str,
+) -> DestinationContext:
+    validate_destination_schema(fetch_database(token, database_id))
+    pending_ids, pending_sources, pending_notices = pending_page_context(
+        inspect_pending_pages(token, database_id)
+    )
+    return DestinationContext(
+        token=token,
+        database_id=database_id,
+        pending_page_ids=pending_ids,
+        pending_page_sources=pending_sources,
+        pending_page_notices=pending_notices,
+    )
+
+
 def prepare_destination(
     token: str,
     database_id: str,

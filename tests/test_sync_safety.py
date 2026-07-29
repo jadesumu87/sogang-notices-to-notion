@@ -1288,6 +1288,224 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(manifest["s"], "committed")
         self.assertIn(store.manual_id, store.root_ids())
 
+    def test_body_generation_accepts_notion_equivalent_link_encoding(self):
+        source_url = (
+            "https://www.sogang.ac.kr/ko/detail/547784"
+            "?bbsConfigFk=2&text=%ED%95%99%EC%82%AC+%EC%A7%80%EC%9B%90"
+            "&redirect=/ko/academic-support/notices?page=1%26option=TITLE"
+        )
+        notion_url = (
+            "https://www.sogang.ac.kr/ko/detail/547784"
+            "?bbsConfigFk=2&text=%ED%95%99%EC%82%AC%20%EC%A7%80%EC%9B%90"
+            "&redirect=%2Fko%2Facademic-support%2Fnotices"
+            "%3Fpage%3D1%26option%3DTITLE"
+        )
+        visible = paragraph_block("첫 문단")
+        linked = paragraph_block("관련 안내")
+        linked["paragraph"]["rich_text"][0]["text"]["link"] = {
+            "url": source_url
+        }
+        store = StatefulBlockStore()
+        append_children = store.append_children
+
+        def append_with_notion_link_encoding(
+            token: str,
+            parent_id: str,
+            blocks: list[dict],
+        ) -> dict:
+            response = append_children(token, parent_id, blocks)
+            if parent_id == store.root_id:
+                candidate_id = str(response["results"][0]["id"])
+                store.children[candidate_id][0]["paragraph"]["rich_text"][0][
+                    "text"
+                ]["link"] = {"url": notion_url}
+            return response
+
+        store.append_children = append_with_notion_link_encoding
+
+        result = self.run_body_sync(
+            store,
+            generation_id="notion-link-normalization",
+            blocks=[visible, linked],
+        )
+
+        manifest = sync.extract_body_generation_manifest(
+            notion_read_properties(store.properties)
+        )
+        candidate_id = str(manifest["p"][0]["i"])
+        candidate = next(
+            block
+            for block in store.root_blocks
+            if block.get("id") == candidate_id
+        )
+        with patch.object(
+            sync,
+            "list_block_children",
+            side_effect=store.list_children,
+        ):
+            actual_hash = sync.sync_container_actual_hash(
+                "token",
+                candidate,
+            )
+
+        self.assertEqual(result, "notion-link-normalization")
+        self.assertEqual(manifest["s"], "committed")
+        self.assertEqual(manifest["p"][0]["h"], actual_hash)
+        self.assertNotIn(store.old_id, store.root_ids())
+
+    def test_pending_notion_link_failure_recovers_without_duplicate(self):
+        source_url = (
+            "https://www.sogang.ac.kr/ko/detail/548926"
+            "?bbsConfigFk=2&text=%EA%B5%90%EC%9C%A1+%EC%95%88%EB%82%B4"
+            "&redirect=/ko/academic-support/notices?page=1%26option=TITLE"
+        )
+        notion_url = (
+            "https://www.sogang.ac.kr/ko/detail/548926"
+            "?bbsConfigFk=2&text=%EA%B5%90%EC%9C%A1%20%EC%95%88%EB%82%B4"
+            "&redirect=%2Fko%2Facademic-support%2Fnotices"
+            "%3Fpage%3D1%26option%3DTITLE"
+        )
+        visible = paragraph_block("첫 문단")
+        linked = paragraph_block("관련 안내")
+        linked["paragraph"]["rich_text"][0]["text"]["link"] = {
+            "url": source_url
+        }
+        failed_linked = copy.deepcopy(linked)
+        failed_linked["paragraph"]["rich_text"][0]["text"]["link"] = {
+            "url": notion_url
+        }
+        failed_id = "failed-managed"
+        store = StatefulBlockStore()
+        store.root_blocks = [
+            {
+                "id": store.manual_id,
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"plain_text": "manual"}]},
+            },
+            {
+                "id": failed_id,
+                "type": "quote",
+                "quote": {
+                    "rich_text": copy.deepcopy(
+                        visible["paragraph"]["rich_text"]
+                    ),
+                    "color": "default",
+                },
+                "has_children": True,
+            },
+        ]
+        store.children = {failed_id: [failed_linked]}
+        with patch.object(
+            sync,
+            "list_block_children",
+            side_effect=store.list_children,
+        ):
+            failed_hash = sync.sync_container_actual_hash(
+                "token",
+                store.root_blocks[1],
+            )
+        generation_id = "notion-link-pending-retry"
+        store.properties[sync.SYNC_GENERATION_PROPERTY] = (
+            sync.body_generation_property_payload(
+                {
+                    "v": 2,
+                    "g": generation_id,
+                    "s": "pending",
+                    "op": generation_id,
+                    "t": 1,
+                    "p": [],
+                    "o": [{"i": failed_id, "h": failed_hash}],
+                }
+            )
+        )
+        append_children = store.append_children
+
+        def append_with_notion_link_encoding(
+            token: str,
+            parent_id: str,
+            blocks: list[dict],
+        ) -> dict:
+            response = append_children(token, parent_id, blocks)
+            if parent_id == store.root_id:
+                candidate_id = str(response["results"][0]["id"])
+                store.children[candidate_id][0]["paragraph"]["rich_text"][0][
+                    "text"
+                ]["link"] = {"url": notion_url}
+            return response
+
+        store.append_children = append_with_notion_link_encoding
+
+        result = self.run_body_sync(
+            store,
+            generation_id=generation_id,
+            blocks=[visible, linked],
+        )
+
+        manifest = sync.extract_body_generation_manifest(
+            notion_read_properties(store.properties)
+        )
+        quote_ids = [
+            str(block.get("id") or "")
+            for block in store.root_blocks
+            if block.get("type") == "quote"
+        ]
+        candidate_id = str(manifest["p"][0]["i"])
+
+        self.assertEqual(result, generation_id)
+        self.assertEqual(manifest["s"], "committed")
+        self.assertEqual(quote_ids, [candidate_id])
+        self.assertNotEqual(candidate_id, failed_id)
+        self.assertIn(failed_id, store.deleted_ids)
+        self.assertIn(store.manual_id, store.root_ids())
+        self.assertLess(
+            store.events.index(("list", candidate_id)),
+            store.events.index(("delete", failed_id)),
+        )
+
+    def test_body_generation_rejects_different_link_query(self):
+        expected_link = "https://www.sogang.ac.kr/ko/detail/1?bbsConfigFk=2"
+        changed_link = "https://www.sogang.ac.kr/ko/detail/1?bbsConfigFk=141"
+        expected = paragraph_block("관련 안내")
+        expected["paragraph"]["rich_text"][0]["text"]["link"] = {
+            "url": expected_link
+        }
+        actual = copy.deepcopy(expected)
+        actual["paragraph"]["rich_text"][0]["text"]["link"] = {
+            "url": changed_link
+        }
+        container = {
+            "id": "candidate",
+            "type": "quote",
+            "quote": {
+                "rich_text": copy.deepcopy(
+                    paragraph_block("첫 문단")["paragraph"]["rich_text"]
+                )
+            },
+            "has_children": True,
+        }
+
+        with patch.object(
+            sync,
+            "list_block_children",
+            return_value=[actual],
+        ):
+            prefix_length = sync.sync_container_prefix_length(
+                "token",
+                container,
+                container["quote"]["rich_text"],
+                [expected],
+            )
+
+        self.assertIsNone(prefix_length)
+        self.assertNotEqual(
+            sync.normalize_notion_link_identity(
+                "https://example.com/?value=%FF"
+            ),
+            sync.normalize_notion_link_identity(
+                "https://example.com/?value=%FE"
+            ),
+        )
+
     def test_generation_manifest_reads_plain_legacy_and_v2_state(self):
         legacy = sync.parse_body_generation_manifest(
             "legacy-generation"
@@ -1951,6 +2169,50 @@ class SyncSafetyTests(unittest.TestCase):
         recover.assert_not_called()
         self.assertEqual(fetch.call_count, 1)
         self.assertEqual(context.pending_page_ids, ())
+
+    def test_pending_context_inspection_is_read_only(self):
+        database = {"properties": complete_destination_schema()}
+        pending = managed_page("pending-page", "2", "548926")
+
+        with (
+            patch.object(
+                sync_engine,
+                "fetch_database",
+                return_value=database,
+            ),
+            patch.object(
+                sync_engine,
+                "validate_destination_schema",
+            ) as validate,
+            patch.object(
+                sync_engine,
+                "inspect_pending_pages",
+                return_value=[pending],
+            ),
+            patch.object(
+                sync_engine,
+                "ensure_destination_schema",
+            ) as ensure,
+        ):
+            context = sync_engine.inspect_destination_pending_context(
+                "token",
+                "database",
+            )
+
+        validate.assert_called_once_with(database)
+        ensure.assert_not_called()
+        self.assertEqual(
+            context.pending_page_ids,
+            ("pending-page",),
+        )
+        self.assertEqual(
+            context.pending_page_sources,
+            {"pending-page": "2"},
+        )
+        self.assertEqual(
+            context.pending_page_notices,
+            {"pending-page": "548926"},
+        )
 
     def test_disable_missing_top_threshold_failure_writes_nothing(self):
         pages = [
