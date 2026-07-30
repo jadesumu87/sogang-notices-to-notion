@@ -2060,6 +2060,56 @@ def latest_recorded_logical_run_id(state: dict[str, Any]) -> str:
     )
 
 
+def destination_hold_key(source_id: str, notice_id: str) -> str:
+    return hashlib.sha256(
+        f"{source_id}\0{notice_id}".encode("utf-8")
+    ).hexdigest()
+
+
+def destination_hold_repeated(
+    state: dict[str, Any],
+    hold_key: str,
+    current_logical_run_id: str,
+    candidate_id: str,
+    reason: str,
+) -> bool:
+    holds = state.get("destination_holds", {})
+    previous = (
+        holds.get(hold_key, {})
+        if isinstance(holds, dict)
+        else {}
+    )
+    if not isinstance(previous, dict) or not current_logical_run_id:
+        return False
+    previous_execution_id = str(
+        previous.get("last_observed_run_id") or ""
+    )
+    previous_logical_run_id = str(
+        previous.get("last_observed_logical_run_id") or ""
+    )
+    previous_reason = str(previous.get("reason") or "")
+    previous_candidate_id = str(previous.get("candidate_id") or "")
+    same_condition = (
+        previous_reason == reason
+        and (
+            reason != "destructive_change_confirmation"
+            or (
+                bool(candidate_id)
+                and previous_candidate_id == candidate_id
+            )
+        )
+    )
+    return bool(
+        same_condition
+        and previous_execution_id
+        and previous_execution_id == latest_recorded_run_id(state)
+        and previous_logical_run_id
+        and previous_logical_run_id
+        == latest_recorded_logical_run_id(state)
+        and previous_logical_run_id != current_logical_run_id
+    )
+
+
 def recent_consecutive_observation(
     state: dict[str, Any],
     observation: object,
@@ -2449,6 +2499,13 @@ def _apply_report(
             counters.recovered_pending_notices[source_id].append(
                 notice_id
             )
+    preflight_by_identity = {
+        (
+            str(candidate.item.get("source_id") or ""),
+            str(candidate.item.get("notice_id") or ""),
+        ): candidate
+        for candidate in preflight
+    }
     for page_id in sorted(remaining_id_set):
         source_id = remaining_sources[page_id]
         notice_id = remaining_notices[page_id]
@@ -2461,6 +2518,50 @@ def _apply_report(
             raise DestinationConsistencyError(
                 "출처별 대기 공지 상태가 보존 한도를 초과했습니다"
             )
+        pending_entry = preflight_by_identity.get(
+            (source_id, notice_id)
+        )
+        destructive_candidate = (
+            pending_entry.shrink_candidate
+            if pending_entry is not None
+            and pending_entry.shrink_candidate
+            and not shrink_candidate_confirmed(
+                pending_entry,
+                state,
+                shrink_candidates,
+                logical_run_id,
+            )
+            else None
+        )
+        hold_key = destination_hold_key(source_id, notice_id)
+        candidate_id = str(
+            (
+                destructive_candidate.get("candidate_id")
+                if destructive_candidate is not None
+                else ""
+            )
+            or ""
+        )
+        reason = (
+            "destructive_change_confirmation"
+            if destructive_candidate is not None
+            else "pending_refresh"
+        )
+        counters.destination_hold_observations[hold_key] = {
+            "candidate_id": candidate_id,
+            "reason": reason,
+        }
+        if destination_hold_repeated(
+            state,
+            hold_key,
+            logical_run_id,
+            candidate_id,
+            reason,
+        ):
+            counters.repeated_destination_hold_count += 1
+    counters.destination_hold_count = len(
+        counters.destination_hold_observations
+    )
     quarantined_sources.update(remaining_sources.values())
     counters.quarantined_source_ids = sorted(quarantined_sources)
     for result in results:

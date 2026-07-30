@@ -74,6 +74,16 @@ PUBLIC_CACHE_SHRINK_FIELDS = frozenset(
         "reasons",
     }
 )
+PUBLIC_CACHE_DESTINATION_HOLD_FIELDS = frozenset(
+    {
+        "candidate_id",
+        "last_observed_at",
+        "last_observed_logical_run_id",
+        "last_observed_run_id",
+        "observations",
+        "reason",
+    }
+)
 PUBLIC_CACHE_TOP_LEVEL_FIELDS = frozenset(
     {
         "consecutive_failures",
@@ -205,6 +215,7 @@ def default_run_state() -> dict[str, Any]:
         "active_incidents": {},
         "runs": [],
         "shrink_candidates": {},
+        "destination_holds": {},
     }
     state["state_checksum"] = state_checksum(state)
     return state
@@ -291,6 +302,14 @@ def build_public_cache_state(state: dict[str, Any]) -> dict[str, Any]:
         for key, candidate in validated["shrink_candidates"].items()
         if isinstance(candidate, dict)
     }
+    projected["destination_holds"] = {
+        key: project_mapping(
+            hold,
+            PUBLIC_CACHE_DESTINATION_HOLD_FIELDS,
+        )
+        for key, hold in validated["destination_holds"].items()
+        if isinstance(hold, dict)
+    }
     projected["active_incidents"] = {
         fingerprint: project_mapping(
             incident,
@@ -372,15 +391,58 @@ def validate_run_state_payload(payload: Any) -> dict[str, Any]:
         raise RunStateIntegrityError(
             "실행 상태 shrink_candidates가 객체가 아닙니다"
         )
+    if not isinstance(state.get("destination_holds"), dict):
+        raise RunStateIntegrityError(
+            "실행 상태 destination_holds가 객체가 아닙니다"
+        )
     if (
         len(state["runs"]) > 100
         or len(state["shrink_candidates"]) > 5000
+        or len(state["destination_holds"]) > 5000
     ):
         raise RunStateIntegrityError("실행 상태 보존 한도를 초과했습니다")
     if len(state["sources"]) > 100:
         raise RunStateIntegrityError("실행 상태 출처 보존 한도를 초과했습니다")
     if len(state["active_incidents"]) > 100:
         raise RunStateIntegrityError("활성 장애 보존 한도를 초과했습니다")
+    for hold_key, hold in state["destination_holds"].items():
+        if (
+            not isinstance(hold_key, str)
+            or re.fullmatch(r"[0-9a-f]{64}", hold_key) is None
+            or not isinstance(hold, dict)
+            or str(hold.get("reason") or "")
+            not in {
+                "destructive_change_confirmation",
+                "pending_refresh",
+            }
+            or not isinstance(hold.get("observations"), int)
+            or isinstance(hold.get("observations"), bool)
+            or not 1 <= hold["observations"] <= 100
+            or (
+                str(hold.get("reason") or "")
+                == "destructive_change_confirmation"
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(hold.get("candidate_id") or ""),
+                )
+                is None
+            )
+            or (
+                str(hold.get("reason") or "") == "pending_refresh"
+                and bool(str(hold.get("candidate_id") or ""))
+            )
+            or not str(hold.get("last_observed_run_id") or "")
+            or len(str(hold.get("last_observed_run_id") or "")) > 160
+            or not str(hold.get("last_observed_logical_run_id") or "")
+            or len(str(hold.get("last_observed_logical_run_id") or "")) > 128
+            or parse_iso_datetime(
+                str(hold.get("last_observed_at") or "")
+            )
+            is None
+        ):
+            raise RunStateIntegrityError(
+                "실행 상태 목적지 안전 보류 형식이 올바르지 않습니다"
+            )
     normalized_incidents: dict[str, dict[str, Any]] = {}
     for fingerprint, incident in state["active_incidents"].items():
         if not isinstance(fingerprint, str):
@@ -831,6 +893,7 @@ def update_state_from_report(
     full_reconcile: bool,
     applied_source_ids: Optional[set[str]] = None,
     counters: Optional[SyncCounters] = None,
+    safety_deferred: bool = False,
 ) -> dict[str, Any]:
     now = utc_now_iso()
     state["last_attempt_at"] = now
@@ -1226,6 +1289,95 @@ def update_state_from_report(
                 reverse=True,
             )
             state["shrink_candidates"] = dict(ordered[:5000])
+        if counters.destination_hold_observations and (
+            not counters.observation_run_id
+            or not current_logical_run_id
+        ):
+            raise DestinationConsistencyError(
+                "목적지 안전 보류의 실행 식별자가 누락되었습니다"
+            )
+        destination_holds: dict[str, dict[str, Any]] = {}
+        previous_holds = state.get("destination_holds", {})
+        if not isinstance(previous_holds, dict):
+            raise DestinationConsistencyError(
+                "목적지 안전 보류 상태를 신뢰할 수 없습니다"
+            )
+        for key, observation in (
+            counters.destination_hold_observations.items()
+        ):
+            previous = previous_holds.get(key, {})
+            reason = str(observation.get("reason") or "")
+            candidate_id = str(
+                observation.get("candidate_id") or ""
+            )
+            if (
+                not isinstance(key, str)
+                or re.fullmatch(r"[0-9a-f]{64}", key) is None
+                or reason
+                not in {
+                    "destructive_change_confirmation",
+                    "pending_refresh",
+                }
+                or (
+                    reason == "destructive_change_confirmation"
+                    and re.fullmatch(r"[0-9a-f]{64}", candidate_id)
+                    is None
+                )
+                or (
+                    reason == "pending_refresh"
+                    and bool(candidate_id)
+                )
+            ):
+                raise DestinationConsistencyError(
+                    "목적지 안전 보류 관측값을 신뢰할 수 없습니다"
+                )
+            same_condition = bool(
+                isinstance(previous, dict)
+                and str(previous.get("reason") or "") == reason
+                and (
+                    reason != "destructive_change_confirmation"
+                    or (
+                        bool(candidate_id)
+                        and str(previous.get("candidate_id") or "")
+                        == candidate_id
+                    )
+                )
+            )
+            consecutive = bool(
+                same_condition
+                and isinstance(previous, dict)
+                and observation_follows_distinct_logical_run(
+                    previous,
+                    latest_run_id,
+                    latest_logical_run_id,
+                    "last_observed_run_id",
+                    "last_observed_logical_run_id",
+                    current_logical_run_id,
+                )
+            )
+            destination_holds[key] = {
+                "candidate_id": candidate_id,
+                "reason": reason,
+                "observations": min(
+                    100,
+                    (
+                        safe_nonnegative_int(
+                            previous.get("observations")
+                        )
+                        if consecutive
+                        else 0
+                    )
+                    + 1,
+                ),
+                "last_observed_at": now,
+                "last_observed_run_id": counters.observation_run_id,
+                "last_observed_logical_run_id": current_logical_run_id,
+            }
+        if len(destination_holds) > 5000:
+            raise DestinationConsistencyError(
+                "목적지 안전 보류 상태가 보존 한도를 초과했습니다"
+            )
+        state["destination_holds"] = destination_holds
     source_ids = [
         result.source.config_fk
         for result in report.sources
@@ -1264,7 +1416,10 @@ def update_state_from_report(
             for watermark in full_watermarks
             if watermark is not None
         ).isoformat()
-    if report.write_safe:
+    if safety_deferred:
+        if safe_count:
+            state["last_partial_success_at"] = now
+    elif report.write_safe:
         state["last_success_at"] = now
         state["consecutive_failures"] = 0
     else:
@@ -1314,6 +1469,7 @@ def append_run_record(
                 "top_present_ids",
                 "shrink_candidate_observations",
                 "shrink_candidate_clears",
+                "destination_hold_observations",
                 "observation_run_id",
                 "observation_logical_run_id",
                 "unresolved_pending_notices",

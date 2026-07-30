@@ -4284,6 +4284,143 @@ class SyncSafetyTests(unittest.TestCase):
             counters.unresolved_pending_page_ids,
             ["pending-1"],
         )
+        hold_key = sync_engine.destination_hold_key("2", "1")
+        self.assertEqual(counters.destination_hold_count, 1)
+        self.assertEqual(counters.repeated_destination_hold_count, 0)
+        self.assertEqual(
+            counters.destination_hold_observations[hold_key],
+            {
+                "candidate_id": "",
+                "reason": "pending_refresh",
+            },
+        )
+
+    def test_destination_hold_escalates_only_on_next_logical_run(self):
+        result = source_result("2", SourceStatus.SUCCESS, [])
+        report = CrawlReport(sources=[result])
+        context = sync_engine.DestinationContext(
+            "token",
+            "database",
+            pending_page_ids=("pending-1",),
+            pending_page_sources={"pending-1": "2"},
+            pending_page_notices={"pending-1": "1"},
+        )
+        pending = managed_page("pending-1", "2", "1")
+        hold_key = sync_engine.destination_hold_key("2", "1")
+        state = {
+            "runs": [
+                {
+                    "run_id": "run-1",
+                    "run_attempt": "1",
+                    "execution_id": "run-1:1",
+                }
+            ],
+            "sources": {},
+            "destination_holds": {
+                hold_key: {
+                    "candidate_id": "",
+                    "reason": "pending_refresh",
+                    "observations": 1,
+                    "last_observed_at": (
+                        datetime.now(timezone.utc).isoformat()
+                    ),
+                    "last_observed_run_id": "run-1:1",
+                    "last_observed_logical_run_id": "run-1",
+                }
+            },
+        }
+
+        with (
+            patch.object(
+                sync_engine,
+                "prepare_destination",
+                return_value=context,
+            ),
+            patch.object(
+                sync_engine,
+                "inspect_pending_pages",
+                return_value=[pending],
+            ),
+        ):
+            rerun = sync_engine.apply_report(
+                "token",
+                "database",
+                report,
+                False,
+                previous_state=state,
+                run_id="run-1:2",
+                logical_run_id="run-1",
+            )
+            next_run = sync_engine.apply_report(
+                "token",
+                "database",
+                report,
+                False,
+                previous_state=state,
+                run_id="run-2:1",
+                logical_run_id="run-2",
+            )
+
+        self.assertEqual(rerun.destination_hold_count, 1)
+        self.assertEqual(rerun.repeated_destination_hold_count, 0)
+        self.assertEqual(next_run.destination_hold_count, 1)
+        self.assertEqual(
+            next_run.repeated_destination_hold_count,
+            1,
+        )
+
+    def test_destination_hold_requires_same_condition_to_escalate(self):
+        hold_key = sync_engine.destination_hold_key("2", "1")
+        candidate_id = "a" * 64
+        state = {
+            "runs": [
+                {
+                    "run_id": "run-1",
+                    "run_attempt": "1",
+                    "execution_id": "run-1:1",
+                }
+            ],
+            "destination_holds": {
+                hold_key: {
+                    "candidate_id": candidate_id,
+                    "reason": "destructive_change_confirmation",
+                    "observations": 1,
+                    "last_observed_at": (
+                        datetime.now(timezone.utc).isoformat()
+                    ),
+                    "last_observed_run_id": "run-1:1",
+                    "last_observed_logical_run_id": "run-1",
+                }
+            },
+        }
+
+        self.assertTrue(
+            sync_engine.destination_hold_repeated(
+                state,
+                hold_key,
+                "run-2",
+                candidate_id,
+                "destructive_change_confirmation",
+            )
+        )
+        self.assertFalse(
+            sync_engine.destination_hold_repeated(
+                state,
+                hold_key,
+                "run-2",
+                "b" * 64,
+                "destructive_change_confirmation",
+            )
+        )
+        self.assertFalse(
+            sync_engine.destination_hold_repeated(
+                state,
+                hold_key,
+                "run-2",
+                "",
+                "pending_refresh",
+            )
+        )
 
     def test_pending_quarantine_allows_other_source_items(self):
         quarantined_item = {
@@ -4535,6 +4672,7 @@ class SyncSafetyTests(unittest.TestCase):
             *sync_engine.prepare_source_items(quarantined_result),
             *sync_engine.prepare_source_items(healthy_result),
         ]
+        candidate_id = "c" * 64
         existing = managed_page("pending-1", "2", "1")
         preflight = [
             sync_engine.DestinationPreflight(
@@ -4543,7 +4681,7 @@ class SyncSafetyTests(unittest.TestCase):
                 operation_id="operation-1",
                 shrink_key="2:1",
                 shrink_candidate={
-                    "candidate_id": "candidate",
+                    "candidate_id": candidate_id,
                     "reasons": ["body_shrink"],
                 },
             ),
@@ -4619,9 +4757,18 @@ class SyncSafetyTests(unittest.TestCase):
             counters.shrink_candidate_observations,
             {
                 "2:1": {
-                    "candidate_id": "candidate",
+                    "candidate_id": candidate_id,
                     "reasons": ["body_shrink"],
                 }
+            },
+        )
+        hold_key = sync_engine.destination_hold_key("2", "1")
+        self.assertEqual(counters.destination_hold_count, 1)
+        self.assertEqual(
+            counters.destination_hold_observations[hold_key],
+            {
+                "candidate_id": candidate_id,
+                "reason": "destructive_change_confirmation",
             },
         )
 

@@ -279,9 +279,34 @@ def destination_contract_summary(
     )
 
 
+def validate_destination_hold_counters(
+    counters: Optional[SyncCounters],
+) -> None:
+    if counters is None:
+        return
+    unresolved_count = len(counters.unresolved_pending_page_ids)
+    observation_count = len(
+        counters.destination_hold_observations
+    )
+    hold_count = counters.destination_hold_count
+    repeated_count = counters.repeated_destination_hold_count
+    if (
+        bool(counters.quarantined_source_ids) != bool(unresolved_count)
+        or hold_count != unresolved_count
+        or hold_count != observation_count
+        or repeated_count < 0
+        or repeated_count > hold_count
+    ):
+        raise DestinationConsistencyError(
+            "목적지 안전 보류 집계의 일관성을 확인할 수 없습니다"
+        )
+
+
 def add_destination_quarantine_issues(
     report: CrawlReport,
     source_ids: list[str],
+    *,
+    fatal: bool = True,
 ) -> None:
     existing = {
         issue.source_config_fk
@@ -299,7 +324,26 @@ def add_destination_quarantine_issues(
                     f"출처를 격리했습니다: {source_id}"
                 ),
                 source_config_fk=source_id,
+                fatal=fatal,
             )
+        )
+
+
+def report_destination_safety_hold(
+    summary: str,
+    *,
+    dry_run: bool = False,
+) -> None:
+    mode = "드라이런" if dry_run else "쓰기 실행"
+    LOGGER.warning(
+        "Notion 안전 재확인 대기: 모드=%s, %s",
+        mode,
+        summary,
+    )
+    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+        print(
+            "::warning title=Notion 안전 재확인 대기::"
+            f"{summary} 다음 독립 실행에서 다시 확인합니다."
         )
 
 
@@ -807,11 +851,13 @@ def main() -> None:
                     state,
                     logical_run_id=record.run_id,
                 )
+                dry_run_source_write_safe = report.write_safe
                 dry_run_destination_summary = ""
                 if plan.quarantined_source_ids:
                     add_destination_quarantine_issues(
                         report,
                         plan.quarantined_source_ids,
+                        fatal=False,
                     )
                     dry_run_destination_summary = (
                         "Notion 대기 페이지 격리 계획이 있습니다: "
@@ -820,15 +866,17 @@ def main() -> None:
                 record.planned_writes = plan.write_count
                 record.finished_at = utc_now_iso()
                 record.status = (
-                    "dry_run_succeeded"
-                    if report.write_safe
-                    and not dry_run_destination_summary
-                    else "dry_run_failed"
+                    "dry_run_deferred"
+                    if dry_run_destination_summary
+                    and dry_run_source_write_safe
+                    else (
+                        "dry_run_succeeded"
+                        if report.write_safe
+                        else "dry_run_failed"
+                    )
                 )
                 record.failure_category = (
-                    FailureCategory.DESTINATION_CONTRACT
-                    if dry_run_destination_summary
-                    else report.failure_category
+                    report.failure_category
                 )
                 append_run_record(state, record)
                 write_run_state_atomic(state_path, state)
@@ -848,20 +896,11 @@ def main() -> None:
                     len(report.sources),
                 )
                 if dry_run_destination_summary:
-                    incident = build_incident(
-                        state,
-                        FailureCategory.DESTINATION_CONTRACT,
-                        "Notion 대기 페이지 격리 필요",
+                    report_destination_safety_hold(
                         dry_run_destination_summary,
-                        report,
+                        dry_run=True,
                     )
-                    deferred_incident = incident
-                    write_run_state_atomic(state_path, state)
-                    write_json_atomic(incident_path, incident)
-                    deferred_error = DestinationConsistencyError(
-                        dry_run_destination_summary
-                    )
-                elif not report.write_safe:
+                if not dry_run_source_write_safe:
                     incident = build_incident(
                         state,
                         report.failure_category,
@@ -892,18 +931,33 @@ def main() -> None:
                 elif report.write_safe:
                     raise RuntimeError("동기화할 출처가 없습니다")
                 source_report_write_safe = report.write_safe
+                source_failure_category = report.failure_category
+                source_failure_summary = (
+                    ""
+                    if source_report_write_safe
+                    else report_failure_summary(report)
+                )
+                validate_destination_hold_counters(counters)
                 destination_summary = destination_contract_summary(
                     counters
+                )
+                repeated_destination_hold_count = (
+                    counters.repeated_destination_hold_count
+                    if counters is not None
+                    else 0
+                )
+                repeated_destination_hold = bool(
+                    destination_summary
+                    and repeated_destination_hold_count
                 )
                 if destination_summary and counters is not None:
                     add_destination_quarantine_issues(
                         report,
                         counters.quarantined_source_ids,
+                        fatal=repeated_destination_hold,
                     )
                 external_download_summary = (
                     external_download_incident_summary(counters)
-                    if source_report_write_safe
-                    else ""
                 )
                 if external_download_summary:
                     report.issues.append(
@@ -912,6 +966,12 @@ def main() -> None:
                             message=external_download_summary,
                         )
                     )
+                destination_safety_deferred = bool(
+                    destination_summary
+                    and not repeated_destination_hold
+                    and source_report_write_safe
+                    and not external_download_summary
+                )
                 quarantined_source_ids = (
                     set(counters.quarantined_source_ids)
                     if counters is not None
@@ -932,52 +992,96 @@ def main() -> None:
                         }
                     ),
                     counters,
+                    safety_deferred=destination_safety_deferred,
                 )
                 record.finished_at = utc_now_iso()
                 record.status = (
-                    "succeeded"
-                    if report.write_safe
-                    and not destination_summary
-                    and not external_download_summary
-                    else "partial_failed"
+                    "safety_deferred"
+                    if destination_safety_deferred
+                    else (
+                        "succeeded"
+                        if report.write_safe
+                        and not destination_summary
+                        and not external_download_summary
+                        else "partial_failed"
+                    )
                 )
                 record.failure_category = (
-                    FailureCategory.DESTINATION_CONTRACT
-                    if destination_summary
+                    FailureCategory.SECURITY_POLICY
+                    if external_download_summary
                     else (
-                        FailureCategory.SECURITY_POLICY
-                        if external_download_summary
-                        else report.failure_category
+                        source_failure_category
+                        if source_failure_summary
+                        else (
+                            FailureCategory.DESTINATION_CONTRACT
+                            if repeated_destination_hold
+                            else report.failure_category
+                        )
                     )
                 )
                 append_run_record(state, record, counters)
-                if destination_summary:
-                    incident = build_incident(
-                        state,
-                        FailureCategory.DESTINATION_CONTRACT,
-                        "Notion 대기 페이지 출처 격리",
-                        destination_summary,
-                        report,
-                    )
-                    deferred_incident = incident
-                    write_json_atomic(incident_path, incident)
-                    deferred_error = DestinationConsistencyError(
+                if destination_summary and not repeated_destination_hold:
+                    report_destination_safety_hold(
                         destination_summary
                     )
-                elif external_download_summary:
+                repeated_summary = (
+                    (
+                        f"{destination_summary}; "
+                        "다음 독립 실행에도 남은 대기 항목="
+                        f"{repeated_destination_hold_count}"
+                    )
+                    if repeated_destination_hold
+                    else ""
+                )
+                failure_components = [
+                    (label, summary)
+                    for label, summary in (
+                        ("수집 검증", source_failure_summary),
+                        ("외부 파일", external_download_summary),
+                        ("Notion 안전 보류", repeated_summary),
+                    )
+                    if summary
+                ]
+                if failure_components:
+                    combined_failure_summary = (
+                        "; ".join(
+                            f"{label}: {summary}"
+                            for label, summary in failure_components
+                        )
+                        if len(failure_components) > 1
+                        else failure_components[0][1]
+                    )
+                    if len(failure_components) > 1:
+                        incident_title = "서강대 공지 동기화 복합 실패"
+                    elif external_download_summary:
+                        incident_title = (
+                            "서강대 외부 파일 다운로드 안전 차단"
+                        )
+                    elif source_failure_summary:
+                        incident_title = "서강대 공지 부분 동기화 실패"
+                    else:
+                        incident_title = (
+                            "Notion 대기 페이지 안전 보류 지속"
+                        )
                     incident = build_incident(
                         state,
-                        FailureCategory.SECURITY_POLICY,
-                        "서강대 외부 파일 다운로드 안전 차단",
-                        external_download_summary,
+                        record.failure_category,
+                        incident_title,
+                        combined_failure_summary,
                         report,
                     )
                     deferred_incident = incident
                     write_json_atomic(incident_path, incident)
-                    deferred_error = RuntimeError(
-                        external_download_summary
+                    deferred_error = (
+                        DestinationConsistencyError(
+                            combined_failure_summary
+                        )
+                        if repeated_summary
+                        and not source_failure_summary
+                        and not external_download_summary
+                        else RuntimeError(combined_failure_summary)
                     )
-                elif report.write_safe:
+                else:
                     recovered_count = clear_active_incidents(state)
                     incident_path.unlink(missing_ok=True)
                     if recovered_count:
@@ -985,19 +1089,15 @@ def main() -> None:
                             "이전 실패 상태 %s건이 정상 실행으로 해소됐습니다",
                             recovered_count,
                         )
-                else:
-                    incident = build_incident(
-                        state,
-                        report.failure_category,
-                        "서강대 공지 부분 동기화 실패",
-                        report_failure_summary(report),
+                write_json_atomic(
+                    snapshot_path,
+                    snapshot_payload(
                         report,
-                    )
-                    deferred_incident = incident
-                    write_json_atomic(incident_path, incident)
-                    deferred_error = RuntimeError(
-                        report_failure_summary(report)
-                    )
+                        record.run_id,
+                        full_reconcile,
+                        dry_run,
+                    ),
+                )
                 write_run_state_atomic(state_path, state)
                 if counters is not None:
                     LOGGER.info(

@@ -26,6 +26,7 @@ from models import (
     FailureCategory,
     ListPageResult,
     MutationKind,
+    MutationPlan,
     SiteFetchResult,
     SourceCrawlResult,
     SourceSpec,
@@ -775,36 +776,26 @@ class CrawlerRegressionTests(unittest.TestCase):
             ["141", "2"],
         )
 
-    def test_main_records_quarantine_as_partial_destination_failure(self):
-        healthy = crawl_result()
-        quarantined = SourceCrawlResult(
-            source=SourceSpec(
-                config_fk="2",
-                classification="학사공지",
-                list_url=(
-                    "https://www.sogang.ac.kr/ko/academic-notice"
-                ),
-            ),
-            status=SourceStatus.SUCCESS,
-            terminal_reached=True,
-            termination_reason="natural_end",
-        )
-        report = CrawlReport(sources=[healthy, quarantined])
-        counters = SyncCounters(
-            quarantined_source_ids=["2"],
-            unresolved_pending_page_ids=["pending-1"],
-            pending_seen=1,
-        )
-        temp_directory = tempfile.TemporaryDirectory()
-        self.addCleanup(temp_directory.cleanup)
-        temp_dir = temp_directory.name
-
+    def _run_main_with_sync_result(
+        self,
+        temp_dir: str,
+        report: CrawlReport,
+        counters: SyncCounters | None,
+        state: dict,
+        *,
+        dry_run: bool = False,
+        plan: MutationPlan | None = None,
+    ) -> None:
         with (
             patch.dict(
                 os.environ,
                 {
                     "NOTION_TOKEN": "token",
                     "NOTION_DB_ID": "database",
+                    "GITHUB_RUN_ID": "current-run",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "CRAWLER_RUN_ID": "current-run",
+                    "CRAWLER_RUN_ATTEMPT": "1",
                 },
             ),
             patch.object(crawler_main, "setup_logging"),
@@ -820,7 +811,7 @@ class CrawlerRegressionTests(unittest.TestCase):
             patch.object(
                 crawler_main,
                 "should_run_dry_run",
-                return_value=False,
+                return_value=dry_run,
             ),
             patch.object(
                 crawler_main,
@@ -835,7 +826,10 @@ class CrawlerRegressionTests(unittest.TestCase):
             patch.object(
                 crawler_main,
                 "get_bbs_config_fks",
-                return_value=["141", "2"],
+                return_value=[
+                    result.source.config_fk
+                    for result in report.sources
+                ],
             ),
             patch.object(
                 crawler_main,
@@ -860,7 +854,7 @@ class CrawlerRegressionTests(unittest.TestCase):
             patch.object(
                 crawler_main,
                 "load_run_state",
-                return_value=default_run_state(),
+                return_value=state,
             ),
             patch.object(
                 crawler_main,
@@ -881,27 +875,67 @@ class CrawlerRegressionTests(unittest.TestCase):
                 "apply_report",
                 return_value=counters,
             ),
-            self.assertRaises(DestinationConsistencyError),
+            patch.object(
+                crawler_main,
+                "build_dry_run_plan",
+                return_value=plan,
+            ),
         ):
             crawler_main.main()
+
+    def test_main_records_first_quarantine_as_safety_deferred_success(self):
+        healthy = crawl_result()
+        quarantined = SourceCrawlResult(
+            source=SourceSpec(
+                config_fk="2",
+                classification="학사공지",
+                list_url=(
+                    "https://www.sogang.ac.kr/ko/academic-notice"
+                ),
+            ),
+            status=SourceStatus.SUCCESS,
+            terminal_reached=True,
+            termination_reason="natural_end",
+        )
+        report = CrawlReport(sources=[healthy, quarantined])
+        hold_key = sync_engine.destination_hold_key("2", "548926")
+        counters = SyncCounters(
+            quarantined_source_ids=["2"],
+            unresolved_pending_page_ids=["pending-1"],
+            pending_seen=1,
+            destination_hold_observations={
+                hold_key: {
+                    "candidate_id": "",
+                    "reason": "pending_refresh",
+                }
+            },
+            destination_hold_count=1,
+            observation_run_id="current-run:1",
+            observation_logical_run_id="current-run",
+        )
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+        temp_dir = temp_directory.name
+
+        self._run_main_with_sync_result(
+            temp_dir,
+            report,
+            counters,
+            default_run_state(),
+        )
 
         state = json.loads(
             (Path(temp_dir) / "run-state.json").read_text(
                 encoding="utf-8"
             )
         )
-        incident = json.loads(
-            (Path(temp_dir) / "incident.json").read_text(
-                encoding="utf-8"
-            )
-        )
         self.assertEqual(
             state["runs"][-1]["status"],
-            "partial_failed",
+            "safety_deferred",
         )
         self.assertEqual(
             state["runs"][-1]["failure_category"],
-            FailureCategory.DESTINATION_CONTRACT.value,
+            FailureCategory.NONE.value,
         )
         self.assertIn(
             "last_success_at",
@@ -912,10 +946,333 @@ class CrawlerRegressionTests(unittest.TestCase):
             state["sources"]["2"],
         )
         self.assertIsNone(state["last_success_at"])
+        self.assertIsNotNone(state["last_partial_success_at"])
+        self.assertFalse(
+            (Path(temp_dir) / "incident.json").exists()
+        )
+        self.assertFalse(report.issues[-1].fatal)
+        self.assertEqual(
+            state["destination_holds"][hold_key]["observations"],
+            1,
+        )
+
+    def test_main_rejects_unpersisted_destination_hold(self):
+        report = CrawlReport(sources=[crawl_result()])
+        counters = SyncCounters(
+            quarantined_source_ids=["141"],
+            unresolved_pending_page_ids=["pending-1"],
+            pending_seen=1,
+        )
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+
+        with self.assertRaisesRegex(
+            DestinationConsistencyError,
+            "집계의 일관성",
+        ):
+            self._run_main_with_sync_result(
+                temp_directory.name,
+                report,
+                counters,
+                default_run_state(),
+            )
+
+    def test_main_escalates_repeated_quarantine_to_failure(self):
+        report = CrawlReport(sources=[crawl_result()])
+        hold_key = sync_engine.destination_hold_key("141", "548926")
+        counters = SyncCounters(
+            quarantined_source_ids=["141"],
+            unresolved_pending_page_ids=["pending-1"],
+            pending_seen=1,
+            destination_hold_observations={
+                hold_key: {
+                    "candidate_id": "",
+                    "reason": "pending_refresh",
+                }
+            },
+            destination_hold_count=1,
+            repeated_destination_hold_count=1,
+            observation_run_id="current-run:1",
+            observation_logical_run_id="current-run",
+        )
+        state = default_run_state()
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+        temp_dir = temp_directory.name
+
+        with self.assertRaises(DestinationConsistencyError):
+            self._run_main_with_sync_result(
+                temp_dir,
+                report,
+                counters,
+                state,
+            )
+
+        saved_state = json.loads(
+            (Path(temp_dir) / "run-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        incident = json.loads(
+            (Path(temp_dir) / "incident.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            saved_state["runs"][-1]["status"],
+            "partial_failed",
+        )
+        self.assertEqual(
+            saved_state["runs"][-1]["failure_category"],
+            FailureCategory.DESTINATION_CONTRACT.value,
+        )
         self.assertEqual(
             incident["category"],
             FailureCategory.DESTINATION_CONTRACT.value,
         )
+        self.assertTrue(report.issues[-1].fatal)
+
+    def test_main_dry_run_reports_quarantine_without_failure(self):
+        report = CrawlReport(sources=[crawl_result()])
+        plan = MutationPlan(
+            run_id="dry-run",
+            quarantined_source_ids=["141"],
+        )
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+        temp_dir = temp_directory.name
+
+        self._run_main_with_sync_result(
+            temp_dir,
+            report,
+            None,
+            default_run_state(),
+            dry_run=True,
+            plan=plan,
+        )
+
+        saved_state = json.loads(
+            (Path(temp_dir) / "run-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        snapshot = json.loads(
+            (Path(temp_dir) / "snapshot.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            saved_state["runs"][-1]["status"],
+            "dry_run_deferred",
+        )
+        self.assertEqual(
+            saved_state["runs"][-1]["failure_category"],
+            FailureCategory.NONE.value,
+        )
+        self.assertFalse(
+            (Path(temp_dir) / "incident.json").exists()
+        )
+        self.assertTrue(snapshot["report"]["write_safe"])
+        self.assertFalse(report.issues[-1].fatal)
+
+    def test_main_dry_run_quarantine_does_not_mask_source_failure(self):
+        failed = crawl_result()
+        failed.status = SourceStatus.FAILED
+        failed.category = FailureCategory.SOURCE_UPSTREAM
+        failed.error = "source unavailable"
+        failed.terminal_reached = False
+        failed.termination_reason = ""
+        report = CrawlReport(sources=[failed])
+        plan = MutationPlan(
+            run_id="dry-run",
+            quarantined_source_ids=["141"],
+        )
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+        temp_dir = temp_directory.name
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "source unavailable",
+        ):
+            self._run_main_with_sync_result(
+                temp_dir,
+                report,
+                None,
+                default_run_state(),
+                dry_run=True,
+                plan=plan,
+            )
+
+        saved_state = json.loads(
+            (Path(temp_dir) / "run-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            saved_state["runs"][-1]["status"],
+            "dry_run_failed",
+        )
+        self.assertEqual(
+            saved_state["runs"][-1]["failure_category"],
+            FailureCategory.SOURCE_UPSTREAM.value,
+        )
+
+    def test_main_safety_hold_does_not_mask_external_download_failure(self):
+        report = CrawlReport(sources=[crawl_result()])
+        hold_key = sync_engine.destination_hold_key("141", "548926")
+        counters = SyncCounters(
+            quarantined_source_ids=["141"],
+            unresolved_pending_page_ids=["pending-1"],
+            pending_seen=1,
+            destination_hold_observations={
+                hold_key: {
+                    "candidate_id": "",
+                    "reason": "pending_refresh",
+                }
+            },
+            destination_hold_count=1,
+            observation_run_id="current-run:1",
+            observation_logical_run_id="current-run",
+            external_download_status_code=403,
+            external_download_stopped_reason="http_403",
+            external_download_requests=1,
+        )
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+        temp_dir = temp_directory.name
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "외부 파일 다운로드 안전 회로",
+        ):
+            self._run_main_with_sync_result(
+                temp_dir,
+                report,
+                counters,
+                default_run_state(),
+            )
+
+        saved_state = json.loads(
+            (Path(temp_dir) / "run-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            saved_state["runs"][-1]["status"],
+            "partial_failed",
+        )
+        self.assertEqual(
+            saved_state["runs"][-1]["failure_category"],
+            FailureCategory.SECURITY_POLICY.value,
+        )
+
+    def test_main_repeated_hold_does_not_mask_external_download_failure(
+        self,
+    ):
+        report = CrawlReport(sources=[crawl_result()])
+        hold_key = sync_engine.destination_hold_key("141", "548926")
+        counters = SyncCounters(
+            quarantined_source_ids=["141"],
+            unresolved_pending_page_ids=["pending-1"],
+            pending_seen=1,
+            destination_hold_observations={
+                hold_key: {
+                    "candidate_id": "",
+                    "reason": "pending_refresh",
+                }
+            },
+            destination_hold_count=1,
+            repeated_destination_hold_count=1,
+            observation_run_id="current-run:1",
+            observation_logical_run_id="current-run",
+            external_download_status_code=403,
+            external_download_stopped_reason="http_403",
+            external_download_requests=1,
+        )
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "외부 파일.*Notion 안전 보류",
+        ):
+            self._run_main_with_sync_result(
+                temp_directory.name,
+                report,
+                counters,
+                default_run_state(),
+            )
+
+        incident = json.loads(
+            (
+                Path(temp_directory.name) / "incident.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            incident["category"],
+            FailureCategory.SECURITY_POLICY.value,
+        )
+        self.assertIn("외부 파일:", incident["summary"])
+        self.assertIn("Notion 안전 보류:", incident["summary"])
+
+    def test_main_repeated_hold_does_not_mask_source_failure(self):
+        healthy = crawl_result()
+        failed = SourceCrawlResult(
+            source=SourceSpec(
+                config_fk="2",
+                classification="학사공지",
+                list_url=(
+                    "https://www.sogang.ac.kr/ko/academic-notice"
+                ),
+            ),
+            status=SourceStatus.FAILED,
+            category=FailureCategory.SOURCE_UPSTREAM,
+            error="source unavailable",
+        )
+        report = CrawlReport(sources=[healthy, failed])
+        hold_key = sync_engine.destination_hold_key("141", "548926")
+        counters = SyncCounters(
+            quarantined_source_ids=["141"],
+            unresolved_pending_page_ids=["pending-1"],
+            unresolved_pending_notices={"141": ["548926"]},
+            pending_seen=1,
+            destination_hold_observations={
+                hold_key: {
+                    "candidate_id": "",
+                    "reason": "pending_refresh",
+                }
+            },
+            destination_hold_count=1,
+            repeated_destination_hold_count=1,
+            observation_run_id="current-run:1",
+            observation_logical_run_id="current-run",
+        )
+        temp_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_directory.cleanup)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "수집 검증.*Notion 안전 보류",
+        ):
+            self._run_main_with_sync_result(
+                temp_directory.name,
+                report,
+                counters,
+                default_run_state(),
+            )
+
+        incident = json.loads(
+            (
+                Path(temp_directory.name) / "incident.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            incident["category"],
+            FailureCategory.SOURCE_UPSTREAM.value,
+        )
+        self.assertIn("수집 검증:", incident["summary"])
+        self.assertIn("Notion 안전 보류:", incident["summary"])
 
     def test_main_external_download_circuit_blocks_success_state_advancement(
         self,

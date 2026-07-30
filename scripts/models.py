@@ -204,6 +204,11 @@ class SyncCounters:
         default_factory=dict
     )
     shrink_candidate_clears: list[str] = field(default_factory=list)
+    destination_hold_observations: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
+    destination_hold_count: int = 0
+    repeated_destination_hold_count: int = 0
     observation_run_id: str = ""
     observation_logical_run_id: str = ""
 

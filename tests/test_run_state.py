@@ -155,6 +155,119 @@ class RunStateTests(unittest.TestCase):
             state["sources"]["2"],
         )
 
+    def test_destination_safety_hold_persists_without_marking_success(self):
+        state = run_state.default_run_state()
+        state["consecutive_failures"] = 2
+        report = CrawlReport(
+            sources=[
+                source_result(
+                    "2",
+                    SourceStatus.SUCCESS,
+                    ["100"],
+                )
+            ]
+        )
+        hold_key = "a" * 64
+        candidate_id = "c" * 64
+        first_counters = SyncCounters(
+            observation_run_id="run-1:1",
+            observation_logical_run_id="run-1",
+            destination_hold_observations={
+                hold_key: {
+                    "candidate_id": candidate_id,
+                    "reason": "destructive_change_confirmation",
+                }
+            },
+            destination_hold_count=1,
+        )
+
+        run_state.update_state_from_report(
+            state,
+            report,
+            False,
+            {"2"},
+            first_counters,
+            safety_deferred=True,
+        )
+
+        self.assertIsNone(state["last_success_at"])
+        self.assertIsNotNone(state["last_partial_success_at"])
+        self.assertEqual(state["consecutive_failures"], 2)
+        self.assertEqual(
+            state["destination_holds"][hold_key]["observations"],
+            1,
+        )
+        state["runs"] = [
+            {
+                "run_id": "run-1",
+                "run_attempt": "1",
+                "execution_id": "run-1:1",
+            }
+        ]
+        run_state.update_state_from_report(
+            state,
+            report,
+            False,
+            {"2"},
+            SyncCounters(
+                observation_run_id="run-2:1",
+                observation_logical_run_id="run-2",
+                destination_hold_observations={
+                    hold_key: {
+                        "candidate_id": candidate_id,
+                        "reason": "destructive_change_confirmation",
+                    }
+                },
+                destination_hold_count=1,
+                repeated_destination_hold_count=1,
+            ),
+            safety_deferred=False,
+        )
+        self.assertEqual(
+            state["destination_holds"][hold_key]["observations"],
+            2,
+        )
+        state["runs"].append(
+            {
+                "run_id": "run-2",
+                "run_attempt": "1",
+                "execution_id": "run-2:1",
+            }
+        )
+        run_state.update_state_from_report(
+            state,
+            report,
+            False,
+            {"2"},
+            SyncCounters(
+                observation_run_id="run-3:1",
+                observation_logical_run_id="run-3",
+                destination_hold_observations={
+                    hold_key: {
+                        "candidate_id": "d" * 64,
+                        "reason": "destructive_change_confirmation",
+                    }
+                },
+                destination_hold_count=1,
+            ),
+            safety_deferred=True,
+        )
+        self.assertEqual(
+            state["destination_holds"][hold_key]["observations"],
+            1,
+        )
+        run_state.update_state_from_report(
+            state,
+            report,
+            False,
+            {"2"},
+            SyncCounters(
+                observation_run_id="run-4:1",
+                observation_logical_run_id="run-4",
+            ),
+        )
+        self.assertEqual(state["destination_holds"], {})
+
     def test_same_logical_run_attempt_does_not_confirm_empty_source(self):
         state = run_state.default_run_state()
         state["sources"]["2"] = {
@@ -863,6 +976,16 @@ class RunStateTests(unittest.TestCase):
             "backfill_active": True,
             "last_reconcile_attempt_at": "2026-07-28T00:00:00+00:00",
         }
+        hold_key = "b" * 64
+        state["destination_holds"][hold_key] = {
+            "candidate_id": "",
+            "reason": "pending_refresh",
+            "observations": 1,
+            "last_observed_at": "2026-07-28T00:00:00+00:00",
+            "last_observed_run_id": "1:1",
+            "last_observed_logical_run_id": "1",
+            "private_notice_id": "548926",
+        }
         state["state_checksum"] = run_state.state_checksum(state)
 
         projected = run_state.build_public_cache_state(state)
@@ -878,6 +1001,11 @@ class RunStateTests(unittest.TestCase):
             projected["sources"]["141"]["last_reconcile_attempt_at"],
             "2026-07-28T00:00:00+00:00",
         )
+        self.assertEqual(
+            set(projected["destination_holds"][hold_key]),
+            run_state.PUBLIC_CACHE_DESTINATION_HOLD_FIELDS,
+        )
+        self.assertNotIn("private_notice_id", json.dumps(projected))
 
     def test_atomic_json_write_replaces_complete_document(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -936,6 +1064,78 @@ class RunStateTests(unittest.TestCase):
                 loaded["sources"]["141"]["observed_ids"],
                 ["1001"],
             )
+
+    def test_current_state_without_destination_holds_is_compatible(self):
+        state = run_state.default_run_state()
+        state.pop("destination_holds")
+        state["state_checksum"] = run_state.state_checksum(state)
+
+        validated = run_state.validate_run_state_payload(state)
+
+        self.assertEqual(validated["destination_holds"], {})
+        self.assertEqual(
+            validated["state_checksum"],
+            run_state.state_checksum(validated),
+        )
+
+    def test_invalid_destination_hold_state_is_rejected(self):
+        valid_hold = {
+            "candidate_id": "",
+            "reason": "pending_refresh",
+            "observations": 1,
+            "last_observed_at": "2026-07-28T00:00:00+00:00",
+            "last_observed_run_id": "1:1",
+            "last_observed_logical_run_id": "1",
+        }
+        cases = {
+            "raw_identity_key": (
+                "2:548926",
+                valid_hold,
+            ),
+            "unknown_reason": (
+                "a" * 64,
+                {**valid_hold, "reason": "unknown"},
+            ),
+            "pending_candidate": (
+                "a" * 64,
+                {**valid_hold, "candidate_id": "b" * 64},
+            ),
+            "invalid_destructive_candidate": (
+                "a" * 64,
+                {
+                    **valid_hold,
+                    "reason": "destructive_change_confirmation",
+                    "candidate_id": "candidate",
+                },
+            ),
+            "boolean_observation_count": (
+                "a" * 64,
+                {**valid_hold, "observations": True},
+            ),
+            "missing_execution_id": (
+                "a" * 64,
+                {**valid_hold, "last_observed_run_id": ""},
+            ),
+            "invalid_timestamp": (
+                "a" * 64,
+                {**valid_hold, "last_observed_at": "invalid"},
+            ),
+        }
+
+        for name, (hold_key, hold) in cases.items():
+            with self.subTest(name=name):
+                state = run_state.default_run_state()
+                state["destination_holds"] = {
+                    hold_key: hold,
+                }
+                state["state_checksum"] = run_state.state_checksum(
+                    state
+                )
+
+                with self.assertRaises(
+                    run_state.RunStateIntegrityError
+                ):
+                    run_state.validate_run_state_payload(state)
 
     def test_run_state_tampering_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
