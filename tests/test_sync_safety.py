@@ -1176,6 +1176,14 @@ class SyncSafetyTests(unittest.TestCase):
 
     def test_invalid_same_generation_is_preserved_when_replacement_append_fails(self):
         store = StatefulBlockStore("append_failure")
+        store.properties[sync.SYNC_GENERATION_PROPERTY] = {
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {"content": "new-generation"},
+                }
+            ]
+        }
         store.root_blocks = [
             block
             for block in store.root_blocks
@@ -1204,6 +1212,14 @@ class SyncSafetyTests(unittest.TestCase):
 
     def test_unsealed_same_generation_is_replaced_after_verified_append(self):
         store = StatefulBlockStore()
+        store.properties[sync.SYNC_GENERATION_PROPERTY] = {
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {"content": "new-generation"},
+                }
+            ]
+        }
         store.root_blocks = [
             block
             for block in store.root_blocks
@@ -1230,7 +1246,7 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertNotIn(store.old_id, store.root_ids())
         self.assertIn("new-managed-1", store.root_ids())
 
-    def test_legacy_marker_remains_managed(self):
+    def test_manifest_authenticated_legacy_marker_remains_managed(self):
         legacy = {
             "id": "legacy",
             "type": "quote",
@@ -1248,10 +1264,25 @@ class SyncSafetyTests(unittest.TestCase):
                 ]
             },
         }
-        with patch.object(
-            sync,
-            "list_block_children",
-            return_value=[legacy],
+        with (
+            patch.object(
+                sync,
+                "load_body_generation_manifest",
+                return_value={
+                    "v": 1,
+                    "g": "legacy",
+                    "s": "legacy",
+                    "op": "",
+                    "t": 0,
+                    "p": [],
+                    "o": [],
+                },
+            ),
+            patch.object(
+                sync,
+                "list_block_children",
+                return_value=[legacy],
+            ),
         ):
             self.assertEqual(
                 sync.list_sync_container_blocks("token", "page"),

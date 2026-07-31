@@ -265,14 +265,35 @@ def is_managed_sync_rich_text(rich_text: list[JsonObject]) -> bool:
 
 
 def list_sync_container_blocks(token: str, page_id: str) -> list[JsonObject]:
-    managed: list[JsonObject] = []
-    for block in list_block_children(token, page_id):
-        if block.get("type") != "quote":
-            continue
-        rich_text = block.get("quote", {}).get("rich_text", [])
-        if is_managed_sync_rich_text(rich_text):
-            managed.append(block)
-    return managed
+    manifest = load_body_generation_manifest(token, page_id)
+    if not manifest:
+        return []
+    if manifest.get("v") == 1:
+        generation_id = str(manifest.get("g") or "")
+        return [
+            block
+            for block in list_block_children(token, page_id)
+            if (
+                block.get("type") == "quote"
+                and extract_sync_generation(
+                    block.get("quote", {}).get("rich_text", [])
+                )[0]
+                == generation_id
+            )
+        ]
+    if (
+        manifest.get("v") != BODY_GENERATION_MANIFEST_VERSION
+        or manifest.get("s") not in {"pending", "committed"}
+    ):
+        return []
+    return [
+        block
+        for _, block in body_generation_blocks_from_manifest(
+            token,
+            page_id,
+            manifest,
+        )
+    ]
 
 
 def group_sync_containers(blocks: list[JsonObject]) -> dict[str, list[tuple[int, int, JsonObject]]]:
@@ -459,8 +480,8 @@ def top_level_quote_state(
     if not page_id or not isinstance(properties, dict):
         raise RuntimeError("Notion 페이지 식별 정보가 올바르지 않습니다")
     manifest = extract_body_generation_manifest(properties)
-    tracked_ids = {
-        str(part.get("i") or "").strip()
+    tracked_hashes = {
+        str(part.get("i") or "").strip(): str(part.get("h") or "")
         for part in [
             *(manifest.get("p", []) if manifest else []),
             *(manifest.get("o", []) if manifest else []),
@@ -468,24 +489,47 @@ def top_level_quote_state(
         if isinstance(part, dict)
         and str(part.get("i") or "").strip()
     }
+    legacy_generation_id = (
+        str(manifest.get("g") or "")
+        if manifest and manifest.get("v") == 1
+        else ""
+    )
     state: list[JsonObject] = []
     for block in list_block_children(token, page_id):
         if block.get("type") != "quote":
             continue
         block_id = str(block.get("id") or "").strip()
-        rich_text = block.get("quote", {}).get("rich_text", [])
         if not block_id:
             raise RuntimeError("최상위 인용 블록 ID를 확인할 수 없습니다")
-        content_hash = sync_container_actual_hash(token, block)
+        expected_hash = tracked_hashes.get(block_id, "")
+        rich_text = block.get("quote", {}).get("rich_text", [])
+        legacy_authenticated = bool(
+            legacy_generation_id
+            and isinstance(rich_text, list)
+            and extract_sync_generation(rich_text)[0]
+            == legacy_generation_id
+        )
+        content_hash = (
+            sync_container_actual_hash(
+                token,
+                block,
+                marker_authenticated=True,
+            )
+            if legacy_authenticated
+            else sync_container_actual_hash_for_expected(
+                token,
+                block,
+                expected_hash,
+            )
+        )
         if not BODY_GENERATION_HASH_RE.fullmatch(content_hash):
             raise RuntimeError("최상위 인용 블록 내용을 검증할 수 없습니다")
         state.append(
             {
                 "id": block_id,
                 "managed": bool(
-                    block_id in tracked_ids
-                    or isinstance(rich_text, list)
-                    and has_sync_marker(rich_text)
+                    block_id in tracked_hashes
+                    or legacy_authenticated
                 ),
                 "content_hash": content_hash,
             }
@@ -537,27 +581,9 @@ def body_generation_blocks_from_manifest(
 
 
 def find_sync_container_id(token: str, page_id: str) -> Optional[str]:
-    queue: list[JsonObject] = list_block_children(token, page_id)
-    while queue:
-        block = queue.pop(0)
-        if block.get("type") == "quote":
-            rich_text = block.get("quote", {}).get("rich_text", [])
-            if is_managed_sync_rich_text(rich_text):
-                managed_block_id = str(block.get("id") or "").strip()
-                return managed_block_id or None
-        if block.get("has_children"):
-            block_id = str(block.get("id") or "").strip()
-            if not block_id:
-                continue
-            try:
-                children: list[JsonObject] = list_block_children(
-                    token,
-                    block_id,
-                )
-                queue.extend(children)
-            except NotionRequestError as exc:
-                LOGGER.info("하위 블록 조회 실패: %s (%s)", block_id, exc)
-    return None
+    block = find_sync_container_block(token, page_id)
+    block_id = str(block.get("id") or "").strip() if block else ""
+    return block_id or None
 
 
 def find_body_generation_blocks(
@@ -565,32 +591,27 @@ def find_body_generation_blocks(
     page_id: str,
     generation_id: str = "",
 ) -> list[JsonObject]:
-    top_blocks: list[JsonObject] = list_block_children(token, page_id)
-    quote_blocks: list[JsonObject] = []
-    marked_blocks: list[JsonObject] = []
-    for block in top_blocks:
-        if block.get("type") != "quote":
-            continue
-        quote_blocks.append(block)
-        rich_text = block.get("quote", {}).get("rich_text", [])
-        if is_managed_sync_rich_text(rich_text):
-            marked_blocks.append(block)
-    if marked_blocks:
-        if not generation_id:
-            return marked_blocks
-        matching = group_sync_containers(marked_blocks).get(
-            generation_id,
-            [],
-        )
-        if matching:
-            return [
-                block
-                for _, _, block in sorted(
-                    matching,
-                    key=lambda entry: entry[0],
-                )
-            ]
     manifest = load_body_generation_manifest(token, page_id)
+    if (
+        manifest
+        and manifest.get("v") == 1
+        and (
+            not generation_id
+            or manifest.get("g") == generation_id
+        )
+    ):
+        legacy_generation_id = str(manifest.get("g") or "")
+        return [
+            block
+            for block in list_block_children(token, page_id)
+            if (
+                block.get("type") == "quote"
+                and extract_sync_generation(
+                    block.get("quote", {}).get("rich_text", [])
+                )[0]
+                == legacy_generation_id
+            )
+        ]
     if (
         manifest
         and manifest.get("v") == BODY_GENERATION_MANIFEST_VERSION
@@ -1538,6 +1559,8 @@ def sync_container_content_hash(
 
 def sync_container_body_rich_text(
     block: JsonObject,
+    *,
+    marker_authenticated: bool = False,
 ) -> Optional[list[JsonObject]]:
     quote = block.get("quote")
     if not isinstance(quote, dict):
@@ -1547,7 +1570,7 @@ def sync_container_body_rich_text(
         return None
     if not all(isinstance(part, dict) for part in rich_text):
         return None
-    if not has_sync_marker(rich_text):
+    if not marker_authenticated or not has_sync_marker(rich_text):
         return copy.deepcopy(rich_text)
     if not rich_text:
         return []
@@ -1589,7 +1612,7 @@ def is_sync_container_content_current(
     rich_text = quote.get("rich_text")
     if not isinstance(rich_text, list):
         return False
-    stored_hash = expected_hash or extract_sync_content_hash(rich_text)
+    stored_hash = expected_hash
     body_rich_text = sync_container_body_rich_text(block)
     block_id = str(block.get("id") or "").strip()
     if (
@@ -1599,11 +1622,28 @@ def is_sync_container_content_current(
     ):
         return False
     actual_children = list_block_children(token, block_id)
-    return stored_hash == sync_container_content_hash(
+    actual_hash = sync_container_content_hash(
         token,
         body_rich_text,
         actual_children,
         True,
+    )
+    if stored_hash == actual_hash:
+        return True
+    legacy_body = sync_container_body_rich_text(
+        block,
+        marker_authenticated=True,
+    )
+    return bool(
+        has_sync_marker(rich_text)
+        and legacy_body is not None
+        and stored_hash
+        == sync_container_content_hash(
+            token,
+            legacy_body,
+            actual_children,
+            True,
+        )
     )
 
 
@@ -1623,7 +1663,7 @@ def verify_sync_container_part(
     rich_text = quote.get("rich_text")
     if not isinstance(rich_text, list):
         return False
-    stored_hash = expected_content_hash or extract_sync_content_hash(rich_text)
+    stored_hash = expected_content_hash
     body_rich_text = sync_container_body_rich_text(block)
     if (
         not BODY_GENERATION_HASH_RE.fullmatch(stored_hash)
@@ -1638,34 +1678,54 @@ def verify_sync_container_part(
         expected_children,
         False,
     )
-    actual_hash = sync_container_content_hash(
+    body_candidates = [body_rich_text]
+    if has_sync_marker(rich_text):
+        legacy_body = sync_container_body_rich_text(
+            block,
+            marker_authenticated=True,
+        )
+        if legacy_body is not None and legacy_body != body_rich_text:
+            legacy_hash = sync_container_content_hash(
+                token,
+                legacy_body,
+                actual_children,
+                True,
+            )
+            if legacy_hash == stored_hash:
+                body_candidates.append(legacy_body)
+    expected_child_signature = sync_child_signature(
         token,
-        body_rich_text,
+        expected_children,
+        False,
+        normalize_links=True,
+    )
+    actual_child_signature = sync_child_signature(
+        token,
         actual_children,
         True,
+        normalize_links=True,
     )
-    return (
-        stored_hash in {expected_hash, actual_hash}
+    return any(
+        stored_hash
+        in {
+            expected_hash,
+            sync_container_content_hash(
+                token,
+                candidate_body,
+                actual_children,
+                True,
+            ),
+        }
         and rich_text_signature(
-            body_rich_text,
+            candidate_body,
             normalize_links=True,
         )
         == rich_text_signature(
             expected_body,
             normalize_links=True,
         )
-        and sync_child_signature(
-            token,
-            actual_children,
-            True,
-            normalize_links=True,
-        )
-        == sync_child_signature(
-            token,
-            expected_children,
-            False,
-            normalize_links=True,
-        )
+        and actual_child_signature == expected_child_signature
+        for candidate_body in body_candidates
     )
 
 
@@ -1716,8 +1776,23 @@ def find_generation_parts(
     page_id: str,
     generation_id: str,
 ) -> list[tuple[int, int, JsonObject]]:
-    groups = group_sync_containers(list_sync_container_blocks(token, page_id))
-    return groups.get(generation_id, [])
+    manifest = load_body_generation_manifest(token, page_id)
+    if (
+        not manifest
+        or manifest.get("v") != BODY_GENERATION_MANIFEST_VERSION
+        or manifest.get("g") != generation_id
+    ):
+        return []
+    resolved = body_generation_blocks_from_manifest(
+        token,
+        page_id,
+        manifest,
+    )
+    total = int(manifest.get("t") or 0)
+    return [
+        (part, total, block)
+        for part, block in resolved
+    ]
 
 
 def is_body_generation_current(
@@ -1844,9 +1919,14 @@ def validate_body_write_payloads(blocks: list[JsonObject]) -> None:
 def sync_container_actual_hash(
     token: str,
     block: JsonObject,
+    *,
+    marker_authenticated: bool = False,
 ) -> str:
     block_id = str(block.get("id") or "").strip()
-    body_rich_text = sync_container_body_rich_text(block)
+    body_rich_text = sync_container_body_rich_text(
+        block,
+        marker_authenticated=marker_authenticated,
+    )
     if not block_id or body_rich_text is None:
         return ""
     return sync_container_content_hash(
@@ -1855,6 +1935,31 @@ def sync_container_actual_hash(
         list_block_children(token, block_id),
         True,
     )
+
+
+def sync_container_actual_hash_for_expected(
+    token: str,
+    block: JsonObject,
+    expected_hash: str,
+) -> str:
+    actual_hash = sync_container_actual_hash(token, block)
+    if actual_hash == expected_hash:
+        return actual_hash
+    quote = block.get("quote")
+    rich_text = quote.get("rich_text") if isinstance(quote, dict) else None
+    if (
+        BODY_GENERATION_HASH_RE.fullmatch(expected_hash)
+        and isinstance(rich_text, list)
+        and has_sync_marker(rich_text)
+    ):
+        legacy_hash = sync_container_actual_hash(
+            token,
+            block,
+            marker_authenticated=True,
+        )
+        if legacy_hash == expected_hash:
+            return legacy_hash
+    return actual_hash
 
 
 def write_body_generation_manifest(
@@ -1952,19 +2057,29 @@ def sync_page_body_blocks(
             for part in current_manifest.get("p", [])
         )
         old_refs.extend(copy.deepcopy(current_manifest.get("o", [])))
-    for block in list_sync_container_blocks(token, page_id):
-        block_id = str(block.get("id") or "").strip()
-        actual_hash = sync_container_actual_hash(token, block)
-        if (
-            block_id
-            and BODY_GENERATION_HASH_RE.fullmatch(actual_hash)
-            and all(
-                str(ref.get("i") or "") != block_id
-                for ref in old_refs
-            )
-        ):
-            old_refs.append({"i": block_id, "h": actual_hash})
     initial_root_blocks = list_block_children(token, page_id)
+    if current_manifest and current_manifest.get("v") == 1:
+        legacy_generation_id = str(current_manifest.get("g") or "")
+        for block in initial_root_blocks:
+            rich_text = block.get("quote", {}).get("rich_text", [])
+            if (
+                block.get("type") != "quote"
+                or not isinstance(rich_text, list)
+                or extract_sync_generation(rich_text)[0]
+                != legacy_generation_id
+            ):
+                continue
+            block_id = str(block.get("id") or "").strip()
+            actual_hash = sync_container_actual_hash(
+                token,
+                block,
+                marker_authenticated=True,
+            )
+            if (
+                block_id
+                and BODY_GENERATION_HASH_RE.fullmatch(actual_hash)
+            ):
+                old_refs.append({"i": block_id, "h": actual_hash})
     tracked_ids = {
         str(ref.get("i") or "").strip()
         for ref in [*candidate_refs, *old_refs]
@@ -2291,7 +2406,11 @@ def sync_page_body_blocks(
         if not old_id or old_id == candidate_id or old_id not in root_by_id:
             continue
         if (
-            sync_container_actual_hash(token, root_by_id[old_id])
+            sync_container_actual_hash_for_expected(
+                token,
+                root_by_id[old_id],
+                str(old_ref.get("h") or ""),
+            )
             != str(old_ref.get("h") or "")
         ):
             raise RuntimeError("기존 본문이 교체 직전에 변경되었습니다")

@@ -1,7 +1,6 @@
 import json
 import hashlib
 import os
-import re
 import socket
 import threading
 import time
@@ -104,6 +103,13 @@ ATTACHMENTS_STATUS_KNOWN: str = _ATTACHMENTS_STATUS_KNOWN
 ATTACHMENTS_STATUS_UNKNOWN: str = _ATTACHMENTS_STATUS_UNKNOWN
 SITE_FETCH_MAX_RETRIES = 3
 SITE_RESPONSE_MAX_BYTES = 10 * 1024 * 1024
+MAX_JSON_INTEGER_DIGITS = 19
+MAX_JSON_INTEGER_VALUE = 9223372036854775807
+MAX_ATTACHMENT_FIELD_INDEX = 100
+MAX_ATTACHMENT_FIELD_INDEX_DIGITS = 3
+MAX_DETAIL_TITLE_INPUT_CHARS = 524288
+MAX_DETAIL_TITLE_TAGS = 4096
+MAX_DETAIL_TITLE_CHARS = 512
 NEXT_SITE_REQUEST_AT = 0.0
 NEXT_PLAYWRIGHT_REQUEST_AT_BY_HOST: dict[str, float] = {}
 PLAYWRIGHT_REQUEST_SLOT_LOCK = threading.Lock()
@@ -372,6 +378,30 @@ class PlaywrightNetworkGuard:
         self.request_budget = request_budget
         self.resolver = resolver or resolve_public_network_address_info
         self.security_error = ""
+        self.document_error = ""
+        self.document_category = FailureCategory.NONE
+        self.document_status_code: Optional[int] = None
+        self.document_retry_after_seconds: Optional[float] = None
+
+    def begin_navigation(self) -> None:
+        self.security_error = ""
+        self.document_error = ""
+        self.document_category = FailureCategory.NONE
+        self.document_status_code = None
+        self.document_retry_after_seconds = None
+
+    def _reject_document(
+        self,
+        route: Any,
+        result: SiteFetchResult,
+    ) -> None:
+        self.document_error = result.error or "fallback_browser_document_failed"
+        self.document_category = result.category
+        self.document_status_code = result.status_code
+        self.document_retry_after_seconds = result.retry_after_seconds
+        if result.category == FailureCategory.SECURITY_POLICY:
+            self.security_error = self.document_error
+        route.abort()
 
     def _validated_host(self, url: str) -> str:
         try:
@@ -424,6 +454,40 @@ class PlaywrightNetworkGuard:
                 self.security_error = "fallback_browser_unsafe_request"
             route.abort()
             return
+        if resource_type == "document":
+            result = fetch_site_result(
+                str(request.url or ""),
+                "Playwright 문서 요청",
+            )
+            if not result.ok or result.body is None:
+                self._reject_document(route, result)
+                return
+            if (
+                not result.final_url
+                or result.final_url != str(request.url or "")
+                or not self._validated_host(result.final_url)
+            ):
+                self._reject_document(
+                    route,
+                    SiteFetchResult(
+                        ok=False,
+                        final_url=result.final_url,
+                        category=FailureCategory.SECURITY_POLICY,
+                        error="fallback_browser_unsafe_redirect",
+                    ),
+                )
+                return
+            route.fulfill(
+                status=result.status_code or 200,
+                headers={
+                    "content-type": (
+                        result.content_type
+                        or "text/html; charset=utf-8"
+                    )
+                },
+                body=result.body,
+            )
+            return
         if (
             self.request_budget is not None
             and not self.request_budget.can_consume_actual()
@@ -440,6 +504,32 @@ class PlaywrightNetworkGuard:
             route.abort()
             return
         route.continue_()
+
+
+def read_bounded_playwright_page_content(page: Any) -> str:
+    max_bytes = get_site_response_max_bytes()
+    try:
+        character_count = page.evaluate(
+            "document.documentElement "
+            "? document.documentElement.outerHTML.length : 0"
+        )
+    except Exception as exc:
+        raise ValueError("page_dom_size_unavailable") from exc
+    if (
+        not isinstance(character_count, int)
+        or character_count < 0
+        or character_count > max_bytes
+    ):
+        raise ValueError(
+            f"page_dom_too_large:{character_count}>{max_bytes}"
+        )
+    html_text = page.content()
+    if not isinstance(html_text, str):
+        raise ValueError("page_dom_content_invalid")
+    byte_count = len(html_text.encode("utf-8"))
+    if byte_count > max_bytes:
+        raise ValueError(f"page_dom_too_large:{byte_count}>{max_bytes}")
+    return html_text
 
 
 def playwright_security_result(
@@ -730,6 +820,21 @@ def fetch_site_result(url: str, label: str) -> SiteFetchResult:
         req = urllib.request.Request(url, headers=build_site_headers())
         try:
             with opener.open(req, timeout=30) as resp:
+                content_encoding = str(
+                    resp.headers.get("Content-Encoding") or ""
+                ).strip().lower()
+                if content_encoding not in {"", "identity"}:
+                    return SiteFetchResult(
+                        ok=False,
+                        status_code=getattr(resp, "status", None),
+                        final_url=str(resp.geturl() or url),
+                        category=FailureCategory.SECURITY_POLICY,
+                        error=(
+                            "unsupported_content_encoding:"
+                            f"{content_encoding}"
+                        ),
+                        attempts=attempt + 1,
+                    )
                 try:
                     body = read_site_response_bytes(resp, max_bytes)
                 except ValueError as exc:
@@ -902,12 +1007,19 @@ def fetch_site_json_result(url: str) -> tuple[SiteFetchResult, Optional[dict[str
         return result, None
     try:
         text = result.body.decode("utf-8", errors="replace")
-        payload = json.loads(text)
-    except json.JSONDecodeError:
+        payload = json.loads(
+            text,
+            parse_int=parse_bounded_json_integer,
+        )
+    except ValueError as exc:
         LOGGER.info("API 응답 파싱 실패: %s", url)
         result.ok = False
         result.category = FailureCategory.SOURCE_CONTRACT
-        result.error = "invalid_json"
+        result.error = (
+            "json_integer_out_of_range"
+            if str(exc) == "json_integer_out_of_range"
+            else "invalid_json"
+        )
         return result, None
     if not isinstance(payload, dict):
         result.ok = False
@@ -915,6 +1027,21 @@ def fetch_site_json_result(url: str) -> tuple[SiteFetchResult, Optional[dict[str
         result.error = "json_root_not_object"
         return result, None
     return result, payload
+
+
+def parse_bounded_json_integer(value: str) -> int:
+    digits = value.lstrip("-")
+    if (
+        not digits
+        or len(digits) > MAX_JSON_INTEGER_DIGITS
+        or not digits.isascii()
+        or not digits.isdigit()
+    ):
+        raise ValueError("json_integer_out_of_range")
+    parsed = int(value)
+    if abs(parsed) > MAX_JSON_INTEGER_VALUE:
+        raise ValueError("json_integer_out_of_range")
+    return parsed
 
 
 def fetch_site_json(url: str) -> Optional[JsonObject]:
@@ -1251,10 +1378,21 @@ def extract_attachments_from_api_data(
 def api_attachment_field_keys(data: JsonObject) -> list[str]:
     indexed: list[tuple[int, str]] = []
     for key in data:
-        match = re.fullmatch(r"fileValue(\d+)", str(key))
-        if not match:
+        key_text = str(key)
+        if not key_text.startswith("fileValue"):
             continue
-        indexed.append((int(match.group(1)), str(key)))
+        suffix = key_text[len("fileValue") :]
+        if (
+            not suffix
+            or len(suffix) > MAX_ATTACHMENT_FIELD_INDEX_DIGITS
+            or not suffix.isascii()
+            or not suffix.isdigit()
+        ):
+            continue
+        index = int(suffix)
+        if index > MAX_ATTACHMENT_FIELD_INDEX:
+            continue
+        indexed.append((index, key_text))
     return [key for _, key in sorted(indexed)]
 
 
@@ -1367,7 +1505,7 @@ def fetch_detail_metadata_via_playwright(
             except PlaywrightTimeoutError:
                 label_visible = 0
         LOGGER.info("첨부파일 라벨 감지: %s (%s)", label_visible, detail_url)
-        html_text = page.content()
+        html_text = read_bounded_playwright_page_content(page)
         written_at = extract_written_at_from_page(page)
         if not written_at:
             written_at = extract_written_at_from_detail(html_text)
@@ -1381,7 +1519,7 @@ def fetch_detail_metadata_via_playwright(
         )
         if attachments and body_blocks:
             body_blocks = replace_body_image_urls(body_blocks, attachments)
-    except PlaywrightTimeoutError:
+    except (PlaywrightTimeoutError, ValueError):
         LOGGER.info("상세 페이지 로드 실패: %s", detail_url)
     finally:
         return_to_list_page(page, list_url)
@@ -1504,7 +1642,18 @@ def fetch_detail_for_row(
     attachment_status = classify_attachment_status_from_signals(attachments, signals)
     if not wait_for_written_at(page):
         LOGGER.info("작성일 로드 대기 실패: %s", detail_url)
-    html_text = page.content()
+    try:
+        html_text = read_bounded_playwright_page_content(page)
+    except ValueError:
+        LOGGER.info("상세 페이지 크기 검증 실패: %s", detail_url)
+        return_to_list_page(page, list_url)
+        return (
+            written_at,
+            normalized_detail_url,
+            attachments,
+            body_blocks,
+            attachment_status,
+        )
     if not written_at:
         written_at = extract_written_at_from_page(page)
         if not written_at:
@@ -3072,7 +3221,21 @@ def fetch_html(url: str) -> Optional[str]:
 
 
 def strip_html_for_attachment_text(html_text: str) -> str:
-    return unescape(re.sub(r"<[^>]+>", " ", html_text or "")).strip()
+    parts: list[str] = []
+    inside_tag = False
+    for character in html_text or "":
+        if character == "<":
+            if not inside_tag:
+                parts.append(" ")
+            inside_tag = True
+        elif character == ">":
+            if inside_tag:
+                inside_tag = False
+            else:
+                parts.append(character)
+        elif not inside_tag:
+            parts.append(character)
+    return unescape("".join(parts)).strip()
 
 
 def detect_attachment_evidence_from_html(html_text: str) -> bool:
@@ -3256,25 +3419,95 @@ def get_fallback_jitter_seconds() -> float:
     return min(2.0, max(0.0, value))
 
 
-def extract_detail_title_from_html(html_text: str) -> str:
-    candidates: list[str] = []
-    for pattern in (
-        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
-        r'<h[12][^>]*class=["\'][^"\']*(?:title|subject)[^"\']*["\'][^>]*>(.*?)</h[12]>',
-        r"<h1[^>]*>(.*?)</h1>",
-    ):
-        for match in re.finditer(
-            pattern,
-            html_text,
-            re.IGNORECASE | re.DOTALL,
+class DetailTitleScanStopped(Exception):
+    pass
+
+
+class DetailTitleParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tag_count = 0
+        self.meta_title = ""
+        self.class_title = ""
+        self.h1_title = ""
+        self.capture_tag = ""
+        self.capture_kind = ""
+        self.capture_parts: list[str] = []
+        self.capture_chars = 0
+        self.same_tag_depth = 0
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, Optional[str]]],
+    ) -> None:
+        self.tag_count += 1
+        if self.tag_count > MAX_DETAIL_TITLE_TAGS:
+            raise DetailTitleScanStopped
+        tag = tag.lower()
+        if self.capture_tag:
+            if tag == self.capture_tag:
+                self.same_tag_depth += 1
+            return
+        attrs_dict = {
+            key.lower(): value or ""
+            for key, value in attrs
+        }
+        if (
+            tag == "meta"
+            and not self.meta_title
+            and attrs_dict.get("property", "").lower() == "og:title"
         ):
-            candidate = normalize_title_key(
-                strip_html_for_attachment_text(unescape(match.group(1)))
+            self.meta_title = normalize_title_key(
+                attrs_dict.get("content", "")[:MAX_DETAIL_TITLE_CHARS]
             )
-            if candidate:
-                candidates.append(candidate)
-    return candidates[0] if candidates else ""
+            return
+        class_value = attrs_dict.get("class", "").lower()
+        if (
+            tag in {"h1", "h2"}
+            and not self.class_title
+            and ("title" in class_value or "subject" in class_value)
+        ):
+            self.capture_tag = tag
+            self.capture_kind = "class"
+        elif tag == "h1" and not self.h1_title:
+            self.capture_tag = tag
+            self.capture_kind = "h1"
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.capture_tag or tag.lower() != self.capture_tag:
+            return
+        if self.same_tag_depth:
+            self.same_tag_depth -= 1
+            return
+        candidate = normalize_title_key(" ".join(self.capture_parts))
+        if self.capture_kind == "class" and not self.class_title:
+            self.class_title = candidate
+        elif self.capture_kind == "h1" and not self.h1_title:
+            self.h1_title = candidate
+        self.capture_tag = ""
+        self.capture_kind = ""
+        self.capture_parts = []
+        self.capture_chars = 0
+
+    def handle_data(self, data: str) -> None:
+        if not self.capture_tag or self.capture_chars >= MAX_DETAIL_TITLE_CHARS:
+            return
+        remaining = MAX_DETAIL_TITLE_CHARS - self.capture_chars
+        value = data[:remaining]
+        if value:
+            self.capture_parts.append(value)
+            self.capture_chars += len(value)
+
+
+def extract_detail_title_from_html(html_text: str) -> str:
+    parser = DetailTitleParser()
+    try:
+        parser.feed(html_text[:MAX_DETAIL_TITLE_INPUT_CHARS])
+        parser.close()
+    except DetailTitleScanStopped:
+        pass
+    return parser.meta_title or parser.class_title or parser.h1_title
 
 
 class FallbackVisibleTextParser(HTMLParser):
@@ -4584,6 +4817,7 @@ def crawl_top_items_playwright_result(
                         category=FailureCategory.SECURITY_POLICY,
                         error=network_guard.security_error,
                     )
+                network_guard.begin_navigation()
                 try:
                     response = page.goto(
                         url,
@@ -4595,6 +4829,18 @@ def crawl_top_items_playwright_result(
                         timeout=15000,
                     )
                 except PlaywrightTimeoutError:
+                    if network_guard.document_error:
+                        return FallbackPageResult(
+                            ok=False,
+                            requested_page=page_number,
+                            source_config_fk=source.config_fk,
+                            final_url=str(page.url or url),
+                            category=network_guard.document_category,
+                            error=network_guard.document_error,
+                            retry_after_seconds=(
+                                network_guard.document_retry_after_seconds
+                            ),
+                        )
                     if network_guard.security_error:
                         return FallbackPageResult(
                             ok=False,
@@ -4624,6 +4870,18 @@ def crawl_top_items_playwright_result(
                         error="fallback_browser_list_timeout",
                     )
                 except Exception:
+                    if network_guard.document_error:
+                        return FallbackPageResult(
+                            ok=False,
+                            requested_page=page_number,
+                            source_config_fk=source.config_fk,
+                            final_url=str(page.url or url),
+                            category=network_guard.document_category,
+                            error=network_guard.document_error,
+                            retry_after_seconds=(
+                                network_guard.document_retry_after_seconds
+                            ),
+                        )
                     if network_guard.security_error:
                         return FallbackPageResult(
                             ok=False,
@@ -4699,7 +4957,17 @@ def crawl_top_items_playwright_result(
                         error=f"fallback_browser_http_{response.status}",
                         retry_after_seconds=retry_after_seconds,
                     )
-                html_text = page.content()
+                try:
+                    html_text = read_bounded_playwright_page_content(page)
+                except ValueError as exc:
+                    return FallbackPageResult(
+                        ok=False,
+                        requested_page=page_number,
+                        source_config_fk=source.config_fk,
+                        final_url=page.url,
+                        category=FailureCategory.SECURITY_POLICY,
+                        error=str(exc),
+                    )
                 if fallback_html_has_access_challenge(html_text):
                     return FallbackPageResult(
                         ok=False,
@@ -4779,6 +5047,7 @@ def crawl_top_items_playwright_result(
                         category=FailureCategory.SECURITY_POLICY,
                         error=network_guard.security_error,
                     )
+                network_guard.begin_navigation()
                 try:
                     response = page.goto(
                         raw_url,
@@ -4790,6 +5059,17 @@ def crawl_top_items_playwright_result(
                         timeout=15000,
                     )
                 except PlaywrightTimeoutError:
+                    if network_guard.document_error:
+                        return FallbackDetailResult(
+                            ok=False,
+                            notice_id=notice_id,
+                            url=str(page.url or raw_url),
+                            category=network_guard.document_category,
+                            error=network_guard.document_error,
+                            retry_after_seconds=(
+                                network_guard.document_retry_after_seconds
+                            ),
+                        )
                     if network_guard.security_error:
                         return FallbackDetailResult(
                             ok=False,
@@ -4817,6 +5097,17 @@ def crawl_top_items_playwright_result(
                         error="fallback_browser_detail_timeout",
                     )
                 except Exception:
+                    if network_guard.document_error:
+                        return FallbackDetailResult(
+                            ok=False,
+                            notice_id=notice_id,
+                            url=str(page.url or raw_url),
+                            category=network_guard.document_category,
+                            error=network_guard.document_error,
+                            retry_after_seconds=(
+                                network_guard.document_retry_after_seconds
+                            ),
+                        )
                     if network_guard.security_error:
                         return FallbackDetailResult(
                             ok=False,
@@ -4903,7 +5194,16 @@ def crawl_top_items_playwright_result(
                         category=FailureCategory.SOURCE_CONTRACT,
                         error="fallback_browser_detail_redirect_mismatch",
                     )
-                html_text = page.content()
+                try:
+                    html_text = read_bounded_playwright_page_content(page)
+                except ValueError as exc:
+                    return FallbackDetailResult(
+                        ok=False,
+                        notice_id=notice_id,
+                        url=final_url,
+                        category=FailureCategory.SECURITY_POLICY,
+                        error=str(exc),
+                    )
                 if fallback_html_has_access_challenge(html_text):
                     return FallbackDetailResult(
                         ok=False,

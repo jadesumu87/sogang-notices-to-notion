@@ -47,12 +47,17 @@ class FakeRequest:
 class FakeRoute:
     def __init__(self):
         self.action = ""
+        self.body = b""
 
     def abort(self):
         self.action = "abort"
 
     def continue_(self):
         self.action = "continue"
+
+    def fulfill(self, *, status, headers, body):
+        self.action = "fulfill"
+        self.body = body
 
 
 class FakeClock:
@@ -80,7 +85,7 @@ class RedirectPage:
             route,
             FakeRequest(url, "document"),
         )
-        if route.action != "continue":
+        if route.action not in {"continue", "fulfill"}:
             raise RuntimeError("navigation blocked")
         self.url = self.redirect_url
         return types.SimpleNamespace(status=200, headers={})
@@ -160,23 +165,72 @@ class PlaywrightNetworkSecurityTests(unittest.TestCase):
             resolver=resolver,
         )
 
-    def test_document_script_xhr_and_fetch_are_allowed_after_dns_validation(self):
+    def test_document_is_bounded_and_script_xhr_fetch_are_dns_validated(self):
         resolver = Mock(return_value=address_info("93.184.216.34"))
         guard = self.make_guard(resolver)
 
-        for resource_type in ("document", "script", "xhr", "fetch"):
-            with self.subTest(resource_type=resource_type):
-                route = FakeRoute()
-                guard.handle_route(
-                    route,
-                    FakeRequest(
-                        "https://www.sogang.ac.kr/assets/app.js",
-                        resource_type,
-                    ),
-                )
-                self.assertEqual(route.action, "continue")
+        def fetch_result(url, _label):
+            return crawler.SiteFetchResult(
+                ok=True,
+                status_code=200,
+                body=b"<html></html>",
+                content_type="text/html",
+                final_url=url,
+            )
 
-        self.assertEqual(resolver.call_count, 4)
+        with patch.object(
+            crawler,
+            "fetch_site_result",
+            side_effect=fetch_result,
+        ):
+            for resource_type in ("document", "script", "xhr", "fetch"):
+                with self.subTest(resource_type=resource_type):
+                    route = FakeRoute()
+                    guard.handle_route(
+                        route,
+                        FakeRequest(
+                            "https://www.sogang.ac.kr/assets/app.js",
+                            resource_type,
+                        ),
+                    )
+                    self.assertEqual(
+                        route.action,
+                        (
+                            "fulfill"
+                            if resource_type == "document"
+                            else "continue"
+                        ),
+                    )
+        self.assertEqual(resolver.call_count, 5)
+
+    def test_document_redirect_is_revalidated_before_fulfill(self):
+        resolver = Mock(return_value=address_info("93.184.216.34"))
+        guard = self.make_guard(resolver)
+        route = FakeRoute()
+        with patch.object(
+            crawler,
+            "fetch_site_result",
+            return_value=crawler.SiteFetchResult(
+                ok=True,
+                status_code=200,
+                body=b"<html></html>",
+                content_type="text/html",
+                final_url="https://evil.example/redirected",
+            ),
+        ):
+            guard.handle_route(
+                route,
+                FakeRequest(
+                    "https://www.sogang.ac.kr/ko/notices",
+                    "document",
+                ),
+            )
+
+        self.assertEqual(route.action, "abort")
+        self.assertEqual(
+            guard.security_error,
+            "fallback_browser_unsafe_redirect",
+        )
 
     def test_insecure_private_reserved_and_rebound_targets_are_blocked(self):
         cases = (
@@ -317,6 +371,17 @@ class PlaywrightNetworkSecurityTests(unittest.TestCase):
                 crawler,
                 "crawl_top_items_http_result",
                 http_fallback,
+            ),
+            patch.object(
+                crawler,
+                "fetch_site_result",
+                side_effect=lambda url, _label: crawler.SiteFetchResult(
+                    ok=True,
+                    status_code=200,
+                    body=b"<html></html>",
+                    content_type="text/html",
+                    final_url=url,
+                ),
             ),
         ):
             result = crawler.crawl_top_items_playwright_result(

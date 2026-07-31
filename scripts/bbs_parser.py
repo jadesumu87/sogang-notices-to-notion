@@ -1,3 +1,4 @@
+import math
 import re
 from html import unescape
 from html.parser import HTMLParser
@@ -37,11 +38,21 @@ from utils import (
     split_text_with_links,
 )
 
+MAX_CSS_COLOR_TEXT_LENGTH = 256
+MAX_CSS_NUMBER_TOKEN_LENGTH = 32
+MAX_DATE_LABEL_COUNT = 64
+MAX_DATE_SEARCH_WINDOW = 512
+MAX_PAGE_DATE_TEXT_LENGTH = 131072
+MAX_PAGE_DATE_SIBLINGS = 4
+DATE_LABEL_PATTERN = re.compile(r"작성일|등록일")
+
 
 def parse_css_color(value: str) -> Optional[tuple[int, int, int]]:
     if not value:
         return None
     raw = value.strip().lower()
+    if len(raw) > MAX_CSS_COLOR_TEXT_LENGTH:
+        return None
     if raw in {"inherit", "transparent", "currentcolor"}:
         return None
     if raw in CSS_COLOR_MAP:
@@ -71,16 +82,32 @@ def parse_css_color(value: str) -> Optional[tuple[int, int, int]]:
         if len(parts) >= 3:
             rgb: list[int] = []
             for part in parts[:3]:
+                number_text = part[:-1] if part.endswith("%") else part
+                if (
+                    not number_text
+                    or len(number_text) > MAX_CSS_NUMBER_TOKEN_LENGTH
+                ):
+                    return None
+                try:
+                    number = float(number_text)
+                except (OverflowError, ValueError):
+                    return None
+                if not math.isfinite(number):
+                    return None
                 if part.endswith("%"):
-                    try:
-                        rgb.append(int(float(part[:-1]) * 2.55))
-                    except ValueError:
-                        return None
+                    if number <= 0:
+                        rgb.append(0)
+                    elif number >= 100:
+                        rgb.append(255)
+                    else:
+                        rgb.append(int(number * 2.55))
                 else:
-                    try:
-                        rgb.append(int(float(part)))
-                    except ValueError:
-                        return None
+                    if number <= 0:
+                        rgb.append(0)
+                    elif number >= 255:
+                        rgb.append(255)
+                    else:
+                        rgb.append(int(number))
             normalized_rgb = [max(0, min(255, val)) for val in rgb[:3]]
             return normalized_rgb[0], normalized_rgb[1], normalized_rgb[2]
     return None
@@ -1088,6 +1115,29 @@ def extract_visible_text(html_text: str) -> str:
     return " ".join(parser.parts)
 
 
+def extract_labeled_date_values(text: str) -> list[str]:
+    values: list[str] = []
+    for label_index, label_match in enumerate(
+        DATE_LABEL_PATTERN.finditer(text)
+    ):
+        if label_index >= MAX_DATE_LABEL_COUNT:
+            break
+        window = text[
+            label_match.end() : label_match.end() + MAX_DATE_SEARCH_WINDOW
+        ]
+        date_match = DATE_PATTERN.search(window)
+        if date_match:
+            values.append(date_match.group(0))
+    return values
+
+
+def best_written_at_value(values: list[str]) -> Optional[str]:
+    for value in values:
+        if DATE_TIME_PATTERN.search(value):
+            return parse_datetime(value)
+    return parse_datetime(values[0]) if values else None
+
+
 class VisibleAnchorParser(VisibleTextParser):
     def __init__(self) -> None:
         super().__init__()
@@ -1139,17 +1189,7 @@ class VisibleAnchorParser(VisibleTextParser):
 
 def extract_written_at_from_detail(html_text: str) -> Optional[str]:
     visible_text = extract_visible_text(html_text)
-    matches = re.findall(
-        r"(작성일|등록일).*?(\d{4}[.\-]\d{2}[.\-]\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)",
-        visible_text,
-        re.DOTALL,
-    )
-    if not matches:
-        return None
-    for _, value in matches:
-        if DATE_TIME_PATTERN.search(value):
-            return parse_datetime(value)
-    return parse_datetime(matches[0][1])
+    return best_written_at_value(extract_labeled_date_values(visible_text))
 
 
 def extract_attachments_from_detail(
@@ -1398,34 +1438,69 @@ def extract_detail_id_from_row(row: Any) -> Optional[str]:
 
 
 def extract_written_at_from_page(page: Any) -> Optional[str]:
+    adjacent_values: list[str] = []
     for label_text in ("작성일", "등록일"):
         locator = page.locator(f"text={label_text}")
-        for idx in range(locator.count()):
+        for idx in range(min(locator.count(), MAX_DATE_LABEL_COUNT)):
             label_node = locator.nth(idx)
             try:
-                container_text = label_node.locator("xpath=..").inner_text()
+                container = label_node.locator("xpath=..")
+                container_text = container.evaluate(
+                    "(node, limit) => (node.innerText || '').slice(0, limit)",
+                    MAX_DATE_SEARCH_WINDOW,
+                )
             except Exception:
-                container_text = ""
-            match = DATE_TIME_PATTERN.search(container_text)
-            if match:
-                return parse_datetime(match.group(0))
+                try:
+                    container_text = container.inner_text()[
+                        :MAX_DATE_SEARCH_WINDOW
+                    ]
+                except Exception:
+                    container_text = ""
+            adjacent_values.extend(
+                match.group(0)
+                for match in DATE_PATTERN.finditer(container_text)
+            )
             try:
-                sibling_texts = label_node.locator(
+                siblings = label_node.locator(
                     "xpath=following-sibling::*"
-                ).all_inner_texts()
+                    f"[position() <= {MAX_PAGE_DATE_SIBLINGS}]"
+                )
+                sibling_texts = siblings.evaluate_all(
+                    "(nodes, limit) => nodes.map("
+                    "node => (node.innerText || '').slice(0, limit))",
+                    MAX_DATE_SEARCH_WINDOW,
+                )
             except Exception:
-                sibling_texts = []
-            for text in sibling_texts:
-                match = DATE_TIME_PATTERN.search(text)
-                if match:
-                    return parse_datetime(match.group(0))
-    body_text = page.locator("body").inner_text()
-    match = re.search(
-        rf"(작성일|등록일).*?({DATE_TIME_PATTERN.pattern})",
-        body_text,
+                try:
+                    sibling_texts = [
+                        text[:MAX_DATE_SEARCH_WINDOW]
+                        for text in siblings.all_inner_texts()[
+                            :MAX_PAGE_DATE_SIBLINGS
+                        ]
+                    ]
+                except Exception:
+                    sibling_texts = []
+            for sibling_text in sibling_texts:
+                adjacent_values.extend(
+                    match.group(0)
+                    for match in DATE_PATTERN.finditer(sibling_text)
+                )
+    adjacent_value = best_written_at_value(adjacent_values)
+    if adjacent_value:
+        return adjacent_value
+    body = page.locator("body")
+    try:
+        body_text = body.evaluate(
+            "(node, limit) => (node.innerText || '').slice(0, limit)",
+            MAX_PAGE_DATE_TEXT_LENGTH,
+        )
+    except Exception:
+        body_text = body.inner_text()[:MAX_PAGE_DATE_TEXT_LENGTH]
+    labeled_value = best_written_at_value(
+        extract_labeled_date_values(body_text)
     )
-    if match:
-        return parse_datetime(match.group(2))
+    if labeled_value:
+        return labeled_value
     match = DATE_TIME_PATTERN.search(body_text)
     if match:
         return parse_datetime(match.group(0))

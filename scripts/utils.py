@@ -64,6 +64,12 @@ URL_TEXT_PATTERN = re.compile(
     r"www\.[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)"
 )
 TRAILING_URL_PUNCTUATION = ").,;]"
+MAX_NORMALIZED_URL_LENGTH = 8192
+MAX_INTEGER_TEXT_LENGTH = 128
+MAX_INTEGER_DIGITS = 18
+MAX_TABLE_ROWS = 200
+MAX_TABLE_COLUMNS = 100
+MAX_TABLE_CELLS = 5000
 
 def clean_text(html_text: str) -> str:
     text = re.sub(r"<[^>]+>", "", html_text)
@@ -323,69 +329,109 @@ def normalize_detail_url(raw_url: Optional[str]) -> Optional[str]:
     if not raw_url:
         return None
     raw_url = raw_url.strip()
+    if (
+        not raw_url
+        or len(raw_url) > MAX_NORMALIZED_URL_LENGTH
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw_url)
+    ):
+        return None
     lowered = raw_url.lower()
     if lowered in {"#", "#/", "javascript:void(0)", "javascript:void(0);"}:
         return None
     if lowered.startswith(("javascript:", "mailto:", "tel:", "data:")):
         return None
-    if raw_url.startswith("//"):
-        raw_url = "https:" + raw_url
-    parsed = urlparse(raw_url)
-    if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
-        return None
-    if not parsed.scheme or not parsed.netloc:
-        if raw_url.startswith("/"):
-            base = urlparse(BASE_URL)
-            parsed = urlparse(f"{base.scheme}://{base.netloc}{raw_url}")
-        else:
-            return None
-    base_site = urlparse(BASE_SITE)
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname != base_site.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        return None
     try:
+        if raw_url.startswith("//"):
+            raw_url = "https:" + raw_url
+        parsed = urlparse(raw_url)
+        if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
+            return None
+        if not parsed.scheme or not parsed.netloc:
+            if raw_url.startswith("/"):
+                base = urlparse(BASE_URL)
+                parsed = urlparse(f"{base.scheme}://{base.netloc}{raw_url}")
+            else:
+                return None
+        base_site = urlparse(BASE_SITE)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != base_site.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or any(character.isspace() for character in parsed.netloc)
+        ):
+            return None
         if parsed.port not in {None, 443}:
             return None
-    except ValueError:
+        query = parse_qs(parsed.query)
+        drop_keys = {"introPkId", "option", "page"}
+        query_items: list[tuple[str, str]] = []
+        for key in sorted(query):
+            if key in drop_keys:
+                continue
+            for value in query[key]:
+                query_items.append((key, value))
+        new_query = urlencode(query_items, doseq=True)
+        normalized = urlunparse(
+            (parsed.scheme, parsed.netloc, parsed.path, "", new_query, "")
+        )
+    except (UnicodeError, ValueError):
         return None
-    query = parse_qs(parsed.query)
-    drop_keys = {"introPkId", "option", "page"}
-    query_items: list[tuple[str, str]] = []
-    for key in sorted(query):
-        if key in drop_keys:
-            continue
-        for value in query[key]:
-            query_items.append((key, value))
-    new_query = urlencode(query_items, doseq=True)
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", new_query, ""))
+    return (
+        normalized
+        if len(normalized) <= MAX_NORMALIZED_URL_LENGTH
+        else None
+    )
 
 
 def normalize_file_url(raw_url: Optional[str]) -> Optional[str]:
     if not raw_url:
         return None
     raw_url = raw_url.strip()
+    if (
+        not raw_url
+        or len(raw_url) > MAX_NORMALIZED_URL_LENGTH
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw_url)
+    ):
+        return None
     lowered = raw_url.lower()
     if lowered in {"#", "#/", "javascript:void(0)", "javascript:void(0);"}:
         return None
     if lowered.startswith(("javascript:", "mailto:", "tel:", "data:")):
         return None
-    if raw_url.startswith("//"):
-        raw_url = "https:" + raw_url
-    absolute = urljoin(BASE_SITE, raw_url)
-    parsed = urlsplit(absolute)
-    if parsed.scheme and parsed.scheme not in {"http", "https"}:
+    try:
+        if raw_url.startswith("//"):
+            raw_url = "https:" + raw_url
+        absolute = urljoin(BASE_SITE, raw_url)
+        if len(absolute) > MAX_NORMALIZED_URL_LENGTH:
+            return None
+        parsed = urlsplit(absolute)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or any(character.isspace() for character in parsed.netloc)
+        ):
+            return None
+        parsed.port
+        encoded = encode_url(absolute)
+        if len(encoded) > MAX_NORMALIZED_URL_LENGTH:
+            return None
+        encoded_parts = urlsplit(encoded)
+        encoded_parts.port
+        normalized = urlunsplit(
+            (
+                encoded_parts.scheme,
+                encoded_parts.netloc,
+                encoded_parts.path,
+                encoded_parts.query,
+                "",
+            )
+        )
+    except (UnicodeError, ValueError):
         return None
-    if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
-        return None
-    encoded = encode_url(absolute)
-    encoded_parts = urlsplit(encoded)
-    return urlunsplit(
-        (encoded_parts.scheme, encoded_parts.netloc, encoded_parts.path, encoded_parts.query, "")
-    )
+    return normalized
 
 
 def normalize_attachment_identity_url(raw_url: Optional[str]) -> str:
@@ -637,7 +683,11 @@ def replace_body_image_urls(
     return body_blocks
 
 def build_site_headers() -> dict[str, str]:
-    return {"User-Agent": USER_AGENT, "Referer": BASE_URL}
+    return {
+        "User-Agent": USER_AGENT,
+        "Referer": BASE_URL,
+        "Accept-Encoding": "identity",
+    }
 
 
 def is_image_name_or_url(name: str, url: str) -> bool:
@@ -746,14 +796,38 @@ def normalize_content_url(raw_url: Optional[str]) -> Optional[str]:
     if not raw_url:
         return None
     raw_url = raw_url.strip()
-    if raw_url.startswith("//"):
-        raw_url = "https:" + raw_url
-    parsed = urlparse(raw_url)
-    if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
+    if (
+        not raw_url
+        or len(raw_url) > MAX_NORMALIZED_URL_LENGTH
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw_url)
+    ):
         return None
-    if not parsed.scheme:
-        raw_url = urljoin(BASE_SITE, raw_url)
-    return encode_url(raw_url)
+    try:
+        if raw_url.startswith("//"):
+            raw_url = "https:" + raw_url
+        parsed = urlsplit(raw_url)
+        if parsed.scheme in {"javascript", "mailto", "tel", "data"}:
+            return None
+        if not parsed.scheme:
+            raw_url = urljoin(BASE_SITE, raw_url)
+            parsed = urlsplit(raw_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or any(character.isspace() for character in parsed.netloc)
+        ):
+            return None
+        parsed.port
+        encoded = encode_url(raw_url)
+        if len(encoded) > MAX_NORMALIZED_URL_LENGTH:
+            return None
+        encoded_parts = urlsplit(encoded)
+        encoded_parts.port
+    except (UnicodeError, ValueError):
+        return None
+    return encoded
 
 
 QUERY_SAFE_CHARS = "/?:@-._~!$&'()*+,;=%"
@@ -768,14 +842,26 @@ def encode_url(raw_url: str) -> str:
 
 
 def is_valid_notion_url(url: Optional[str], allow_mailto: bool = True) -> bool:
-    if not url or any(ch.isspace() for ch in url):
+    if (
+        not url
+        or len(url) > MAX_NORMALIZED_URL_LENGTH
+        or any(ch.isspace() for ch in url)
+    ):
         return False
-    parsed = urlsplit(url)
-    scheme = parsed.scheme.lower()
-    if scheme in {"http", "https"}:
-        return bool(parsed.netloc)
-    if allow_mailto and scheme in {"mailto", "tel"}:
-        return bool(parsed.path)
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        if scheme in {"http", "https"}:
+            parsed.port
+            return bool(
+                parsed.hostname
+                and parsed.username is None
+                and parsed.password is None
+            )
+        if allow_mailto and scheme in {"mailto", "tel"}:
+            return bool(parsed.path)
+    except (UnicodeError, ValueError):
+        return False
     return False
 
 
@@ -901,10 +987,17 @@ def build_table_block(
     has_column_header: bool,
     has_row_header: bool,
 ) -> Optional[dict[str, Any]]:
-    if not rows:
+    if not rows or len(rows) > MAX_TABLE_ROWS:
         return None
     table_width = max((len(row) for row in rows), default=0)
-    if table_width <= 0:
+    source_cell_count = sum(len(row) for row in rows)
+    normalized_cell_count = len(rows) * table_width
+    if (
+        table_width <= 0
+        or table_width > MAX_TABLE_COLUMNS
+        or source_cell_count > MAX_TABLE_CELLS
+        or normalized_cell_count > MAX_TABLE_CELLS
+    ):
         return None
     normalized_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -927,7 +1020,13 @@ def chunks(
 ) -> list[list[dict[str, Any]]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 def parse_int(value: str) -> Optional[int]:
-    digits = re.sub(r"[^0-9]", "", value)
-    if not digits:
+    if len(value) > MAX_INTEGER_TEXT_LENGTH:
+        return None
+    digits = "".join(
+        character
+        for character in value
+        if character.isascii() and character.isdigit()
+    )
+    if not digits or len(digits) > MAX_INTEGER_DIGITS:
         return None
     return int(digits)

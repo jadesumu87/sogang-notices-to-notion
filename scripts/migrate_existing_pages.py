@@ -396,10 +396,18 @@ def _quote_snapshot(
             f"표식 없는 인용 블록과 다른 최상위 블록이 함께 있어 이관할 수 없습니다: {page_id}"
         )
     quote_id = _safe_id(quotes[0].get("id"), "인용 블록 ID")
-    quote_hash = sync_container_actual_hash(token, quotes[0])
+    marker_authenticated = marker == "legacy"
+    quote_hash = sync_container_actual_hash(
+        token,
+        quotes[0],
+        marker_authenticated=marker_authenticated,
+    )
     if not re.fullmatch(r"[0-9a-f]{64}", quote_hash):
         raise MigrationError(f"인용 블록 해시를 계산할 수 없습니다: {page_id}")
-    body_rich_text = sync_container_body_rich_text(quotes[0])
+    body_rich_text = sync_container_body_rich_text(
+        quotes[0],
+        marker_authenticated=marker_authenticated,
+    )
     if body_rich_text is None:
         raise MigrationError(f"인용 블록 본문을 확인할 수 없습니다: {page_id}")
     preview = " ".join(rich_text_plain_text(body_rich_text).split())[:160]
