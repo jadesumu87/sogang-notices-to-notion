@@ -88,6 +88,7 @@ EXTERNAL_DOWNLOAD_READ_CHUNK_BYTES = 64 * 1024
 EXTERNAL_DOWNLOAD_MAX_REQUESTS = 300
 EXTERNAL_DOWNLOAD_MAX_SECONDS = 600.0
 EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS = 1.0
+EXTERNAL_DOWNLOAD_MAX_CONNECT_ADDRESSES = 8
 EXTERNAL_PREFLIGHT_CACHE_MAX_BYTES = 128 * 1024 * 1024
 IMAGE_MAX_PIXELS = 40_000_000
 IMAGE_MAX_DIMENSION = 16_384
@@ -896,21 +897,60 @@ def create_public_network_socket(
     timeout: object,
     source_address: Optional[SocketAddress] = None,
 ) -> socket.socket:
+    started_at = time.monotonic()
     address_info = resolve_public_network_address_info(hostname, port)
     if not address_info:
         raise OSError(f"외부 다운로드 대상이 차단되었습니다: {hostname}")
+    unique_address_info: list[tuple[Any, ...]] = []
+    seen_addresses: set[tuple[Any, ...]] = set()
+    for entry in address_info:
+        family, socktype, proto, _, socket_address = entry
+        key = (family, socktype, proto, socket_address)
+        if key in seen_addresses:
+            continue
+        seen_addresses.add(key)
+        unique_address_info.append(entry)
+        if (
+            len(unique_address_info)
+            >= EXTERNAL_DOWNLOAD_MAX_CONNECT_ADDRESSES
+        ):
+            break
+    default_timeout = getattr(socket, "_GLOBAL_DEFAULT_TIMEOUT")
+    explicit_timeout: Optional[float] = None
+    if timeout is not default_timeout and timeout is not None:
+        explicit_timeout = max(0.0, float(cast(float, timeout)))
+    deadline = (
+        started_at + explicit_timeout
+        if explicit_timeout is not None
+        else None
+    )
+    policy = current_external_download_run_policy()
     last_error: Optional[OSError] = None
-    for family, socktype, proto, _, socket_address in address_info:
+    for family, socktype, proto, _, socket_address in unique_address_info:
+        check_run_control()
+        if policy is not None and not policy.can_continue():
+            raise external_download_stopped_error(policy)
+        remaining: Optional[float] = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+        if policy is not None:
+            policy_remaining = policy.remaining_seconds()
+            remaining = (
+                policy_remaining
+                if remaining is None
+                else min(remaining, policy_remaining)
+            )
+        if remaining is not None and remaining <= 0:
+            if policy is not None and not policy.can_continue():
+                raise external_download_stopped_error(policy)
+            raise socket.timeout("외부 연결 시간 한도를 초과했습니다")
         connection = None
         try:
             connection = socket.socket(family, socktype, proto)
-            if timeout is not getattr(
-                socket,
-                "_GLOBAL_DEFAULT_TIMEOUT",
-            ):
-                connection.settimeout(
-                    cast(Optional[float], timeout)
-                )
+            if remaining is not None:
+                connection.settimeout(remaining)
+            elif timeout is not default_timeout:
+                connection.settimeout(cast(Optional[float], timeout))
             if source_address:
                 connection.bind(source_address)
             connection.connect(socket_address)
@@ -1372,21 +1412,42 @@ def collect_compound_directory_names(payload: bytes) -> Optional[set[str]]:
     sector_size = 1 << sector_shift
     if len(payload) % sector_size != 0:
         return None
+    max_sector_count = len(payload) // sector_size - 1
+    if max_sector_count <= 0:
+        return None
     fat_sector_count = struct.unpack("<I", payload[44:48])[0]
     first_directory_sector = struct.unpack("<I", payload[48:52])[0]
     first_difat_sector = struct.unpack("<I", payload[68:72])[0]
     difat_sector_count = struct.unpack("<I", payload[72:76])[0]
-    if fat_sector_count == 0:
+    if (
+        fat_sector_count == 0
+        or fat_sector_count > max_sector_count
+        or difat_sector_count > max_sector_count
+    ):
         return None
     free_sector = 0xFFFFFFFF
     end_of_chain = 0xFFFFFFFE
     fat_sector = 0xFFFFFFFD
     difat_sector = 0xFFFFFFFC
-    fat_sector_ids = [
-        sector_id
-        for sector_id in struct.unpack("<109I", payload[76:512])
-        if sector_id not in {free_sector, end_of_chain}
-    ]
+    fat_sector_ids: list[int] = []
+    seen_fat_sector_ids: set[int] = set()
+
+    def add_fat_sector_id(sector_id: int) -> bool:
+        if sector_id in {free_sector, end_of_chain}:
+            return True
+        if (
+            sector_id >= max_sector_count
+            or sector_id in seen_fat_sector_ids
+            or len(fat_sector_ids) >= fat_sector_count
+        ):
+            return False
+        seen_fat_sector_ids.add(sector_id)
+        fat_sector_ids.append(sector_id)
+        return True
+
+    for sector_id in struct.unpack("<109I", payload[76:512]):
+        if not add_fat_sector_id(sector_id):
+            return None
     next_difat_sector = first_difat_sector
     seen_difat: set[int] = set()
     for _ in range(difat_sector_count):
@@ -1397,11 +1458,9 @@ def collect_compound_directory_names(payload: bytes) -> Optional[set[str]]:
         if sector is None:
             return None
         values = struct.unpack(f"<{sector_size // 4}I", sector)
-        fat_sector_ids.extend(
-            sector_id
-            for sector_id in values[:-1]
-            if sector_id not in {free_sector, end_of_chain}
-        )
+        for sector_id in values[:-1]:
+            if not add_fat_sector_id(sector_id):
+                return None
         next_difat_sector = values[-1]
     if difat_sector_count == 0 and first_difat_sector not in {
         free_sector,
@@ -1410,22 +1469,25 @@ def collect_compound_directory_names(payload: bytes) -> Optional[set[str]]:
         return None
     if len(fat_sector_ids) < fat_sector_count:
         return None
-    fat_sector_ids = fat_sector_ids[:fat_sector_count]
-    if len(set(fat_sector_ids)) != len(fat_sector_ids):
-        return None
     fat_entries: list[int] = []
     for sector_id in fat_sector_ids:
         sector = read_compound_sector(payload, sector_id, sector_size)
         if sector is None:
             return None
-        fat_entries.extend(struct.unpack(f"<{sector_size // 4}I", sector))
+        remaining_entries = max_sector_count - len(fat_entries)
+        if remaining_entries <= 0:
+            break
+        fat_entries.extend(
+            struct.unpack(f"<{sector_size // 4}I", sector)[
+                :remaining_entries
+            ]
+        )
     for sector_id in fat_sector_ids:
         if sector_id >= len(fat_entries) or fat_entries[sector_id] != fat_sector:
             return None
     directory_bytes = bytearray()
     directory_sector = first_directory_sector
     seen_directory: set[int] = set()
-    max_sector_count = len(payload) // sector_size - 1
     while directory_sector != end_of_chain:
         if (
             directory_sector in seen_directory

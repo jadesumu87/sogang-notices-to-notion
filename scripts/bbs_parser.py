@@ -25,7 +25,6 @@ from utils import (
     build_embed_block,
     build_image_block,
     build_table_block,
-    clean_text,
     is_attachment_candidate,
     is_valid_notion_url,
     normalize_content_url,
@@ -43,6 +42,7 @@ MAX_CSS_NUMBER_TOKEN_LENGTH = 32
 MAX_DATE_LABEL_COUNT = 64
 MAX_DATE_SEARCH_WINDOW = 512
 MAX_PAGE_DATE_TEXT_LENGTH = 131072
+MAX_ATTACHMENT_NAME_CHARS = 512
 MAX_PAGE_DATE_SIBLINGS = 4
 DATE_LABEL_PATTERN = re.compile(r"작성일|등록일")
 
@@ -1143,6 +1143,7 @@ class VisibleAnchorParser(VisibleTextParser):
         super().__init__()
         self.current_anchor_href: Optional[str] = None
         self.current_anchor_parts: list[str] = []
+        self.current_anchor_length = 0
         self.anchors: list[tuple[str, str]] = []
         self.seen_attachment_label = False
 
@@ -1159,6 +1160,7 @@ class VisibleAnchorParser(VisibleTextParser):
             if href:
                 self.current_anchor_href = href
                 self.current_anchor_parts = []
+                self.current_anchor_length = 0
 
     def handle_endtag(self, tag: str) -> None:
         hidden = self.hidden_stack[-1] if self.hidden_stack else False
@@ -1166,11 +1168,14 @@ class VisibleAnchorParser(VisibleTextParser):
             self.anchors.append(
                 (
                     self.current_anchor_href,
-                    clean_text(" ".join(self.current_anchor_parts)),
+                    " ".join(
+                        " ".join(self.current_anchor_parts).split()
+                    )[:MAX_ATTACHMENT_NAME_CHARS],
                 )
             )
             self.current_anchor_href = None
             self.current_anchor_parts = []
+            self.current_anchor_length = 0
         super().handle_endtag(tag)
 
     def handle_data(self, data: str) -> None:
@@ -1183,8 +1188,13 @@ class VisibleAnchorParser(VisibleTextParser):
         if "첨부파일" in text:
             self.seen_attachment_label = True
         if self.current_anchor_href:
-            self.current_anchor_parts.append(text)
-        super().handle_data(data)
+            remaining = (
+                MAX_ATTACHMENT_NAME_CHARS - self.current_anchor_length
+            )
+            if remaining > 0:
+                part = text[:remaining]
+                self.current_anchor_parts.append(part)
+                self.current_anchor_length += len(part)
 
 
 def extract_written_at_from_detail(html_text: str) -> Optional[str]:

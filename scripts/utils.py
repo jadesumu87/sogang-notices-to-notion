@@ -6,7 +6,6 @@ import os
 import re
 import socket
 from datetime import datetime, timedelta, timezone
-from html import unescape
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import (
@@ -70,12 +69,6 @@ MAX_INTEGER_DIGITS = 18
 MAX_TABLE_ROWS = 200
 MAX_TABLE_COLUMNS = 100
 MAX_TABLE_CELLS = 5000
-
-def clean_text(html_text: str) -> str:
-    text = re.sub(r"<[^>]+>", "", html_text)
-    text = unescape(text).replace("\u00a0", " ")
-    return text.strip()
-
 
 def normalize_title_key(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()

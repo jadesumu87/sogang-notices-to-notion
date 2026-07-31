@@ -2,7 +2,6 @@ import json
 import hashlib
 import os
 import socket
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -105,17 +104,18 @@ SITE_FETCH_MAX_RETRIES = 3
 SITE_RESPONSE_MAX_BYTES = 10 * 1024 * 1024
 MAX_JSON_INTEGER_DIGITS = 19
 MAX_JSON_INTEGER_VALUE = 9223372036854775807
+MAX_JSON_NESTING_DEPTH = 64
+MAX_JSON_STRUCTURE_NODES = 100_000
 MAX_ATTACHMENT_FIELD_INDEX = 100
 MAX_ATTACHMENT_FIELD_INDEX_DIGITS = 3
 MAX_DETAIL_TITLE_INPUT_CHARS = 524288
 MAX_DETAIL_TITLE_TAGS = 4096
 MAX_DETAIL_TITLE_CHARS = 512
 NEXT_SITE_REQUEST_AT = 0.0
-NEXT_PLAYWRIGHT_REQUEST_AT_BY_HOST: dict[str, float] = {}
-PLAYWRIGHT_REQUEST_SLOT_LOCK = threading.Lock()
 PLAYWRIGHT_NETWORK_RESOURCE_TYPES = frozenset(
     {"document", "script", "xhr", "fetch"}
 )
+PLAYWRIGHT_NAVIGATION_MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 BODY_STATUS_PRESENT = "present"
 BODY_STATUS_CONFIRMED_EMPTY = "confirmed_empty"
 BODY_STATUS_UNKNOWN = "unknown"
@@ -334,24 +334,6 @@ def select_playwright_pinned_address(
     return sorted(public_addresses)[0]
 
 
-def wait_for_playwright_request_slot(hostname: str) -> bool:
-    with PLAYWRIGHT_REQUEST_SLOT_LOCK:
-        now = time.monotonic()
-        next_request_at = NEXT_PLAYWRIGHT_REQUEST_AT_BY_HOST.get(
-            hostname,
-            0.0,
-        )
-        delay = next_request_at - now
-        if delay > 0:
-            if not sleep_with_source_request_budget(delay):
-                return False
-            now = time.monotonic()
-        NEXT_PLAYWRIGHT_REQUEST_AT_BY_HOST[hostname] = (
-            now + get_site_min_request_interval_seconds()
-        )
-    return True
-
-
 class PlaywrightNetworkGuard:
     def __init__(
         self,
@@ -382,6 +364,7 @@ class PlaywrightNetworkGuard:
         self.document_category = FailureCategory.NONE
         self.document_status_code: Optional[int] = None
         self.document_retry_after_seconds: Optional[float] = None
+        self.navigation_response_bytes = 0
 
     def begin_navigation(self) -> None:
         self.security_error = ""
@@ -389,6 +372,7 @@ class PlaywrightNetworkGuard:
         self.document_category = FailureCategory.NONE
         self.document_status_code = None
         self.document_retry_after_seconds = None
+        self.navigation_response_bytes = 0
 
     def _reject_document(
         self,
@@ -439,11 +423,11 @@ class PlaywrightNetworkGuard:
         if resource_type not in PLAYWRIGHT_NETWORK_RESOURCE_TYPES:
             route.abort()
             return
-        hostname = self._validated_host(str(request.url or ""))
-        if not hostname:
+        request_url = str(request.url or "")
+        if not self._validated_host(request_url):
             try:
                 request_host = (
-                    urlparse(str(request.url or "")).hostname or ""
+                    urlparse(request_url).hostname or ""
                 ).strip().lower().rstrip(".")
             except ValueError:
                 request_host = ""
@@ -454,56 +438,81 @@ class PlaywrightNetworkGuard:
                 self.security_error = "fallback_browser_unsafe_request"
             route.abort()
             return
-        if resource_type == "document":
-            result = fetch_site_result(
-                str(request.url or ""),
-                "Playwright 문서 요청",
-            )
-            if not result.ok or result.body is None:
+        if str(getattr(request, "method", "GET") or "").upper() != "GET":
+            self.security_error = "fallback_browser_unsupported_method"
+            route.abort()
+            return
+        result = fetch_site_result(
+            request_url,
+            (
+                "Playwright 문서 요청"
+                if resource_type == "document"
+                else "Playwright 하위 리소스 요청"
+            ),
+        )
+        if not result.ok or result.body is None:
+            if resource_type == "document":
                 self._reject_document(route, result)
-                return
-            if (
-                not result.final_url
-                or result.final_url != str(request.url or "")
-                or not self._validated_host(result.final_url)
-            ):
+            else:
+                if result.category == FailureCategory.SECURITY_POLICY:
+                    self.security_error = (
+                        result.error or "fallback_browser_subresource_failed"
+                    )
+                route.abort()
+            return
+        if (
+            not result.final_url
+            or result.final_url != request_url
+            or not self._validated_host(result.final_url)
+        ):
+            redirect_result = SiteFetchResult(
+                ok=False,
+                final_url=result.final_url,
+                category=FailureCategory.SECURITY_POLICY,
+                error="fallback_browser_unsafe_redirect",
+            )
+            if resource_type == "document":
                 self._reject_document(
                     route,
-                    SiteFetchResult(
-                        ok=False,
-                        final_url=result.final_url,
-                        category=FailureCategory.SECURITY_POLICY,
-                        error="fallback_browser_unsafe_redirect",
-                    ),
+                    redirect_result,
                 )
-                return
-            route.fulfill(
-                status=result.status_code or 200,
-                headers={
-                    "content-type": (
-                        result.content_type
-                        or "text/html; charset=utf-8"
-                    )
-                },
-                body=result.body,
+            else:
+                self.security_error = redirect_result.error
+                route.abort()
+            return
+        next_total = self.navigation_response_bytes + len(result.body)
+        if next_total > PLAYWRIGHT_NAVIGATION_MAX_RESPONSE_BYTES:
+            size_result = SiteFetchResult(
+                ok=False,
+                final_url=result.final_url,
+                category=FailureCategory.SECURITY_POLICY,
+                error=(
+                    "fallback_browser_navigation_response_too_large:"
+                    f"{next_total}>"
+                    f"{PLAYWRIGHT_NAVIGATION_MAX_RESPONSE_BYTES}"
+                ),
             )
+            if resource_type == "document":
+                self._reject_document(route, size_result)
+            else:
+                self.security_error = size_result.error
+                route.abort()
             return
-        if (
-            self.request_budget is not None
-            and not self.request_budget.can_consume_actual()
-        ):
-            route.abort()
-            return
-        if not wait_for_playwright_request_slot(hostname):
-            route.abort()
-            return
-        if (
-            self.request_budget is not None
-            and not self.request_budget.consume_actual()
-        ):
-            route.abort()
-            return
-        route.continue_()
+        self.navigation_response_bytes = next_total
+        default_content_type = (
+            "text/html; charset=utf-8"
+            if resource_type == "document"
+            else "application/octet-stream"
+        )
+        route.fulfill(
+            status=result.status_code or 200,
+            headers={
+                "content-type": (
+                    result.content_type or default_content_type
+                )
+            },
+            body=result.body,
+        )
 
 
 def read_bounded_playwright_page_content(page: Any) -> str:
@@ -981,6 +990,42 @@ def fetch_site_bytes(url: str, label: str) -> Optional[bytes]:
     return result.body if result.ok else None
 
 
+def validate_json_structure(text: str) -> Optional[str]:
+    depth = 0
+    nodes = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            nodes += 1
+            if depth > MAX_JSON_NESTING_DEPTH:
+                return "json_structure_too_deep"
+            if nodes > MAX_JSON_STRUCTURE_NODES:
+                return "json_structure_too_large"
+        elif character in "]}":
+            depth -= 1
+            if depth < 0:
+                return "invalid_json"
+        elif character == ",":
+            nodes += 1
+            if nodes > MAX_JSON_STRUCTURE_NODES:
+                return "json_structure_too_large"
+    if in_string or depth != 0:
+        return "invalid_json"
+    return None
+
+
 def fetch_site_json_result(url: str) -> tuple[SiteFetchResult, Optional[dict[str, Any]]]:
     result = fetch_site_result(url, "API 요청")
     if not result.ok or result.body is None:
@@ -1007,17 +1052,32 @@ def fetch_site_json_result(url: str) -> tuple[SiteFetchResult, Optional[dict[str
         return result, None
     try:
         text = result.body.decode("utf-8", errors="replace")
+        structure_error = validate_json_structure(text)
+        if structure_error:
+            raise ValueError(structure_error)
         payload = json.loads(
             text,
             parse_int=parse_bounded_json_integer,
         )
+    except RecursionError:
+        LOGGER.info("API 응답 구조 깊이 초과: %s", url)
+        result.ok = False
+        result.category = FailureCategory.SOURCE_CONTRACT
+        result.error = "json_structure_too_deep"
+        return result, None
     except ValueError as exc:
         LOGGER.info("API 응답 파싱 실패: %s", url)
         result.ok = False
         result.category = FailureCategory.SOURCE_CONTRACT
+        error = str(exc)
         result.error = (
-            "json_integer_out_of_range"
-            if str(exc) == "json_integer_out_of_range"
+            error
+            if error
+            in {
+                "json_integer_out_of_range",
+                "json_structure_too_deep",
+                "json_structure_too_large",
+            }
             else "invalid_json"
         )
         return result, None

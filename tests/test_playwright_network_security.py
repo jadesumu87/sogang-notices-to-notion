@@ -39,9 +39,10 @@ def address_info(address: str) -> tuple:
 
 
 class FakeRequest:
-    def __init__(self, url: str, resource_type: str):
+    def __init__(self, url: str, resource_type: str, method: str = "GET"):
         self.url = url
         self.resource_type = resource_type
+        self.method = method
 
 
 class FakeRoute:
@@ -147,10 +148,10 @@ class PlaywrightNetworkSecurityTests(unittest.TestCase):
             },
         )
         self.env.start()
-        crawler.NEXT_PLAYWRIGHT_REQUEST_AT_BY_HOST.clear()
+        crawler.NEXT_SITE_REQUEST_AT = 0.0
 
     def tearDown(self):
-        crawler.NEXT_PLAYWRIGHT_REQUEST_AT_BY_HOST.clear()
+        crawler.NEXT_SITE_REQUEST_AT = 0.0
         self.env.stop()
 
     def make_guard(
@@ -195,13 +196,95 @@ class PlaywrightNetworkSecurityTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         route.action,
-                        (
-                            "fulfill"
-                            if resource_type == "document"
-                            else "continue"
-                        ),
+                        "fulfill",
                     )
-        self.assertEqual(resolver.call_count, 5)
+        self.assertEqual(resolver.call_count, 8)
+
+    @unittest.skipUnless(
+        os.environ.get("REQUIRE_BROWSER_TESTS", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "Playwright 브라우저 검증이 선택되지 않았습니다",
+    )
+    def test_csf_2d3a31ef45f9b76873543558_browser_renders_bounded_assets(
+        self,
+    ):
+        from playwright.sync_api import sync_playwright
+
+        resolver = Mock(return_value=address_info("93.184.216.34"))
+        guard = self.make_guard(resolver)
+        responses = {
+            "https://www.sogang.ac.kr/list": (
+                b"<html><body><h1>List</h1><div id='result'></div>"
+                b"<script src='/assets/app.js'></script></body></html>",
+                "text/html; charset=utf-8",
+            ),
+            "https://www.sogang.ac.kr/detail": (
+                b"<html><body><h1>Detail</h1></body></html>",
+                "text/html; charset=utf-8",
+            ),
+            "https://www.sogang.ac.kr/assets/app.js": (
+                b"fetch('/api/data').then(r => r.json()).then(data => "
+                b"document.querySelector('#result').textContent = data.value)",
+                "application/javascript",
+            ),
+            "https://www.sogang.ac.kr/api/data": (
+                b'{"value":"loaded"}',
+                "application/json",
+            ),
+        }
+
+        def fetch_result(url, _label):
+            body, content_type = responses[url]
+            return crawler.SiteFetchResult(
+                ok=True,
+                status_code=200,
+                body=body,
+                content_type=content_type,
+                final_url=url,
+            )
+
+        with (
+            patch.object(
+                crawler,
+                "fetch_site_result",
+                side_effect=fetch_result,
+            ),
+            sync_playwright() as playwright,
+        ):
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(service_workers="block")
+                context.route(
+                    "**/*",
+                    lambda route, request: guard.handle_route(
+                        route,
+                        request,
+                    ),
+                )
+                page = context.new_page()
+                guard.begin_navigation()
+                page.goto(
+                    "https://www.sogang.ac.kr/list",
+                    wait_until="domcontentloaded",
+                )
+                page.wait_for_selector("#result:text-is('loaded')")
+                self.assertEqual(
+                    page.locator("#result").inner_text(),
+                    "loaded",
+                )
+
+                guard.begin_navigation()
+                page.goto(
+                    "https://www.sogang.ac.kr/detail",
+                    wait_until="domcontentloaded",
+                )
+                self.assertEqual(
+                    page.locator("h1").inner_text(),
+                    "Detail",
+                )
+                self.assertFalse(guard.security_error)
+            finally:
+                browser.close()
 
     def test_document_redirect_is_revalidated_before_fulfill(self):
         resolver = Mock(return_value=address_info("93.184.216.34"))
@@ -289,6 +372,18 @@ class PlaywrightNetworkSecurityTests(unittest.TestCase):
 
     def test_allowed_requests_are_spaced_per_host_and_share_actual_budget(self):
         clock = FakeClock()
+
+        def fetch_result(url, _label):
+            if not crawler.reserve_site_request():
+                return crawler.source_budget_fetch_result(url, 1)
+            return crawler.SiteFetchResult(
+                ok=True,
+                status_code=200,
+                body=b"{}",
+                content_type="application/json",
+                final_url=url,
+            )
+
         with (
             patch.dict(os.environ, {"SOURCE_MAX_REQUESTS": "2"}),
             patch.object(crawler.time, "monotonic", clock.monotonic),
@@ -302,25 +397,32 @@ class PlaywrightNetworkSecurityTests(unittest.TestCase):
                 "get_site_min_request_interval_seconds",
                 return_value=1.0,
             ),
+            patch.object(
+                crawler,
+                "fetch_site_result",
+                side_effect=fetch_result,
+            ),
         ):
-            budget = crawler.SourceRequestBudget()
-            guard = self.make_guard(
-                Mock(return_value=address_info("93.184.216.34")),
-                budget,
-            )
-            routes = [FakeRoute(), FakeRoute(), FakeRoute()]
-            for route in routes:
-                guard.handle_route(
-                    route,
-                    FakeRequest(
-                        "https://www.sogang.ac.kr/api/data",
-                        "xhr",
-                    ),
+            with crawler.source_request_budget_scope(
+                max_requests_cap=2
+            ) as budget:
+                guard = self.make_guard(
+                    Mock(return_value=address_info("93.184.216.34")),
+                    budget,
                 )
+                routes = [FakeRoute(), FakeRoute(), FakeRoute()]
+                for route in routes:
+                    guard.handle_route(
+                        route,
+                        FakeRequest(
+                            "https://www.sogang.ac.kr/api/data",
+                            "xhr",
+                        ),
+                    )
 
         self.assertEqual(
             [route.action for route in routes],
-            ["continue", "continue", "abort"],
+            ["fulfill", "fulfill", "abort"],
         )
         self.assertEqual(clock.sleeps, [1.0])
         self.assertEqual(budget.actual_requests, 2)
