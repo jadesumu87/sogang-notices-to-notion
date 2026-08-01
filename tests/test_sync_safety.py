@@ -1384,6 +1384,56 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(manifest["p"][0]["h"], actual_hash)
         self.assertNotIn(store.old_id, store.root_ids())
 
+    def test_body_generation_accepts_notion_root_link_slash(self):
+        source_url = "https://www.kosaf.go.kr"
+        notion_url = "https://www.kosaf.go.kr/"
+        visible = paragraph_block("첫 문단")
+        linked = paragraph_block("관련 안내")
+        linked["paragraph"]["rich_text"][0]["text"]["link"] = {
+            "url": source_url
+        }
+        store = StatefulBlockStore()
+        append_children = store.append_children
+
+        def append_with_notion_root_slash(
+            token: str,
+            parent_id: str,
+            blocks: list[dict],
+        ) -> dict:
+            response = append_children(token, parent_id, blocks)
+            if parent_id == store.root_id:
+                candidate_id = str(response["results"][0]["id"])
+                store.children[candidate_id][0]["paragraph"]["rich_text"][0][
+                    "text"
+                ]["link"] = {"url": notion_url}
+            return response
+
+        store.append_children = append_with_notion_root_slash
+
+        result = self.run_body_sync(
+            store,
+            generation_id="notion-root-link-slash",
+            blocks=[visible, linked],
+        )
+
+        manifest = sync.extract_body_generation_manifest(
+            notion_read_properties(store.properties)
+        )
+        self.assertEqual(result, "notion-root-link-slash")
+        self.assertEqual(manifest["s"], "committed")
+        self.assertEqual(store.root_append_count, 1)
+        self.assertNotIn(store.old_id, store.root_ids())
+
+    def test_notion_link_normalization_preserves_non_root_path_slash(self):
+        self.assertNotEqual(
+            sync.normalize_notion_link_identity(
+                "https://www.kosaf.go.kr/path"
+            ),
+            sync.normalize_notion_link_identity(
+                "https://www.kosaf.go.kr/path/"
+            ),
+        )
+
     def test_pending_notion_link_failure_recovers_without_duplicate(self):
         source_url = (
             "https://www.sogang.ac.kr/ko/detail/548926"

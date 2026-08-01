@@ -1328,26 +1328,27 @@ def normalize_notion_link_identity(raw_link: object) -> str:
     if (
         parsed.scheme.lower() not in {"http", "https"}
         or not parsed.netloc
-        or not parsed.query
     ):
         return link
-    try:
-        query = urlencode(
-            parse_qsl(
-                parsed.query,
-                keep_blank_values=True,
-                encoding="utf-8",
-                errors="strict",
-            ),
-            doseq=True,
-        )
-    except (UnicodeError, ValueError):
-        return link
+    query = parsed.query
+    if query:
+        try:
+            query = urlencode(
+                parse_qsl(
+                    query,
+                    keep_blank_values=True,
+                    encoding="utf-8",
+                    errors="strict",
+                ),
+                doseq=True,
+            )
+        except (UnicodeError, ValueError):
+            return link
     return urlunsplit(
         (
             parsed.scheme,
             parsed.netloc,
-            parsed.path,
+            parsed.path or "/",
             query,
             parsed.fragment,
         )
