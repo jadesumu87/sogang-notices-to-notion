@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,6 +23,7 @@ from models import (
     ValidationIssue,
     utc_now_iso,
 )
+from refresh_policy import select_due_notice_ids
 from run_control import (
     install_run_control,
     require_destination_state_reserve,
@@ -71,22 +73,9 @@ from validation import validate_crawl_report
 def select_refresh_ids(
     source_state: dict[str, Any],
     known_ids: set[str],
+    now: Optional[datetime] = None,
 ) -> list[str]:
-    raw_ids = source_state.get("observed_ids", [])
-    ordered_ids = [
-        str(value)
-        for value in raw_ids
-        if str(value) in known_ids
-    ] if isinstance(raw_ids, list) else sorted(known_ids)
-    if not ordered_ids:
-        return []
-    cursor = str(source_state.get("detail_refresh_cursor_id") or "")
-    start = 0
-    if cursor in ordered_ids:
-        start = (ordered_ids.index(cursor) + 1) % len(ordered_ids)
-    limit = max(1, get_backfill_detail_limit() // 2)
-    rotated = ordered_ids[start:] + ordered_ids[:start]
-    return rotated[:limit]
+    return select_due_notice_ids(source_state, known_ids, now)
 
 
 def pending_shrink_ids(
@@ -399,27 +388,23 @@ def collect_report(
             )
             for config_fk in config_fks
         }
-        rotation_windows_by_source = {
-            config_fk: (
-                select_refresh_ids(
-                    source_states.get(config_fk, {}),
-                    known_ids_by_source[config_fk],
-                )
-                if (
-                    reconcile_by_source[config_fk]
-                    and known_ids_by_source[config_fk]
-                    and isinstance(source_states.get(config_fk), dict)
-                    and not source_states[config_fk].get("backfill_active")
-                )
-                else []
+        scheduled_refresh_ids_by_source = {
+            config_fk: select_refresh_ids(
+                source_states.get(config_fk, {}),
+                known_ids_by_source[config_fk],
             )
+            if (
+                known_ids_by_source[config_fk]
+                and isinstance(source_states.get(config_fk), dict)
+            )
+            else []
             for config_fk in config_fks
         }
         refresh_ids_by_source = {
             config_fk: set(
                 [
                     *pending_shrink_ids(state, config_fk),
-                    *rotation_windows_by_source[config_fk],
+                    *scheduled_refresh_ids_by_source[config_fk],
                 ]
             )
             for config_fk in config_fks
@@ -518,13 +503,6 @@ def collect_report(
                 targeted_refresh_ids_by_source
             ),
         )
-        for result in report.sources:
-            refresh_window = rotation_windows_by_source.get(
-                result.source.config_fk,
-                [],
-            )
-            if refresh_window:
-                result.refresh_window_end_id = refresh_window[-1]
         return report
     if not html_path.exists():
         raise RuntimeError(f"HTML 파일을 찾을 수 없습니다: {html_path}")
@@ -623,6 +601,10 @@ def source_run_payload(result: SourceCrawlResult) -> dict[str, Any]:
         "pages_scanned": result.pages_scanned,
         "observed_count": result.observed_count,
         "item_count": len(result.items),
+        "notice_observation_count": len(result.notice_observations),
+        "detailed_notice_count": len(result.detailed_notice_ids),
+        "refreshed_known_count": len(result.refreshed_known_ids),
+        "notice_index_complete": result.notice_index_complete,
         "detail_failures": result.detail_failures,
         "rejected_count": result.rejected_count,
         "checkpoint_found": result.checkpoint_found,

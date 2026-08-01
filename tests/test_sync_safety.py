@@ -3019,11 +3019,17 @@ class SyncSafetyTests(unittest.TestCase):
             "date": "2026-07-27T00:00:00+09:00",
             "classification": "학사공지",
             "type": "학사",
+            "views": 200,
             "top": False,
             "body_blocks": [],
         }
         operation_id = sync_engine.operation_id_for_item(item)
-        properties = sync.build_properties(item, False, False, True)
+        properties = sync.build_properties(
+            {**item, "views": 100},
+            True,
+            False,
+            True,
+        )
         properties[sync.SYNC_STATUS_PROPERTY] = {
             "rich_text": sync_engine.build_rich_text_chunks("committed")
         }
@@ -3038,7 +3044,7 @@ class SyncSafetyTests(unittest.TestCase):
         context = sync_engine.DestinationContext(
             token="token",
             database_id="database",
-            has_views_property=False,
+            has_views_property=True,
             has_attachments_property=False,
             has_classification_property=True,
         )
@@ -3071,6 +3077,80 @@ class SyncSafetyTests(unittest.TestCase):
         verify.assert_called_once()
         self.assertEqual(counters.writes, 0)
         self.assertEqual(counters.unchanged, 1)
+
+    def test_operation_id_ignores_view_count_only_changes(self):
+        item = {
+            "source_id": "2",
+            "notice_id": "view-only",
+            "title": "조회수 정책",
+            "date": "2026-08-01T00:00:00+09:00",
+            "author": "작성자",
+            "views": 100,
+            "top": False,
+            "classification": "학사공지",
+            "url": (
+                "https://www.sogang.ac.kr/ko/detail/view-only"
+                "?bbsConfigFk=2"
+            ),
+        }
+
+        self.assertEqual(
+            sync_engine.operation_id_for_item(item),
+            sync_engine.operation_id_for_item({**item, "views": 999}),
+        )
+
+    def test_existing_page_readback_ignores_view_count_only_change(self):
+        item = {
+            "source_id": "2",
+            "notice_id": "view-readback",
+            "title": "조회수 재조회",
+            "date": "2026-08-01T00:00:00+09:00",
+            "author": "작성자",
+            "views": 200,
+            "top": False,
+            "classification": "학사공지",
+            "type": "학사",
+            "url": (
+                "https://www.sogang.ac.kr/ko/detail/view-readback"
+                "?bbsConfigFk=2"
+            ),
+        }
+        operation_id = sync_engine.operation_id_for_item(item)
+        stored_item = {
+            **item,
+            "views": 100,
+            "operation_id": operation_id,
+            "generation_id": "generation",
+            "sync_status": "committed",
+        }
+        page = {
+            "id": "page-view-readback",
+            "properties": notion_read_properties(
+                sync_engine.build_properties(
+                    stored_item,
+                    True,
+                    True,
+                    True,
+                )
+            ),
+        }
+
+        reasons = sync_engine.committed_item_readback_reasons(
+            "token",
+            page,
+            item,
+            sync_engine.DestinationContext("token", "database"),
+            "page-view-readback",
+            operation_id,
+            "generation",
+            "",
+            [],
+            [],
+            False,
+            True,
+        )
+
+        self.assertEqual(reasons, [])
 
     def test_invalid_body_payload_stops_before_upload_or_page_write(self):
         invalid_bodies = {

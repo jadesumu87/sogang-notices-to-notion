@@ -172,6 +172,7 @@ class FallbackContractTests(unittest.TestCase):
         include_non_top=True,
         incremental=False,
         known_ids=None,
+        source_state=None,
     ):
         page_values = dict(pages)
         detail_values = details or {}
@@ -196,6 +197,7 @@ class FallbackContractTests(unittest.TestCase):
             self.original,
             fetch_page,
             fetch_detail,
+            source_state=source_state,
         )
 
     def test_verified_fallback_reaches_natural_end_and_is_write_safe(self):
@@ -361,6 +363,72 @@ class FallbackContractTests(unittest.TestCase):
         self.assertTrue(result.write_safe)
         self.assertEqual([item["notice_id"] for item in result.items], ["1003"])
         self.assertTrue(result.checkpoint_found)
+
+    def test_refresh_policy_scans_fallback_history_for_list_changes(self):
+        known_ids = {"1004", "1003", "1002", "1001", "1000", "900"}
+        changed = self.entry("900", title="수정된 과거 공지")
+        changed["date"] = "2025-01-01T09:00:00+09:00"
+        last_detail_at = datetime.now(timezone.utc).isoformat()
+        notice_refresh_state = {}
+        for notice_id in known_ids - {"900"}:
+            notice_refresh_state[notice_id] = {
+                **crawler.build_notice_observation(
+                    notice_id,
+                    f"공지 {notice_id}",
+                    DATE,
+                    False,
+                ),
+                "last_detail_at": last_detail_at,
+            }
+        notice_refresh_state["900"] = {
+            **crawler.build_notice_observation(
+                "900",
+                "이전 과거 공지",
+                "2025-01-01T09:00:00+09:00",
+                False,
+            ),
+            "last_detail_at": last_detail_at,
+        }
+
+        result = self.crawl(
+            {
+                1: self.page(
+                    1,
+                    [self.entry("1005"), self.entry("1004")],
+                ),
+                2: self.page(
+                    2,
+                    [self.entry("1003"), self.entry("1002")],
+                ),
+                3: self.page(
+                    3,
+                    [self.entry("1001"), self.entry("1000")],
+                ),
+                4: self.page(4, [self.entry("800"), changed]),
+                5: self.page(5, [], explicit_empty=True),
+            },
+            {
+                "900": self.detail(
+                    changed,
+                    title="수정된 과거 공지",
+                    date="2025-01-01T09:00:00+09:00",
+                )
+            },
+            incremental=True,
+            known_ids=known_ids,
+            source_state={
+                "notice_refresh_state": notice_refresh_state,
+            },
+        )
+
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(
+            {item["notice_id"] for item in result.items},
+            {"1005", "900"},
+        )
+        self.assertNotIn("800", result.observed_ids)
+        self.assertIn("800", result.notice_observations)
 
     def test_css_or_script_text_cannot_confirm_empty_body_or_attachments(self):
         signals = crawler.build_detail_signals(

@@ -975,6 +975,13 @@ class RunStateTests(unittest.TestCase):
         state["sources"]["141"] = {
             "backfill_active": True,
             "last_reconcile_attempt_at": "2026-07-28T00:00:00+00:00",
+            "notice_refresh_state": {
+                "1001": {
+                    "fingerprint": "a" * 64,
+                    "published_at": "2026-07-28T00:00:00+00:00",
+                    "last_detail_at": "2026-07-28T01:00:00+00:00",
+                }
+            },
         }
         hold_key = "b" * 64
         state["destination_holds"][hold_key] = {
@@ -1002,10 +1009,73 @@ class RunStateTests(unittest.TestCase):
             "2026-07-28T00:00:00+00:00",
         )
         self.assertEqual(
+            projected["sources"]["141"]["notice_refresh_state"],
+            state["sources"]["141"]["notice_refresh_state"],
+        )
+        self.assertEqual(
             set(projected["destination_holds"][hold_key]),
             run_state.PUBLIC_CACHE_DESTINATION_HOLD_FIELDS,
         )
         self.assertNotIn("private_notice_id", json.dumps(projected))
+
+    def test_notice_refresh_state_advances_only_for_applied_details(self):
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "observed_ids": ["1001", "9999"],
+            "notice_refresh_state": {
+                "1001": {
+                    "fingerprint": "a" * 64,
+                    "published_at": "2026-07-28T00:00:00+00:00",
+                    "last_detail_at": "2026-07-28T01:00:00+00:00",
+                },
+                "9999": {
+                    "fingerprint": "b" * 64,
+                    "published_at": "2026-01-01T00:00:00+00:00",
+                },
+            },
+        }
+        result = source_result(
+            "141",
+            SourceStatus.SUCCESS,
+            ["1001"],
+        )
+        result.notice_observations = {
+            "1001": {
+                "fingerprint": "c" * 64,
+                "published_at": "2026-07-28T00:00:00+00:00",
+            }
+        }
+        result.detailed_notice_ids = ["1001"]
+        result.notice_index_complete = True
+        fixed_now = "2026-08-01T00:00:00+00:00"
+
+        with patch.object(run_state, "utc_now_iso", return_value=fixed_now):
+            run_state.update_state_from_report(
+                state,
+                CrawlReport([result]),
+                full_reconcile=False,
+                applied_source_ids={"141"},
+            )
+
+        refresh_state = state["sources"]["141"]["notice_refresh_state"]
+        self.assertEqual(set(refresh_state), {"1001"})
+        self.assertEqual(refresh_state["1001"]["fingerprint"], "c" * 64)
+        self.assertEqual(refresh_state["1001"]["first_seen_at"], fixed_now)
+        self.assertEqual(refresh_state["1001"]["last_detail_at"], fixed_now)
+
+    def test_malformed_notice_refresh_state_fails_closed(self):
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "notice_refresh_state": {
+                "../1001": {
+                    "fingerprint": "not-a-fingerprint",
+                }
+            }
+        }
+        state["state_checksum"] = run_state.state_checksum(state)
+
+        with self.assertRaises(run_state.RunStateIntegrityError):
+            run_state.validate_run_state_payload(state)
 
     def test_atomic_json_write_replaces_complete_document(self):
         with tempfile.TemporaryDirectory() as temp_dir:

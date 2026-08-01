@@ -2408,6 +2408,243 @@ class CrawlerRegressionTests(unittest.TestCase):
             ["1005"],
         )
 
+    def test_refresh_policy_scans_full_list_and_refreshes_changed_history(self):
+        known_ids = {"1004", "1003", "1002", "1001", "1000", "900"}
+        changed_entry = api_entry("900")
+        changed_entry["title"] = "수정된 과거 공지"
+        changed_entry["regDate"] = "20250101090000"
+        pages = {
+            1: api_page([api_entry("1005"), api_entry("1004")]),
+            2: api_page([api_entry("1003"), api_entry("1002")]),
+            3: api_page([api_entry("1001"), api_entry("1000")]),
+            4: api_page([api_entry("800"), changed_entry]),
+            5: api_page([], terminal_verified=True),
+        }
+        last_detail_at = datetime.now(timezone.utc).isoformat()
+        notice_refresh_state = {}
+        for notice_id in known_ids - {"900"}:
+            observation = crawler.build_notice_observation(
+                notice_id,
+                f"공지 {notice_id}",
+                DATE,
+                False,
+            )
+            notice_refresh_state[notice_id] = {
+                **observation,
+                "last_detail_at": last_detail_at,
+            }
+        notice_refresh_state["900"] = {
+            **crawler.build_notice_observation(
+                "900",
+                "이전 과거 공지",
+                "20250101090000",
+                False,
+            ),
+            "last_detail_at": last_detail_at,
+        }
+        detail_calls = []
+
+        def fetch_detail(notice_id, **kwargs):
+            detail_calls.append(notice_id)
+            if notice_id == "900":
+                return {
+                    **api_detail(notice_id),
+                    "title": "수정된 과거 공지",
+                    "regDate": "20250101090000",
+                }
+            return api_detail(notice_id)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"INCREMENTAL_CHECKPOINT_OVERLAP_PAGES": "2"},
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_list_result",
+                side_effect=lambda page, *args, **kwargs: pages[page],
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_detail",
+                side_effect=fetch_detail,
+            ),
+            patch.object(
+                crawler,
+                "get_detail_html_fallback_reason",
+                return_value=None,
+            ),
+            patch.object(
+                crawler,
+                "extract_body_blocks_from_html",
+                return_value=BODY,
+            ),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                known_ids=known_ids,
+                incremental=True,
+                source_state={
+                    "notice_refresh_state": notice_refresh_state,
+                },
+            )
+
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(result.termination_reason, "natural_end")
+        self.assertEqual(set(detail_calls), {"1005", "900"})
+        self.assertNotIn("800", result.observed_ids)
+        self.assertIn("800", result.notice_observations)
+        self.assertEqual(
+            set(result.detailed_notice_ids),
+            {"1005", "900"},
+        )
+
+    def test_scheduled_refresh_does_not_consume_backfill_detail_limit(self):
+        observation = crawler.build_notice_observation(
+            "1006",
+            "공지 1006",
+            DATE,
+            False,
+        )
+        pages = {
+            1: api_page([api_entry("1006"), api_entry("1005")]),
+            2: api_page([api_entry("1004")]),
+            3: api_page([], terminal_verified=True),
+        }
+        detail_calls = []
+
+        def fetch_detail(notice_id, **kwargs):
+            detail_calls.append(notice_id)
+            return api_detail(notice_id)
+
+        with (
+            patch.dict(os.environ, {"BACKFILL_DETAIL_LIMIT": "1"}),
+            patch.object(
+                crawler,
+                "fetch_bbs_list_result",
+                side_effect=lambda page, *args, **kwargs: pages[page],
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_detail",
+                side_effect=fetch_detail,
+            ),
+            patch.object(
+                crawler,
+                "get_detail_html_fallback_reason",
+                return_value=None,
+            ),
+            patch.object(
+                crawler,
+                "extract_body_blocks_from_html",
+                return_value=BODY,
+            ),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                known_ids={"1006"},
+                incremental=True,
+                reconcile_mode=True,
+                source_state={
+                    "notice_refresh_state": {
+                        "1006": {
+                            **observation,
+                            "last_detail_at": (
+                                "2020-01-01T00:00:00+00:00"
+                            ),
+                        }
+                    }
+                },
+            )
+
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertEqual(result.termination_reason, "backfill_window")
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(set(detail_calls), {"1006", "1005"})
+        self.assertNotIn("1004", result.observed_ids)
+        self.assertIn("1004", result.notice_observations)
+
+    def test_refresh_policy_finds_shifted_resume_anchor_during_full_sweep(self):
+        known_ids = {"1000", "900"}
+        last_detail_at = datetime.now(timezone.utc).isoformat()
+        notice_refresh_state = {
+            notice_id: {
+                **crawler.build_notice_observation(
+                    notice_id,
+                    f"공지 {notice_id}",
+                    DATE,
+                    False,
+                ),
+                "last_detail_at": last_detail_at,
+            }
+            for notice_id in known_ids
+        }
+        pages = {
+            1: api_page([api_entry("1000")]),
+            2: api_page([api_entry("999")]),
+            3: api_page([api_entry("998")]),
+            4: api_page([api_entry("997")]),
+            5: api_page([api_entry("996")]),
+            6: api_page([api_entry("900"), api_entry("895")]),
+            7: api_page([], terminal_verified=True),
+        }
+
+        with (
+            patch.object(
+                crawler,
+                "fetch_bbs_list_result",
+                side_effect=lambda page, *args, **kwargs: pages[page],
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_detail",
+                side_effect=lambda notice_id, **kwargs: api_detail(notice_id),
+            ),
+            patch.object(
+                crawler,
+                "get_detail_html_fallback_reason",
+                return_value=None,
+            ),
+            patch.object(
+                crawler,
+                "extract_body_blocks_from_html",
+                return_value=BODY,
+            ),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                known_ids=known_ids,
+                incremental=True,
+                reconcile_mode=True,
+                resume_page=3,
+                resume_anchor_ids={"900"},
+                source_state={
+                    "notice_refresh_state": notice_refresh_state,
+                },
+            )
+
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(
+            [
+                crawler.extract_detail_id_from_text(item["url"])
+                for item in result.items
+            ],
+            ["895"],
+        )
+        self.assertTrue(
+            {"999", "998", "997", "996"}.isdisjoint(
+                result.observed_ids
+            )
+        )
+
     def test_repeated_new_pinned_top_does_not_dirty_api_overlap(self):
         pinned = api_entry("9000", top=True)
         known_ids = {"1004", "1003", "1002", "1001", "1000"}
@@ -3008,6 +3245,60 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
         self.assertEqual(
             captured["targeted_refresh_ids_by_source"]["2"],
             {"548926"},
+        )
+
+    def test_collect_report_schedules_due_refresh_during_incremental_run(self):
+        state = fresh_state()
+        observation = crawler.build_notice_observation(
+            "550000",
+            "오래된 공지",
+            "2020-01-01T00:00:00+09:00",
+            False,
+        )
+        state["sources"]["2"] = {
+            "observed_ids": ["550000"],
+            "notice_refresh_state": {
+                "550000": {
+                    **observation,
+                    "last_detail_at": "2020-01-01T00:00:00+00:00",
+                }
+            },
+        }
+        captured = {}
+
+        def crawl_sources(**kwargs):
+            captured.update(kwargs)
+            return CrawlReport([])
+
+        with (
+            patch.object(
+                crawler_main,
+                "resolve_html_path",
+                return_value=None,
+            ),
+            patch.object(
+                crawler_main,
+                "get_bbs_config_fks",
+                return_value=["2"],
+            ),
+            patch.object(
+                crawler_main,
+                "crawl_sources",
+                side_effect=crawl_sources,
+            ),
+        ):
+            crawler_main.collect_report(
+                state,
+                full_reconcile=False,
+            )
+
+        self.assertEqual(
+            captured["refresh_ids_by_source"]["2"],
+            {"550000"},
+        )
+        self.assertEqual(
+            captured["targeted_refresh_ids_by_source"]["2"],
+            set(),
         )
 
     def test_backfill_source_runs_first_with_fair_budget(self):

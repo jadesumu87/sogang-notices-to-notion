@@ -47,6 +47,7 @@ PUBLIC_CACHE_SOURCE_FIELDS = frozenset(
         "last_success_at",
         "last_top_observed_ids",
         "method",
+        "notice_refresh_state",
         "observed_ids",
         "pending_notice_ids",
         "source_circuit_open_until",
@@ -503,6 +504,51 @@ def validate_run_state_payload(payload: Any) -> dict[str, Any]:
             raise RunStateIntegrityError(
                 "실행 상태 대기 공지 ID 형식 또는 보존 한도가 올바르지 않습니다"
             )
+        notice_refresh_state = source_state.get("notice_refresh_state", {})
+        if (
+            not isinstance(notice_refresh_state, dict)
+            or len(notice_refresh_state) > 50000
+        ):
+            raise RunStateIntegrityError(
+                "실행 상태 공지 재검사 정보 형식 또는 보존 한도가 올바르지 않습니다"
+            )
+        for notice_id, observation in notice_refresh_state.items():
+            if (
+                not isinstance(notice_id, str)
+                or re.fullmatch(r"[0-9]{1,32}", notice_id) is None
+                or not isinstance(observation, dict)
+                or set(observation)
+                - {
+                    "fingerprint",
+                    "first_seen_at",
+                    "published_at",
+                    "last_detail_at",
+                }
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(observation.get("fingerprint") or ""),
+                )
+                is None
+            ):
+                raise RunStateIntegrityError(
+                    "실행 상태 공지 재검사 정보가 올바르지 않습니다"
+                )
+            for timestamp_name in (
+                "first_seen_at",
+                "published_at",
+                "last_detail_at",
+            ):
+                timestamp = observation.get(timestamp_name)
+                if (
+                    timestamp is not None
+                    and (
+                        not isinstance(timestamp, str)
+                        or parse_iso_datetime(timestamp) is None
+                    )
+                ):
+                    raise RunStateIntegrityError(
+                        "실행 상태 공지 재검사 시각이 올바르지 않습니다"
+                    )
         for flag_name in (
             "backfill_active",
             "empty_confirmation_pending",
@@ -1017,6 +1063,66 @@ def update_state_from_report(
                     "error": "",
                 }
             )
+            previous_notice_refresh_state = source_state.get(
+                "notice_refresh_state",
+                {},
+            )
+            if not isinstance(previous_notice_refresh_state, dict):
+                previous_notice_refresh_state = {}
+            should_replace_notice_refresh_state = bool(
+                result.notice_index_complete
+                and (not confirmed_empty or consecutive_empty)
+            )
+            merged_notice_refresh_state: dict[str, dict[str, str]] = (
+                {}
+                if should_replace_notice_refresh_state
+                else deepcopy(previous_notice_refresh_state)
+            )
+            detailed_notice_ids = set(result.detailed_notice_ids)
+            for notice_id, observation in result.notice_observations.items():
+                previous_observation = previous_notice_refresh_state.get(
+                    notice_id,
+                    {},
+                )
+                if not isinstance(previous_observation, dict):
+                    previous_observation = {}
+                merged_observation = {
+                    "fingerprint": str(
+                        observation.get("fingerprint") or ""
+                    ),
+                }
+                published_at = str(
+                    observation.get("published_at") or ""
+                )
+                if published_at:
+                    merged_observation["published_at"] = published_at
+                first_seen_at = str(
+                    previous_observation.get("first_seen_at") or now
+                )
+                merged_observation["first_seen_at"] = first_seen_at
+                if notice_id in detailed_notice_ids:
+                    merged_observation["last_detail_at"] = now
+                else:
+                    last_detail_at = str(
+                        previous_observation.get("last_detail_at") or ""
+                    )
+                    if last_detail_at:
+                        merged_observation["last_detail_at"] = (
+                            last_detail_at
+                        )
+                merged_notice_refresh_state[notice_id] = merged_observation
+            if len(merged_notice_refresh_state) > max_observed_ids:
+                raise RunStateIntegrityError(
+                    "공지 재검사 정보가 실행 상태 보존 한도를 초과했습니다"
+                )
+            if (
+                merged_notice_refresh_state
+                or "notice_refresh_state" in source_state
+                or result.notice_observations
+            ):
+                source_state["notice_refresh_state"] = (
+                    merged_notice_refresh_state
+                )
             if confirmed_empty:
                 source_state["empty_observation_count"] = (
                     safe_nonnegative_int(

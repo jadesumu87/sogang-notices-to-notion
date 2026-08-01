@@ -295,6 +295,11 @@ class SourceCrawlResult:
     pages_scanned: int = 0
     observed_count: int = 0
     observed_ids: list[str] = field(default_factory=list)
+    notice_observations: dict[str, dict[str, str]] = field(
+        default_factory=dict
+    )
+    detailed_notice_ids: list[str] = field(default_factory=list)
+    notice_index_complete: bool = False
     refreshed_known_ids: list[str] = field(default_factory=list)
     refresh_window_end_id: str = ""
     backfill_resume_page: int = 1

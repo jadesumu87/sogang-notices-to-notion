@@ -48,6 +48,7 @@ from models import (
     SourceSpec,
     SourceStatus,
 )
+from refresh_policy import build_notice_observation, notice_refresh_due
 from bbs_parser import (
     detect_attachment_container,
     detect_loading_shell,
@@ -1910,12 +1911,17 @@ def crawl_top_items_api_result(
     resume_page: int = 1,
     resume_anchor_ids: Optional[set[str]] = None,
     targeted_refresh_ids: Optional[set[str]] = None,
+    source_state: Optional[dict[str, Any]] = None,
 ) -> SourceCrawlResult:
     config_fk = source.config_fk
     items: JsonObjectList = []
     seen: set[str] = set()
     observed_ids: list[str] = []
     observed_id_set: set[str] = set()
+    notice_observations: dict[str, dict[str, str]] = {}
+    detailed_notice_ids: list[str] = []
+    policy_refresh_ids: set[str] = set()
+    fingerprint_changed_ids: set[str] = set()
     raw_observed_ids: set[str] = set()
     top_urls: set[str] = set()
     top_dates: dict[str, set[str]] = {}
@@ -1940,6 +1946,11 @@ def crawl_top_items_api_result(
     previous_page_count: Optional[int] = None
     expected_total_count: Optional[int] = None
     fetched_detail_count = 0
+    backfill_new_detail_count = 0
+    backfill_window_reached = False
+    notice_index_complete = False
+    incremental_detail_window_closed = False
+    crawl_now = datetime.now(timezone.utc)
     first_page_top_verified = False
     backfill_detail_limit = get_backfill_detail_limit()
     resume_page = max(1, resume_page)
@@ -1961,6 +1972,16 @@ def crawl_top_items_api_result(
         (targeted_refresh_ids or set())
         & required_refresh_ids
     )
+    raw_notice_refresh_state = (source_state or {}).get(
+        "notice_refresh_state",
+        {},
+    )
+    notice_refresh_state = (
+        raw_notice_refresh_state
+        if isinstance(raw_notice_refresh_state, dict)
+        else {}
+    )
+    refresh_policy_enabled = source_state is not None
     classification = source.classification
     page_size_raw = os.environ.get("BBS_PAGE_SIZE", "20")
     try:
@@ -2086,6 +2107,7 @@ def crawl_top_items_api_result(
             resume_active
             and not resume_anchor_found
             and page_number > resume_search_end
+            and not refresh_policy_enabled
         ):
             terminal_error = "backfill_resume_anchor_missing"
             terminal_category = FailureCategory.SOURCE_PARTIAL
@@ -2168,6 +2190,7 @@ def crawl_top_items_api_result(
                     reconcile_complete=reconcile_mode,
                     coverage_complete=reconcile_mode,
                     top_snapshot_verified=True,
+                    notice_index_complete=True,
                 )
             if not page_entries:
                 if (
@@ -2182,7 +2205,12 @@ def crawl_top_items_api_result(
                     break
                 checkpoint_found = True
                 terminal_reached = True
-                termination_reason = "natural_end"
+                notice_index_complete = True
+                termination_reason = (
+                    "backfill_window"
+                    if backfill_window_reached
+                    else "natural_end"
+                )
                 break
         raw_observed_ids.update(
             str(entry.get("pkId") or "").strip()
@@ -2286,6 +2314,37 @@ def crawl_top_items_api_result(
                     break
             else:
                 seen_identities[pk_id] = identity
+            observation = build_notice_observation(
+                pk_id,
+                entry.get("title"),
+                entry.get("regDate"),
+                top,
+            )
+            notice_observations.setdefault(pk_id, observation)
+            previous_observation = notice_refresh_state.get(pk_id, {})
+            if not isinstance(previous_observation, dict):
+                previous_observation = {}
+            policy_refresh_due = bool(
+                refresh_policy_enabled
+                and pk_id in known_ids
+                and notice_refresh_due(
+                    pk_id,
+                    observation,
+                    previous_observation,
+                    crawl_now,
+                )
+            )
+            if policy_refresh_due:
+                policy_refresh_ids.add(pk_id)
+                previous_fingerprint = str(
+                    previous_observation.get("fingerprint") or ""
+                )
+                if (
+                    previous_fingerprint
+                    and previous_fingerprint
+                    != observation["fingerprint"]
+                ):
+                    fingerprint_changed_ids.add(pk_id)
             if top:
                 observed_top_ids.add(pk_id)
                 top_urls.add(detail_url)
@@ -2300,7 +2359,20 @@ def crawl_top_items_api_result(
                 if targeted_refresh_ids:
                     targeted_history_active = True
             if (
-                targeted_history_active
+                (
+                    targeted_history_active
+                    or incremental_detail_window_closed
+                    or backfill_window_reached
+                    or (
+                        refresh_policy_enabled
+                        and resume_active
+                        and checkpoint_found
+                        and (
+                            not resume_anchor_found
+                            or page_number < resume_page
+                        )
+                    )
+                )
                 and not top
                 and pk_id not in known_ids
             ):
@@ -2314,6 +2386,7 @@ def crawl_top_items_api_result(
                 incremental
                 and pk_id in known_ids
                 and pk_id not in refresh_known_ids
+                and not policy_refresh_due
             ):
                 continue
             log_detail_collection_progress(
@@ -2525,8 +2598,11 @@ def crawl_top_items_api_result(
             items.append(item)
             new_count += 1
             fetched_detail_count += 1
+            detailed_notice_ids.append(pk_id)
             if pk_id in known_ids:
                 refreshed_known_ids.append(pk_id)
+            else:
+                backfill_new_detail_count += 1
             log_detail_collection_progress(
                 "API",
                 "완료",
@@ -2553,9 +2629,12 @@ def crawl_top_items_api_result(
                 set(refreshed_known_ids)
             )
         ):
-            terminal_reached = True
-            termination_reason = "incremental_checkpoint"
-            break
+            if refresh_policy_enabled:
+                incremental_detail_window_closed = True
+            else:
+                terminal_reached = True
+                termination_reason = "incremental_checkpoint"
+                break
         if page_result.terminal_verified:
             if (
                 include_non_top
@@ -2572,7 +2651,12 @@ def crawl_top_items_api_result(
                 break
             checkpoint_found = True
             terminal_reached = True
-            termination_reason = "natural_end"
+            notice_index_complete = True
+            termination_reason = (
+                "backfill_window"
+                if backfill_window_reached
+                else "natural_end"
+            )
             break
         if not include_non_top:
             has_non_top = any(
@@ -2587,16 +2671,26 @@ def crawl_top_items_api_result(
         if (
             reconcile_mode
             and include_non_top
-            and fetched_detail_count >= backfill_detail_limit
+            and (
+                backfill_new_detail_count
+                if refresh_policy_enabled
+                else fetched_detail_count
+            )
+            >= backfill_detail_limit
+            and not backfill_window_reached
         ):
             checkpoint_found = True
-            terminal_reached = True
-            termination_reason = "backfill_window"
             next_resume_page = page_number + 1
             next_anchor_ids = sorted(page_non_top_ids)
-            break
+            if refresh_policy_enabled:
+                backfill_window_reached = True
+            else:
+                terminal_reached = True
+                termination_reason = "backfill_window"
+                break
         if (
-            resume_active
+            not refresh_policy_enabled
+            and resume_active
             and not resume_jump_done
             and checkpoint_found
         ):
@@ -2623,11 +2717,15 @@ def crawl_top_items_api_result(
             if (
                 checkpoint_overlap_pages
                 >= checkpoint_overlap_required
-                and required_refresh_ids.issubset(
-                    set(refreshed_known_ids)
+                and (
+                    refresh_policy_enabled
+                    or required_refresh_ids.issubset(
+                        set(refreshed_known_ids)
+                    )
                 )
                 and (
-                    expected_total_count is None
+                    refresh_policy_enabled
+                    or expected_total_count is None
                     or len(
                         raw_observed_ids
                         | (known_ids - observed_top_ids)
@@ -2635,9 +2733,12 @@ def crawl_top_items_api_result(
                     >= expected_total_count
                 )
             ):
-                terminal_reached = True
-                termination_reason = "incremental_checkpoint"
-                break
+                if refresh_policy_enabled:
+                    incremental_detail_window_closed = True
+                else:
+                    terminal_reached = True
+                    termination_reason = "incremental_checkpoint"
+                    break
         previous_page_count = len(page_entries)
         page_number += 1
 
@@ -2692,6 +2793,16 @@ def crawl_top_items_api_result(
                 error = f"detail_failures:{detail_failures}"
             else:
                 error = f"rejected_entries:{rejected_count}"
+    LOGGER.info(
+        "공지 최신성 감시 결과(API): 출처=%s, 목록=%s, 상세=%s, "
+        "정기 재검사=%s, 지문 변경=%s, 목록 완결=%s",
+        config_fk,
+        len(notice_observations),
+        len(detailed_notice_ids),
+        len(policy_refresh_ids - fingerprint_changed_ids),
+        len(fingerprint_changed_ids),
+        notice_index_complete,
+    )
     return SourceCrawlResult(
         source=source,
         status=status,
@@ -2704,6 +2815,9 @@ def crawl_top_items_api_result(
             else len(observed_ids)
         ),
         observed_ids=observed_ids,
+        notice_observations=notice_observations,
+        detailed_notice_ids=detailed_notice_ids,
+        notice_index_complete=notice_index_complete,
         refreshed_known_ids=refreshed_known_ids,
         top_urls=sorted(top_urls),
         top_dates={key: sorted(values) for key, values in top_dates.items()},
@@ -2917,6 +3031,7 @@ class SogangSourceAdapter:
             resume_page=resume_page,
             resume_anchor_ids=resume_anchor_ids,
             targeted_refresh_ids=targeted_refresh_ids,
+            source_state=source_state,
         )
         if api_result.write_safe:
             return api_result
@@ -2961,6 +3076,7 @@ class SogangSourceAdapter:
             resume_page,
             resume_anchor_ids,
             targeted_refresh_ids,
+            source_state,
         )
 
 
@@ -4020,10 +4136,15 @@ def crawl_fallback_with_fetchers(
     resume_page: int = 1,
     resume_anchor_ids: Optional[set[str]] = None,
     targeted_refresh_ids: Optional[set[str]] = None,
+    source_state: Optional[dict[str, Any]] = None,
 ) -> SourceCrawlResult:
     items: JsonObjectList = []
     observed_ids: list[str] = []
     observed_id_set: set[str] = set()
+    notice_observations: dict[str, dict[str, str]] = {}
+    detailed_notice_ids: list[str] = []
+    policy_refresh_ids: set[str] = set()
+    fingerprint_changed_ids: set[str] = set()
     top_urls: set[str] = set()
     top_dates: dict[str, set[str]] = {}
     seen_identity: dict[str, tuple[bool, str, str, str]] = {}
@@ -4050,6 +4171,11 @@ def crawl_fallback_with_fetchers(
     jitter_max = get_fallback_jitter_seconds()
     backfill_detail_limit = get_backfill_detail_limit()
     fetched_detail_count = 0
+    backfill_new_detail_count = 0
+    backfill_window_reached = False
+    notice_index_complete = False
+    incremental_detail_window_closed = False
+    crawl_now = datetime.now(timezone.utc)
     first_page_top_verified = False
     refresh_known_ids = refresh_known_ids or set()
     refreshed_known_ids: list[str] = []
@@ -4072,6 +4198,16 @@ def crawl_fallback_with_fetchers(
         (targeted_refresh_ids or set())
         & required_refresh_ids
     )
+    raw_notice_refresh_state = (source_state or {}).get(
+        "notice_refresh_state",
+        {},
+    )
+    notice_refresh_state = (
+        raw_notice_refresh_state
+        if isinstance(raw_notice_refresh_state, dict)
+        else {}
+    )
+    refresh_policy_enabled = source_state is not None
 
     def consume_budget(label: str) -> bool:
         nonlocal request_count, last_request_at, terminal_error
@@ -4184,6 +4320,7 @@ def crawl_fallback_with_fetchers(
             resume_active
             and not resume_anchor_found
             and page_number > resume_search_end
+            and not refresh_policy_enabled
         ):
             terminal_error = "backfill_resume_anchor_missing"
             terminal_category = FailureCategory.SOURCE_PARTIAL
@@ -4229,7 +4366,12 @@ def crawl_fallback_with_fetchers(
             if page_number == 1:
                 first_page_top_verified = True
             terminal_reached = True
-            termination_reason = "natural_end"
+            notice_index_complete = True
+            termination_reason = (
+                "backfill_window"
+                if backfill_window_reached
+                else "natural_end"
+            )
             checkpoint_found = True
             break
         id_sequence: list[tuple[str, bool]] = []
@@ -4280,6 +4422,37 @@ def crawl_fallback_with_fetchers(
                     break
                 continue
             seen_identity[notice_id] = identity
+            observation = build_notice_observation(
+                notice_id,
+                entry.get("title"),
+                entry.get("date"),
+                top,
+            )
+            notice_observations.setdefault(notice_id, observation)
+            previous_observation = notice_refresh_state.get(notice_id, {})
+            if not isinstance(previous_observation, dict):
+                previous_observation = {}
+            policy_refresh_due = bool(
+                refresh_policy_enabled
+                and notice_id in known_ids
+                and notice_refresh_due(
+                    notice_id,
+                    observation,
+                    previous_observation,
+                    crawl_now,
+                )
+            )
+            if policy_refresh_due:
+                policy_refresh_ids.add(notice_id)
+                previous_fingerprint = str(
+                    previous_observation.get("fingerprint") or ""
+                )
+                if (
+                    previous_fingerprint
+                    and previous_fingerprint
+                    != observation["fingerprint"]
+                ):
+                    fingerprint_changed_ids.add(notice_id)
             if top:
                 top_urls.add(normalized_url)
                 top_dates.setdefault(title, set()).add(
@@ -4290,7 +4463,20 @@ def crawl_fallback_with_fetchers(
                 if targeted_refresh_ids:
                     targeted_history_active = True
             if (
-                targeted_history_active
+                (
+                    targeted_history_active
+                    or incremental_detail_window_closed
+                    or backfill_window_reached
+                    or (
+                        refresh_policy_enabled
+                        and resume_active
+                        and checkpoint_found
+                        and (
+                            not resume_anchor_found
+                            or page_number < resume_page
+                        )
+                    )
+                )
                 and not top
                 and notice_id not in known_ids
             ):
@@ -4304,6 +4490,7 @@ def crawl_fallback_with_fetchers(
                 incremental
                 and notice_id in known_ids
                 and notice_id not in refresh_known_ids
+                and not policy_refresh_due
             ):
                 if not top:
                     checkpoint_found = True
@@ -4430,8 +4617,11 @@ def crawl_fallback_with_fetchers(
                 break
             items.append(item)
             fetched_detail_count += 1
+            detailed_notice_ids.append(notice_id)
             if notice_id in known_ids:
                 refreshed_known_ids.append(notice_id)
+            else:
+                backfill_new_detail_count += 1
             log_detail_collection_progress(
                 "폴백",
                 "완료",
@@ -4464,20 +4654,32 @@ def crawl_fallback_with_fetchers(
                 set(refreshed_known_ids)
             )
         ):
-            terminal_reached = True
-            termination_reason = "incremental_checkpoint"
-            break
+            if refresh_policy_enabled:
+                incremental_detail_window_closed = True
+            else:
+                terminal_reached = True
+                termination_reason = "incremental_checkpoint"
+                break
         if (
             reconcile_mode
             and include_non_top
-            and fetched_detail_count >= backfill_detail_limit
+            and (
+                backfill_new_detail_count
+                if refresh_policy_enabled
+                else fetched_detail_count
+            )
+            >= backfill_detail_limit
+            and not backfill_window_reached
         ):
-            terminal_reached = True
             checkpoint_found = True
-            termination_reason = "backfill_window"
             next_resume_page = page_number + 1
             next_anchor_ids = sorted(page_non_top_ids)
-            break
+            if refresh_policy_enabled:
+                backfill_window_reached = True
+            else:
+                terminal_reached = True
+                termination_reason = "backfill_window"
+                break
         if not include_non_top and any(
             not bool(entry.get("top")) for entry in page.entries
         ):
@@ -4486,7 +4688,8 @@ def crawl_fallback_with_fetchers(
             termination_reason = "non_top_boundary"
             break
         if (
-            resume_active
+            not refresh_policy_enabled
+            and resume_active
             and not resume_jump_done
             and checkpoint_found
         ):
@@ -4512,13 +4715,19 @@ def crawl_fallback_with_fetchers(
             if (
                 checkpoint_overlap_pages
                 >= checkpoint_overlap_required
-                and required_refresh_ids.issubset(
-                    set(refreshed_known_ids)
+                and (
+                    refresh_policy_enabled
+                    or required_refresh_ids.issubset(
+                        set(refreshed_known_ids)
+                    )
                 )
             ):
-                terminal_reached = True
-                termination_reason = "incremental_checkpoint"
-                break
+                if refresh_policy_enabled:
+                    incremental_detail_window_closed = True
+                else:
+                    terminal_reached = True
+                    termination_reason = "incremental_checkpoint"
+                    break
         page_number += 1
 
     if terminal_reached and not terminal_error:
@@ -4559,7 +4768,7 @@ def crawl_fallback_with_fetchers(
     if terminal_reached and not terminal_error and not detail_failures and not rejected_count:
         status = (
             SourceStatus.VALID_EMPTY
-            if not observed_ids
+            if not notice_observations
             else SourceStatus.SUCCESS
         )
         category = FailureCategory.NONE
@@ -4572,6 +4781,16 @@ def crawl_fallback_with_fetchers(
         )
         if not terminal_error:
             terminal_error = "fallback_scope_unverified"
+    LOGGER.info(
+        "공지 최신성 감시 결과(폴백): 출처=%s, 목록=%s, 상세=%s, "
+        "정기 재검사=%s, 지문 변경=%s, 목록 완결=%s",
+        source.config_fk,
+        len(notice_observations),
+        len(detailed_notice_ids),
+        len(policy_refresh_ids - fingerprint_changed_ids),
+        len(fingerprint_changed_ids),
+        notice_index_complete,
+    )
     return SourceCrawlResult(
         source=source,
         status=status,
@@ -4584,6 +4803,9 @@ def crawl_fallback_with_fetchers(
             else len(observed_ids)
         ),
         observed_ids=observed_ids,
+        notice_observations=notice_observations,
+        detailed_notice_ids=detailed_notice_ids,
+        notice_index_complete=notice_index_complete,
         refreshed_known_ids=refreshed_known_ids,
         top_urls=sorted(top_urls),
         top_dates={key: sorted(values) for key, values in top_dates.items()},
@@ -4651,6 +4873,7 @@ def crawl_top_items_http_result(
     resume_page: int = 1,
     resume_anchor_ids: Optional[set[str]] = None,
     targeted_refresh_ids: Optional[set[str]] = None,
+    source_state: Optional[dict[str, Any]] = None,
 ) -> SourceCrawlResult:
     return crawl_fallback_with_fetchers(
         source,
@@ -4674,6 +4897,7 @@ def crawl_top_items_http_result(
         resume_page,
         resume_anchor_ids,
         targeted_refresh_ids,
+        source_state,
     )
 
 
@@ -4689,6 +4913,7 @@ def crawl_top_items_playwright_result(
     resume_page: int = 1,
     resume_anchor_ids: Optional[set[str]] = None,
     targeted_refresh_ids: Optional[set[str]] = None,
+    source_state: Optional[dict[str, Any]] = None,
 ) -> SourceCrawlResult:
     if CURRENT_SOURCE_REQUEST_BUDGET.get() is None:
         with source_request_budget_scope():
@@ -4704,6 +4929,7 @@ def crawl_top_items_playwright_result(
                 resume_page,
                 resume_anchor_ids,
                 targeted_refresh_ids,
+                source_state,
             )
     try:
         import playwright.sync_api as playwright_sync_api
@@ -4729,6 +4955,7 @@ def crawl_top_items_playwright_result(
             resume_page,
             resume_anchor_ids,
             targeted_refresh_ids,
+            source_state,
         )
 
     browser_name = os.environ.get("BROWSER", "chromium")
@@ -4745,6 +4972,7 @@ def crawl_top_items_playwright_result(
             resume_page,
             resume_anchor_ids,
             targeted_refresh_ids,
+            source_state,
         )
     headless = os.environ.get("HEADLESS", "1").strip().lower() not in {
         "0",
@@ -4842,6 +5070,7 @@ def crawl_top_items_playwright_result(
                 resume_page,
                 resume_anchor_ids,
                 targeted_refresh_ids,
+                source_state,
             )
         browser_result: Optional[SourceCrawlResult] = None
         try:
@@ -5343,6 +5572,7 @@ def crawl_top_items_playwright_result(
                 resume_page,
                 resume_anchor_ids,
                 targeted_refresh_ids,
+                source_state,
             )
         except PlaywrightError as exc:
             browser_result = SourceCrawlResult(
@@ -5372,6 +5602,7 @@ def crawl_top_items_playwright_result(
             resume_page,
             resume_anchor_ids,
             targeted_refresh_ids,
+            source_state,
         )
         http_result.fallback_from_error = ";".join(
             value

@@ -48,6 +48,7 @@ from settings import (
     SYNC_OPERATION_PROPERTY,
     SYNC_STATUS_PROPERTY,
     TOP_PROPERTY,
+    VIEWS_PROPERTY,
     should_upload_files_to_notion,
 )
 from sync import (
@@ -648,7 +649,6 @@ def operation_id_for_item(
         "title": item.get("title"),
         "date": item.get("date"),
         "author": item.get("author"),
-        "views": item.get("views"),
         "top": bool(item.get("top")),
         "classification": item.get("classification"),
         "url": item.get("url"),
@@ -992,6 +992,7 @@ def committed_item_readback_reasons(
     attachment_state: list[dict[str, Any]],
     body_media_state: list[dict[str, Any]],
     preserve_top: bool,
+    preserve_views: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
     source_id = str(item["source_id"])
@@ -1017,6 +1018,8 @@ def committed_item_readback_reasons(
     )
     expected_properties.pop(ATTACHMENT_PROPERTY, None)
     expected_properties.pop(SYNC_GENERATION_PROPERTY, None)
+    if preserve_views:
+        expected_properties.pop(VIEWS_PROPERTY, None)
     if preserve_top:
         expected_properties.pop(TOP_PROPERTY, None)
     if filter_changed_properties(properties, expected_properties):
@@ -1098,6 +1101,7 @@ def verify_committed_item(
     attachment_state: list[dict[str, Any]],
     body_media_state: list[dict[str, Any]],
     preserve_top: bool,
+    preserve_views: bool = False,
 ) -> dict[str, Any]:
     last_reasons: list[str] = ["unread"]
     for delay in COMMIT_READBACK_DELAYS:
@@ -1117,6 +1121,7 @@ def verify_committed_item(
             attachment_state,
             body_media_state,
             preserve_top,
+            preserve_views,
         )
         if not last_reasons:
             return page
@@ -1349,6 +1354,8 @@ def _apply_item(
         context.has_attachments_property,
         context.has_classification_property,
     )
+    if existing_page:
+        desired_properties.pop(VIEWS_PROPERTY, None)
     preserve_top = should_preserve_existing_top(existing_page, item)
     if preserve_top:
         desired_properties.pop(TOP_PROPERTY, None)
@@ -1648,6 +1655,7 @@ def _apply_item(
                 else existing_media_state
             ),
             preserve_top,
+            bool(existing_page),
         )
         pending_operation.active = False
     if existing_page and not base_changed and not body_changed and not post_properties:
@@ -2940,6 +2948,7 @@ def build_dry_run_plan(
             desired_item["operation_id"] = operation_id
             desired_item["sync_status"] = "committed"
             desired = build_properties(desired_item, True, True, True)
+            desired.pop(VIEWS_PROPERTY, None)
             if should_preserve_existing_top(existing, item):
                 desired.pop(TOP_PROPERTY, None)
             attachment_state_changed = False
