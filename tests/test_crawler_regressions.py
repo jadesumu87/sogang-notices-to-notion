@@ -2694,6 +2694,72 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertIn("1999", result.notice_observations)
         self.assertIn("1998", result.notice_observations)
 
+    def test_refresh_policy_accepts_total_that_includes_first_page_top(self):
+        pages = {
+            1: api_page(
+                [api_entry("9000", top=True), api_entry("1000")],
+                total_count=3,
+            ),
+            2: api_page(
+                [api_entry("999")],
+                terminal_verified=True,
+                total_count=3,
+            ),
+        }
+        page_calls = []
+
+        def fetch_page(page, *args, **kwargs):
+            page_calls.append(page)
+            return pages[page]
+
+        with (
+            patch.object(
+                crawler,
+                "fetch_bbs_list_result",
+                side_effect=fetch_page,
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_detail",
+                side_effect=lambda notice_id, **kwargs: api_detail(
+                    notice_id
+                ),
+            ),
+            patch.object(
+                crawler,
+                "get_detail_html_fallback_reason",
+                return_value=None,
+            ),
+            patch.object(
+                crawler,
+                "extract_body_blocks_from_html",
+                return_value=BODY,
+            ),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                incremental=False,
+                source_state={},
+            )
+            for page in pages.values():
+                page.total_count = 4
+            mismatch = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                incremental=False,
+                source_state={},
+            )
+
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(len(result.notice_observations), 3)
+        self.assertFalse(mismatch.write_safe)
+        self.assertEqual(mismatch.error, "pagination_total_mismatch")
+        self.assertEqual(page_calls, [1, 2, 1, 2, 1, 2])
+
     def test_refresh_policy_finds_shifted_resume_anchor_during_full_sweep(self):
         known_ids = {"1000", "900"}
         last_detail_at = datetime.now(timezone.utc).isoformat()

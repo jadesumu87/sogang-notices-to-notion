@@ -1155,6 +1155,27 @@ def pagination_bool(
     return None
 
 
+def pagination_total_satisfied(
+    expected_total_count: Optional[int],
+    notice_observations: dict[str, dict[str, str]],
+    raw_observed_ids: set[str],
+    known_ids: set[str],
+    observed_top_ids: set[str],
+    refresh_policy_enabled: bool,
+) -> bool:
+    if expected_total_count is None:
+        return True
+    if refresh_policy_enabled:
+        return expected_total_count in {
+            len(notice_observations),
+            len(raw_observed_ids),
+        }
+    return (
+        len(raw_observed_ids | (known_ids - observed_top_ids))
+        >= expected_total_count
+    )
+
+
 def fetch_bbs_list_result(
     page_num: int,
     page_size: int = 20,
@@ -2227,9 +2248,14 @@ def crawl_top_items_api_result(
             if not page_entries:
                 if (
                     include_non_top
-                    and expected_total_count is not None
-                    and len(raw_observed_ids | known_ids)
-                    < expected_total_count
+                    and not pagination_total_satisfied(
+                        expected_total_count,
+                        notice_observations,
+                        raw_observed_ids,
+                        known_ids,
+                        observed_top_ids,
+                        refresh_policy_enabled,
+                    )
                 ):
                     terminal_error = "pagination_total_mismatch"
                     terminal_category = FailureCategory.SOURCE_CONTRACT
@@ -2683,12 +2709,14 @@ def crawl_top_items_api_result(
         if page_result.terminal_verified:
             if (
                 include_non_top
-                and expected_total_count is not None
-                and len(
-                    raw_observed_ids
-                    | (known_ids - observed_top_ids)
+                and not pagination_total_satisfied(
+                    expected_total_count,
+                    notice_observations,
+                    raw_observed_ids,
+                    known_ids,
+                    observed_top_ids,
+                    refresh_policy_enabled,
                 )
-                < expected_total_count
             ):
                 terminal_error = "pagination_total_mismatch"
                 terminal_category = FailureCategory.SOURCE_CONTRACT
