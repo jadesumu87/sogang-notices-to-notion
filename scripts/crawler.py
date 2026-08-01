@@ -1230,13 +1230,40 @@ def fetch_bbs_list_result(
         )
     total_count = pagination_int(
         data_object,
-        ("totalCount", "totalElements"),
+        ("totalCount", "totalElements", "total"),
     )
     explicit_has_more = pagination_bool(
         data_object,
-        ("hasMore", "hasNext", "next"),
+        ("hasMore", "hasNext", "hasNextPage", "next"),
     )
-    has_more = explicit_has_more
+    explicit_is_last = pagination_bool(
+        data_object,
+        ("isLastPage", "last"),
+    )
+    if (
+        explicit_has_more is not None
+        and explicit_is_last is not None
+        and explicit_has_more == explicit_is_last
+    ):
+        return ListPageResult(
+            ok=False,
+            category=FailureCategory.SOURCE_CONTRACT,
+            error="pagination_terminal_mismatch",
+            status_code=fetch_result.status_code,
+            requested_page=page_num,
+            effective_page=effective_page or page_num,
+            page_size=effective_page_size or page_size,
+            total_count=total_count,
+        )
+    has_more = (
+        explicit_has_more
+        if explicit_has_more is not None
+        else (
+            not explicit_is_last
+            if explicit_is_last is not None
+            else None
+        )
+    )
     terminal_verified = has_more is False
     return ListPageResult(
         ok=True,
@@ -1779,6 +1806,15 @@ def get_hard_page_limit() -> int:
     return min(1000, max(1, value))
 
 
+def get_bbs_page_size() -> int:
+    raw = os.environ.get("BBS_PAGE_SIZE", "500").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 500
+    return min(500, max(1, value))
+
+
 def get_api_request_budget() -> int:
     raw = os.environ.get("API_MAX_REQUESTS", "2500").strip()
     try:
@@ -1983,11 +2019,7 @@ def crawl_top_items_api_result(
     )
     refresh_policy_enabled = source_state is not None
     classification = source.classification
-    page_size_raw = os.environ.get("BBS_PAGE_SIZE", "20")
-    try:
-        page_size = max(1, int(page_size_raw))
-    except ValueError:
-        page_size = 20
+    page_size = get_bbs_page_size()
     hard_page_limit = get_hard_page_limit()
     request_count = 0
     started_at = time.monotonic()

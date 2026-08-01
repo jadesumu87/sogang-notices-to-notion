@@ -164,6 +164,20 @@ class CrawlerContractTests(unittest.TestCase):
         self.network.stop()
         self.env.stop()
 
+    def test_api_page_size_defaults_and_caps_match_verified_server_limit(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(crawler.get_bbs_page_size(), 500)
+        cases = (
+            ("invalid", 500),
+            ("0", 1),
+            ("200", 200),
+            ("999", 500),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, {"BBS_PAGE_SIZE": raw}):
+                    self.assertEqual(crawler.get_bbs_page_size(), expected)
+
     def fetch_list_with_transport(self, outcomes):
         opener = FakeOpener(outcomes)
         with (
@@ -424,6 +438,56 @@ class CrawlerContractTests(unittest.TestCase):
         self.assertFalse(result.valid_empty)
         self.assertEqual(result.entries, [NORMAL_ENTRY])
         self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_fetch_list_accepts_current_official_pagination_fields(self):
+        result, opener = self.fetch_list_with_transport(
+            [
+                json_response(
+                    {
+                        "data": {
+                            "total": 3441,
+                            "list": [NORMAL_ENTRY],
+                            "pageNum": 1,
+                            "pageSize": 20,
+                            "hasNextPage": False,
+                            "isLastPage": True,
+                        }
+                    }
+                )
+            ]
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.total_count, 3441)
+        self.assertFalse(result.has_more)
+        self.assertTrue(result.terminal_verified)
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_fetch_list_rejects_conflicting_terminal_metadata(self):
+        result, opener = self.fetch_list_with_transport(
+            [
+                json_response(
+                    {
+                        "data": {
+                            "total": 1,
+                            "list": [NORMAL_ENTRY],
+                            "pageNum": 1,
+                            "pageSize": 20,
+                            "hasNextPage": True,
+                            "isLastPage": True,
+                        }
+                    }
+                )
+            ]
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            result.category,
+            FailureCategory.SOURCE_CONTRACT,
+        )
+        self.assertEqual(result.error, "pagination_terminal_mismatch")
         self.assertEqual(len(opener.calls), 1)
 
     def test_fetch_list_accepts_confirmed_empty_response(self):
