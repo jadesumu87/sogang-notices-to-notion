@@ -2569,6 +2569,131 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertNotIn("1004", result.observed_ids)
         self.assertIn("1004", result.notice_observations)
 
+    def test_refresh_policy_caps_unknown_details_inside_large_page(self):
+        entries = [api_entry(str(2000 - index)) for index in range(8)]
+        pages = {
+            1: api_page(entries),
+            2: api_page([], terminal_verified=True),
+        }
+        detail_calls = []
+
+        def fetch_detail(notice_id, **kwargs):
+            detail_calls.append(notice_id)
+            return api_detail(notice_id)
+
+        with (
+            patch.dict(os.environ, {"BACKFILL_DETAIL_LIMIT": "2"}),
+            patch.object(
+                crawler,
+                "fetch_bbs_list_result",
+                side_effect=lambda page, *args, **kwargs: pages[page],
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_detail",
+                side_effect=fetch_detail,
+            ),
+            patch.object(
+                crawler,
+                "get_detail_html_fallback_reason",
+                return_value=None,
+            ),
+            patch.object(
+                crawler,
+                "extract_body_blocks_from_html",
+                return_value=BODY,
+            ),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                known_ids={"1000"},
+                incremental=True,
+                source_state={},
+            )
+
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertEqual(set(detail_calls), {"2000", "1999"})
+        self.assertEqual(detail_calls.count("2000"), 2)
+        self.assertEqual(detail_calls.count("1999"), 2)
+        self.assertEqual(result.termination_reason, "backfill_window")
+        self.assertEqual(result.backfill_resume_page, 1)
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(len(result.notice_observations), len(entries))
+        self.assertEqual(result.observed_ids, ["2000", "1999"])
+
+    def test_refresh_policy_closes_incremental_detail_window_at_checkpoint(self):
+        entries = [
+            api_entry("2000"),
+            api_entry("1000"),
+            api_entry("1999"),
+            api_entry("1998"),
+        ]
+        pages = {
+            1: api_page(entries),
+            2: api_page([], terminal_verified=True),
+        }
+        known_observation = crawler.build_notice_observation(
+            "1000",
+            "공지 1000",
+            DATE,
+            False,
+        )
+        detail_calls = []
+
+        def fetch_detail(notice_id, **kwargs):
+            detail_calls.append(notice_id)
+            return api_detail(notice_id)
+
+        with (
+            patch.object(
+                crawler,
+                "fetch_bbs_list_result",
+                side_effect=lambda page, *args, **kwargs: pages[page],
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_detail",
+                side_effect=fetch_detail,
+            ),
+            patch.object(
+                crawler,
+                "get_detail_html_fallback_reason",
+                return_value=None,
+            ),
+            patch.object(
+                crawler,
+                "extract_body_blocks_from_html",
+                return_value=BODY,
+            ),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                known_ids={"1000"},
+                incremental=True,
+                source_state={
+                    "notice_refresh_state": {
+                        "1000": {
+                            **known_observation,
+                            "last_detail_at": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                        }
+                    }
+                },
+            )
+
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertEqual(set(detail_calls), {"2000"})
+        self.assertEqual(result.detailed_notice_ids, ["2000"])
+        self.assertNotIn("1999", result.observed_ids)
+        self.assertNotIn("1998", result.observed_ids)
+        self.assertIn("1999", result.notice_observations)
+        self.assertIn("1998", result.notice_observations)
+
     def test_refresh_policy_finds_shifted_resume_anchor_during_full_sweep(self):
         known_ids = {"1000", "900"}
         last_detail_at = datetime.now(timezone.utc).isoformat()

@@ -2388,8 +2388,21 @@ def crawl_top_items_api_result(
                 continue
             if incremental and pk_id in known_ids and not top:
                 page_has_checkpoint = True
+                if refresh_policy_enabled and not reconcile_mode:
+                    incremental_detail_window_closed = True
                 if targeted_refresh_ids:
                     targeted_history_active = True
+            if (
+                refresh_policy_enabled
+                and not top
+                and pk_id not in known_ids
+                and backfill_new_detail_count >= backfill_detail_limit
+            ):
+                incremental_detail_window_closed = True
+                if not backfill_window_reached:
+                    backfill_window_reached = True
+                    next_resume_page = page_number
+                    next_anchor_ids = sorted(page_non_top_ids)
             if (
                 (
                     targeted_history_active
@@ -2765,7 +2778,7 @@ def crawl_top_items_api_result(
                     >= expected_total_count
                 )
             ):
-                if refresh_policy_enabled:
+                if refresh_policy_enabled and not reconcile_mode:
                     incremental_detail_window_closed = True
                 else:
                     terminal_reached = True
@@ -4492,8 +4505,21 @@ def crawl_fallback_with_fetchers(
                 )
             if incremental and notice_id in known_ids and not top:
                 page_has_checkpoint = True
+                if refresh_policy_enabled and not reconcile_mode:
+                    incremental_detail_window_closed = True
                 if targeted_refresh_ids:
                     targeted_history_active = True
+            if (
+                refresh_policy_enabled
+                and not top
+                and notice_id not in known_ids
+                and backfill_new_detail_count >= backfill_detail_limit
+            ):
+                incremental_detail_window_closed = True
+                if not backfill_window_reached:
+                    backfill_window_reached = True
+                    next_resume_page = page_number
+                    next_anchor_ids = sorted(page_non_top_ids)
             if (
                 (
                     targeted_history_active

@@ -430,6 +430,27 @@ class FallbackContractTests(unittest.TestCase):
         self.assertNotIn("800", result.observed_ids)
         self.assertIn("800", result.notice_observations)
 
+    def test_refresh_policy_caps_unknown_fallback_details_inside_large_page(self):
+        entries = [self.entry(str(2000 - index)) for index in range(8)]
+        with patch.dict(os.environ, {"BACKFILL_DETAIL_LIMIT": "2"}):
+            result = self.crawl(
+                {
+                    1: self.page(1, entries),
+                    2: self.page(2, [], explicit_empty=True),
+                },
+                incremental=True,
+                known_ids={"1000"},
+                source_state={},
+            )
+
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertEqual(result.detailed_notice_ids, ["2000", "1999"])
+        self.assertEqual(result.termination_reason, "backfill_window")
+        self.assertEqual(result.backfill_resume_page, 1)
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(len(result.notice_observations), len(entries))
+        self.assertEqual(result.observed_ids, ["2000", "1999"])
+
     def test_css_or_script_text_cannot_confirm_empty_body_or_attachments(self):
         signals = crawler.build_detail_signals(
             "<html><style>.tiptap{display:block}</style>"
