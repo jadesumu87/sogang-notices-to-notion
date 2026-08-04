@@ -2,7 +2,9 @@ import re
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github" / "scripts"
@@ -93,6 +95,51 @@ class CiScriptTests(unittest.TestCase):
                     ]
                 }
             )
+
+    def test_vulnerability_audit_retries_only_transient_fetch_errors(
+        self,
+    ) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = (
+            b'{"info":{"version":"1.2.3"},"vulnerabilities":[]}'
+        )
+        with (
+            patch(
+                "audit_lock_vulnerabilities.urllib.request.urlopen",
+                side_effect=[urllib.error.URLError("temporary"), response],
+            ) as urlopen_mock,
+            patch("audit_lock_vulnerabilities.time.sleep") as sleep_mock,
+        ):
+            payload = audit_lock_vulnerabilities.fetch_release(
+                "example-package",
+                "1.2.3",
+            )
+        self.assertEqual(payload["info"]["version"], "1.2.3")
+        self.assertEqual(urlopen_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(1.0)
+
+        permanent_error = urllib.error.HTTPError(
+            "https://pypi.org/pypi/example-package/1.2.3/json",
+            404,
+            "Not Found",
+            None,
+            None,
+        )
+        with (
+            patch(
+                "audit_lock_vulnerabilities.urllib.request.urlopen",
+                side_effect=permanent_error,
+            ) as urlopen_mock,
+            patch("audit_lock_vulnerabilities.time.sleep") as sleep_mock,
+            self.assertRaises(urllib.error.HTTPError),
+        ):
+            audit_lock_vulnerabilities.fetch_release(
+                "example-package",
+                "1.2.3",
+            )
+        urlopen_mock.assert_called_once()
+        sleep_mock.assert_not_called()
 
     def test_crawler_workflow_uses_public_state_cache(self) -> None:
         workflow = (

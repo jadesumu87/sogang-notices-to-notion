@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -12,6 +13,14 @@ from typing import Any
 from verify_lock import parse_requirements
 
 MAX_RESPONSE_BYTES = 2_000_000
+FETCH_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0)
+RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
+def is_retryable_fetch_error(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in RETRYABLE_HTTP_STATUS_CODES
+    return isinstance(exc, (TimeoutError, urllib.error.URLError))
 
 
 def fetch_release(name: str, version: str) -> dict[str, Any]:
@@ -24,8 +33,18 @@ def fetch_release(name: str, version: str) -> dict[str, Any]:
             "User-Agent": "sogang-notices-lock-audit",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        body = response.read(MAX_RESPONSE_BYTES + 1)
+    for attempt in range(len(FETCH_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = response.read(MAX_RESPONSE_BYTES + 1)
+            break
+        except (TimeoutError, urllib.error.URLError) as exc:
+            if (
+                not is_retryable_fetch_error(exc)
+                or attempt == len(FETCH_RETRY_DELAYS_SECONDS)
+            ):
+                raise
+            time.sleep(FETCH_RETRY_DELAYS_SECONDS[attempt])
     if len(body) > MAX_RESPONSE_BYTES:
         raise RuntimeError("PyPI 취약점 응답이 허용 크기를 넘었습니다.")
     payload = json.loads(body)
