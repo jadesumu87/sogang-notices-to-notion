@@ -364,13 +364,13 @@ def should_use_incremental_crawl() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def get_full_reconcile_interval_hours() -> int:
-    raw = os.environ.get("FULL_RECONCILE_INTERVAL_HOURS", "24").strip()
+def get_full_reconcile_local_hour() -> int:
+    raw = os.environ.get("FULL_RECONCILE_LOCAL_HOUR", "7").strip()
     try:
         value = int(raw)
     except ValueError:
-        return 24
-    return max(1, value)
+        return 7
+    return min(23, max(0, value))
 
 
 def get_top_disable_max_count() -> int:

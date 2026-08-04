@@ -6,9 +6,10 @@ import re
 import tempfile
 import uuid
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from log import LOGGER, redact_sensitive_urls
 from models import (
@@ -23,6 +24,7 @@ from models import (
 
 
 STATE_SCHEMA_VERSION = 2
+RECONCILE_TIMEZONE = ZoneInfo("Asia/Seoul")
 PUBLIC_CACHE_SOURCE_FIELDS = frozenset(
     {
         "backfill_active",
@@ -44,6 +46,7 @@ PUBLIC_CACHE_SOURCE_FIELDS = frozenset(
         "last_full_reconcile_at",
         "last_item_count",
         "last_reconcile_attempt_at",
+        "last_reconcile_local_date",
         "last_success_at",
         "last_top_observed_ids",
         "method",
@@ -200,6 +203,22 @@ def parse_iso_datetime(value: str) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def parse_reconcile_local_date(value: object) -> Optional[date]:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == value else None
+
+
+def reconcile_local_date(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(RECONCILE_TIMEZONE).date().isoformat()
 
 
 def default_run_state() -> dict[str, Any]:
@@ -576,6 +595,14 @@ def validate_run_state_payload(payload: Any) -> dict[str, Any]:
                 raise RunStateIntegrityError(
                     "실행 상태 출처 조정 시각이 올바르지 않습니다"
                 )
+        local_date = source_state.get("last_reconcile_local_date")
+        if (
+            local_date is not None
+            and parse_reconcile_local_date(local_date) is None
+        ):
+            raise RunStateIntegrityError(
+                "실행 상태 출처 조정 날짜가 올바르지 않습니다"
+            )
     state["state_checksum"] = state_checksum(state)
     return state
 
@@ -801,26 +828,23 @@ def classify_exception(exc: BaseException) -> FailureCategory:
     return FailureCategory.INTERNAL
 
 
-def source_reconcile_due(
+def legacy_source_reconcile_reference(
     state: dict[str, Any],
-    config_fk: str,
-    interval_hours: int,
-) -> bool:
-    sources = state.get("sources", {})
-    if not isinstance(sources, dict) or config_fk not in sources:
-        return True
-    source_state = sources.get(config_fk)
-    if not isinstance(source_state, dict):
-        return True
-    if source_state.get("empty_confirmation_pending"):
-        return True
-    if interval_hours <= 0:
-        return True
+    source_state: dict[str, Any],
+) -> Optional[datetime]:
     last_attempt = parse_iso_datetime(
         str(source_state.get("last_reconcile_attempt_at") or "")
     )
+    last_success = parse_iso_datetime(
+        str(source_state.get("last_success_at") or "")
+    )
+    successful_attempt = (
+        last_attempt
+        if last_attempt is not None and last_attempt == last_success
+        else None
+    )
     if last_attempt is None and source_state.get("backfill_active"):
-        last_attempt = parse_iso_datetime(
+        successful_attempt = parse_iso_datetime(
             str(
                 source_state.get("last_success_at")
                 or source_state.get("last_attempt_at")
@@ -831,7 +855,7 @@ def source_reconcile_due(
     references = [
         value
         for value in (
-            last_attempt,
+            successful_attempt,
             parse_iso_datetime(
                 str(
                     source_state.get("last_coverage_reconcile_at")
@@ -843,23 +867,112 @@ def source_reconcile_due(
         )
         if value is not None
     ]
-    last = max(references) if references else None
-    if last is None:
-        return True
-    age_seconds = (datetime.now(timezone.utc) - last).total_seconds()
-    return age_seconds >= interval_hours * 3600
+    return max(references) if references else None
+
+
+def materialize_reconcile_local_dates(
+    state: dict[str, Any],
+    config_fks: list[str],
+) -> None:
+    sources = state.setdefault("sources", {})
+    if not isinstance(sources, dict):
+        raise RunStateIntegrityError("실행 상태 sources가 객체가 아닙니다")
+    for config_fk in config_fks:
+        source_state = sources.setdefault(config_fk, {})
+        if not isinstance(source_state, dict):
+            raise RunStateIntegrityError("실행 상태 출처 형식이 올바르지 않습니다")
+        if "last_reconcile_local_date" in source_state:
+            continue
+        reference = legacy_source_reconcile_reference(state, source_state)
+        source_state["last_reconcile_local_date"] = (
+            reconcile_local_date(reference)
+            if reference is not None
+            else None
+        )
+
+
+def source_reconcile_schedule(
+    state: dict[str, Any],
+    config_fk: str,
+    local_hour: int,
+    now: Optional[datetime] = None,
+) -> tuple[bool, str, str]:
+    sources = state.get("sources", {})
+    if not isinstance(sources, dict) or config_fk not in sources:
+        return True, "즉시", "새 출처"
+    source_state = sources.get(config_fk)
+    if not isinstance(source_state, dict):
+        return True, "즉시", "새 출처"
+    if source_state.get("empty_confirmation_pending"):
+        return True, "즉시", "빈 출처 재확인"
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local_now = current.astimezone(RECONCILE_TIMEZONE)
+    bounded_hour = min(23, max(0, int(local_hour)))
+    if "last_reconcile_local_date" in source_state:
+        last_local_date = parse_reconcile_local_date(
+            source_state.get("last_reconcile_local_date")
+        )
+    else:
+        legacy_reference = legacy_source_reconcile_reference(
+            state,
+            source_state,
+        )
+        last_local_date = (
+            legacy_reference.astimezone(RECONCILE_TIMEZONE).date()
+            if legacy_reference is not None
+            else None
+        )
+    if last_local_date is None:
+        return True, "즉시", "보강 이력 없음"
+    eligible_date = last_local_date + timedelta(days=1)
+    if eligible_date < local_now.date():
+        eligible_date = local_now.date()
+    eligible_at = local_now.replace(
+        year=eligible_date.year,
+        month=eligible_date.month,
+        day=eligible_date.day,
+        hour=bounded_hour,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if local_now >= eligible_at:
+        return True, "즉시", "일일 보강 창 도래"
+    reason = (
+        "오늘 보강 완료"
+        if last_local_date >= local_now.date()
+        else "일일 보강 창 대기"
+    )
+    return False, eligible_at.isoformat(timespec="seconds"), reason
+
+
+def source_reconcile_due(
+    state: dict[str, Any],
+    config_fk: str,
+    local_hour: int,
+    now: Optional[datetime] = None,
+) -> bool:
+    return source_reconcile_schedule(
+        state,
+        config_fk,
+        local_hour,
+        now,
+    )[0]
 
 
 def should_full_reconcile(
     state: dict[str, Any],
-    interval_hours: int,
+    local_hour: int,
     config_fks: Optional[list[str]] = None,
+    now: Optional[datetime] = None,
 ) -> bool:
     source_ids = list(config_fks or state.get("sources", {}).keys())
     if not source_ids:
         return True
     return any(
-        source_reconcile_due(state, config_fk, interval_hours)
+        source_reconcile_due(state, config_fk, local_hour, now)
         for config_fk in source_ids
     )
 
@@ -1063,6 +1176,15 @@ def update_state_from_report(
                     "error": "",
                 }
             )
+            if reconcile_requested:
+                reconcile_finished_at = parse_iso_datetime(now)
+                if reconcile_finished_at is None:
+                    raise RunStateIntegrityError(
+                        "실행 상태 조정 완료 시각이 올바르지 않습니다"
+                    )
+                source_state["last_reconcile_local_date"] = (
+                    reconcile_local_date(reconcile_finished_at)
+                )
             previous_notice_refresh_state = source_state.get(
                 "notice_refresh_state",
                 {},

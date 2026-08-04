@@ -3728,6 +3728,13 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
                 for message in logs.output
             )
         )
+        self.assertTrue(
+            any(
+                "보강 판정=보강 이력 없음, 다음 보강 가능=즉시"
+                in message
+                for message in logs.output
+            )
+        )
 
     def test_recent_backfill_attempt_stays_incremental(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -3738,6 +3745,7 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
             "backfill_resume_page": 5,
             "backfill_anchor_ids": ["290"],
             "last_reconcile_attempt_at": now,
+            "last_success_at": now,
         }
         captured = {}
 
@@ -3787,6 +3795,12 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
             any(
                 "수집 계획: 출처=141, 모드=증분, "
                 "상세 한도=-, 시작 페이지=1, 백필=대기" in message
+                for message in logs.output
+            )
+        )
+        self.assertTrue(
+            any(
+                "보강 판정=오늘 보강 완료" in message
                 for message in logs.output
             )
         )

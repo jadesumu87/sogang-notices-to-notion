@@ -37,10 +37,11 @@ from run_state import (
     create_run_record,
     known_ids_for_source,
     load_run_state,
+    materialize_reconcile_local_dates,
     mark_failure_signaled,
     mark_exception_failure,
     should_full_reconcile,
-    source_reconcile_due,
+    source_reconcile_schedule,
     update_state_from_report,
     write_json_atomic,
     write_run_state_atomic,
@@ -48,7 +49,7 @@ from run_state import (
 from settings import (
     get_bbs_config_fk,
     get_bbs_config_fks,
-    get_full_reconcile_interval_hours,
+    get_full_reconcile_local_hour,
     get_incident_path,
     get_run_state_path,
     get_snapshot_path,
@@ -345,21 +346,27 @@ def collect_report(
     html_path = resolve_html_path()
     if html_path is None:
         config_fks = get_bbs_config_fks()
+        materialize_reconcile_local_dates(state, config_fks)
+        reconcile_local_hour = get_full_reconcile_local_hour()
         known_ids_by_source = {
             config_fk: known_ids_for_source(state, config_fk)
             for config_fk in config_fks
         }
         source_states = state.get("sources", {})
+        reconcile_schedule_by_source = {
+            config_fk: source_reconcile_schedule(
+                state,
+                config_fk,
+                reconcile_local_hour,
+            )
+            for config_fk in config_fks
+        }
         reconcile_by_source = {
             config_fk: bool(
                 full_reconcile
                 and (
                     force_all_reconcile
-                    or source_reconcile_due(
-                        state,
-                        config_fk,
-                        get_full_reconcile_interval_hours(),
-                    )
+                    or reconcile_schedule_by_source[config_fk][0]
                 )
             )
             for config_fk in config_fks
@@ -434,7 +441,7 @@ def collect_report(
             LOGGER.info(
                 "수집 계획: 출처=%s, 모드=%s, 상세 한도=%s, "
                 "시작 페이지=%s, 백필=%s, 최근 조정 시도=%s, "
-                "재확인 대상=%s",
+                "보강 판정=%s, 다음 보강 가능=%s, 재확인 대상=%s",
                 config_fk,
                 (
                     "과거 보강"
@@ -460,6 +467,16 @@ def collect_report(
                     )
                     if isinstance(source_state, dict)
                     else "-"
+                ),
+                (
+                    "강제 전체 조정"
+                    if force_all_reconcile
+                    else reconcile_schedule_by_source[config_fk][2]
+                ),
+                (
+                    "강제 실행"
+                    if force_all_reconcile
+                    else reconcile_schedule_by_source[config_fk][1]
                 ),
                 len(refresh_ids_by_source[config_fk]),
             )
@@ -731,11 +748,12 @@ def main() -> None:
     with exclusive_run_lock(lock_path):
         state = load_run_state(state_path)
         configured_source_ids = get_bbs_config_fks()
+        materialize_reconcile_local_dates(state, configured_source_ids)
         full_reconcile = (
             not incremental_enabled
             or should_full_reconcile(
                 state,
-                get_full_reconcile_interval_hours(),
+                get_full_reconcile_local_hour(),
                 configured_source_ids,
             )
         )

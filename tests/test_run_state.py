@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import run_state
 import crawler
 import notion_client
+import settings
 from models import (
     CrawlReport,
     DestinationConsistencyError,
@@ -65,6 +66,28 @@ def source_result(
 
 
 class RunStateTests(unittest.TestCase):
+    def test_full_reconcile_local_hour_defaults_and_bounds(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(settings.get_full_reconcile_local_hour(), 7)
+        with patch.dict(
+            os.environ,
+            {"FULL_RECONCILE_LOCAL_HOUR": "invalid"},
+            clear=False,
+        ):
+            self.assertEqual(settings.get_full_reconcile_local_hour(), 7)
+        with patch.dict(
+            os.environ,
+            {"FULL_RECONCILE_LOCAL_HOUR": "-1"},
+            clear=False,
+        ):
+            self.assertEqual(settings.get_full_reconcile_local_hour(), 0)
+        with patch.dict(
+            os.environ,
+            {"FULL_RECONCILE_LOCAL_HOUR": "24"},
+            clear=False,
+        ):
+            self.assertEqual(settings.get_full_reconcile_local_hour(), 23)
+
     def test_unknown_top_level_state_is_discarded(self):
         state = run_state.default_run_state()
         state["obsolete_internal_state"] = {"page_id": "example"}
@@ -474,42 +497,116 @@ class RunStateTests(unittest.TestCase):
         )
 
         self.assertTrue(
-            run_state.source_reconcile_due(state, "new-source", 24)
+            run_state.source_reconcile_due(
+                state,
+                "new-source",
+                7,
+                datetime(2026, 8, 3, 21, 0, tzinfo=timezone.utc),
+            )
         )
 
-    def test_recent_reconcile_attempt_throttles_incomplete_backfill(self):
-        now = datetime.now(timezone.utc)
+    def test_daily_reconcile_waits_for_local_window_without_drifting(self):
         state = run_state.default_run_state()
         state["sources"]["141"] = {
             "backfill_active": True,
-            "last_reconcile_attempt_at": now.isoformat(),
-            "last_coverage_reconcile_at": (
-                now - timedelta(days=7)
-            ).isoformat(),
+            "last_reconcile_local_date": "2026-08-03",
         }
 
         self.assertFalse(
-            run_state.source_reconcile_due(state, "141", 24)
+            run_state.source_reconcile_due(
+                state,
+                "141",
+                7,
+                datetime(2026, 8, 3, 21, 59, tzinfo=timezone.utc),
+            )
         )
-
-        state["sources"]["141"]["last_reconcile_attempt_at"] = (
-            now - timedelta(hours=25)
-        ).isoformat()
-
         self.assertTrue(
-            run_state.source_reconcile_due(state, "141", 24)
+            run_state.source_reconcile_due(
+                state,
+                "141",
+                7,
+                datetime(2026, 8, 3, 22, 0, tzinfo=timezone.utc),
+            )
         )
+        state["sources"]["141"]["last_reconcile_local_date"] = (
+            "2026-08-04"
+        )
+        due, next_at, reason = run_state.source_reconcile_schedule(
+            state,
+            "141",
+            7,
+            datetime(2026, 8, 4, 3, 0, tzinfo=timezone.utc),
+        )
+        self.assertFalse(due)
+        self.assertEqual(next_at, "2026-08-05T07:00:00+09:00")
+        self.assertEqual(reason, "오늘 보강 완료")
 
     def test_legacy_backfill_uses_recent_success_as_attempt_watermark(self):
-        now = datetime.now(timezone.utc)
         state = run_state.default_run_state()
         state["sources"]["141"] = {
             "backfill_active": True,
-            "last_success_at": now.isoformat(),
+            "last_success_at": "2026-08-04T03:56:50+00:00",
         }
 
         self.assertFalse(
-            run_state.source_reconcile_due(state, "141", 24)
+            run_state.source_reconcile_due(
+                state,
+                "141",
+                7,
+                datetime(2026, 8, 4, 6, 0, tzinfo=timezone.utc),
+            )
+        )
+        run_state.materialize_reconcile_local_dates(state, ["141"])
+        self.assertEqual(
+            state["sources"]["141"]["last_reconcile_local_date"],
+            "2026-08-04",
+        )
+
+    def test_legacy_failed_reconcile_does_not_advance_local_date(self):
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "backfill_active": True,
+            "last_reconcile_attempt_at": "2026-08-04T03:56:50+00:00",
+            "last_success_at": "2026-08-04T04:56:50+00:00",
+            "status": "success",
+        }
+
+        run_state.materialize_reconcile_local_dates(state, ["141"])
+
+        self.assertIsNone(
+            state["sources"]["141"]["last_reconcile_local_date"]
+        )
+        self.assertTrue(
+            run_state.source_reconcile_due(
+                state,
+                "141",
+                7,
+                datetime(2026, 8, 4, 6, 0, tzinfo=timezone.utc),
+            )
+        )
+
+    def test_legacy_successful_reconcile_advances_local_date(self):
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "backfill_active": True,
+            "last_reconcile_attempt_at": "2026-08-04T03:56:50+00:00",
+            "last_success_at": "2026-08-04T03:56:50+00:00",
+            "status": "success",
+        }
+
+        run_state.materialize_reconcile_local_dates(state, ["141"])
+
+        self.assertEqual(
+            state["sources"]["141"]["last_reconcile_local_date"],
+            "2026-08-04",
+        )
+        self.assertFalse(
+            run_state.source_reconcile_due(
+                state,
+                "141",
+                7,
+                datetime(2026, 8, 4, 6, 0, tzinfo=timezone.utc),
+            )
         )
 
     def test_reconcile_attempt_is_recorded_even_when_source_fails(self):
@@ -517,6 +614,7 @@ class RunStateTests(unittest.TestCase):
         state = run_state.default_run_state()
         state["sources"]["141"] = {
             "backfill_active": True,
+            "last_reconcile_local_date": "2026-07-27",
             "observed_ids": ["old"],
         }
         failed = source_result(
@@ -543,6 +641,71 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(
             state["sources"]["141"]["last_reconcile_attempt_at"],
             fixed_now,
+        )
+        self.assertEqual(
+            state["sources"]["141"]["last_reconcile_local_date"],
+            "2026-07-27",
+        )
+        self.assertTrue(
+            run_state.source_reconcile_due(
+                state,
+                "141",
+                7,
+                datetime.fromisoformat(fixed_now),
+            )
+        )
+
+    def test_successful_reconcile_marks_local_date_and_retries_next_window(self):
+        fixed_now = "2026-07-28T03:30:00+00:00"
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "backfill_active": True,
+            "last_reconcile_local_date": "2026-07-27",
+            "observed_ids": ["old"],
+        }
+        result = source_result("141", SourceStatus.SUCCESS, ["new"])
+        result.reconcile_requested = True
+        result.termination_reason = "backfill_window"
+
+        with patch.object(
+            run_state,
+            "utc_now_iso",
+            return_value=fixed_now,
+        ):
+            run_state.update_state_from_report(
+                state,
+                CrawlReport([result]),
+                full_reconcile=True,
+                applied_source_ids={"141"},
+            )
+
+        self.assertEqual(
+            state["sources"]["141"]["last_reconcile_local_date"],
+            "2026-07-28",
+        )
+        self.assertFalse(
+            run_state.source_reconcile_due(
+                state,
+                "141",
+                7,
+                datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc),
+            )
+        )
+        self.assertFalse(
+            run_state.source_reconcile_due(
+                state,
+                "141",
+                7,
+                datetime(2026, 7, 28, 21, 59, tzinfo=timezone.utc),
+            )
+        )
+        self.assertTrue(
+            run_state.source_reconcile_due(
+                state,
+                "141",
+                7,
+                datetime(2026, 7, 28, 22, 0, tzinfo=timezone.utc),
+            )
         )
 
     def test_incremental_run_materializes_legacy_backfill_watermark(self):
@@ -607,6 +770,10 @@ class RunStateTests(unittest.TestCase):
 
         self.assertEqual(updated["sources"]["141"]["observed_ids"], ["141-new"])
         self.assertEqual(updated["sources"]["141"]["last_success_at"], fixed_now)
+        self.assertEqual(
+            updated["sources"]["141"]["last_reconcile_local_date"],
+            "2026-07-27",
+        )
         self.assertEqual(updated["sources"]["2"]["observed_ids"], ["2-old"])
         self.assertEqual(
             updated["sources"]["2"]["last_success_at"],
@@ -615,6 +782,10 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(
             updated["sources"]["2"]["error"],
             "incremental_checkpoint_not_found",
+        )
+        self.assertNotIn(
+            "last_reconcile_local_date",
+            updated["sources"]["2"],
         )
         self.assertEqual(updated["last_partial_success_at"], fixed_now)
         self.assertIsNone(updated["last_success_at"])
@@ -975,6 +1146,7 @@ class RunStateTests(unittest.TestCase):
         state["sources"]["141"] = {
             "backfill_active": True,
             "last_reconcile_attempt_at": "2026-07-28T00:00:00+00:00",
+            "last_reconcile_local_date": "2026-07-28",
             "notice_refresh_state": {
                 "1001": {
                     "fingerprint": "a" * 64,
@@ -1007,6 +1179,10 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(
             projected["sources"]["141"]["last_reconcile_attempt_at"],
             "2026-07-28T00:00:00+00:00",
+        )
+        self.assertEqual(
+            projected["sources"]["141"]["last_reconcile_local_date"],
+            "2026-07-28",
         )
         self.assertEqual(
             projected["sources"]["141"]["notice_refresh_state"],
@@ -1071,6 +1247,16 @@ class RunStateTests(unittest.TestCase):
                     "fingerprint": "not-a-fingerprint",
                 }
             }
+        }
+        state["state_checksum"] = run_state.state_checksum(state)
+
+        with self.assertRaises(run_state.RunStateIntegrityError):
+            run_state.validate_run_state_payload(state)
+
+    def test_malformed_reconcile_local_date_fails_closed(self):
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "last_reconcile_local_date": "2026-02-30",
         }
         state["state_checksum"] = run_state.state_checksum(state)
 
@@ -1235,7 +1421,7 @@ class RunStateTests(unittest.TestCase):
             self.assertTrue(
                 run_state.should_full_reconcile(
                     loaded,
-                    24,
+                    7,
                     ["141"],
                 )
             )
@@ -1285,7 +1471,7 @@ class RunStateTests(unittest.TestCase):
             self.assertTrue(
                 run_state.should_full_reconcile(
                     loaded,
-                    24,
+                    7,
                     ["141"],
                 )
             )
@@ -1340,7 +1526,7 @@ class RunStateTests(unittest.TestCase):
             run_state.source_reconcile_due(
                 state,
                 "141",
-                24,
+                7,
             )
         )
 
@@ -1367,7 +1553,7 @@ class RunStateTests(unittest.TestCase):
             run_state.source_reconcile_due(
                 state,
                 "141",
-                24,
+                7,
             )
         )
 

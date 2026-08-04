@@ -46,6 +46,7 @@ jobs:
       PIP_NO_INPUT: "1"
       PIP_ONLY_BINARY: ":all:"
       INTERNAL_DEADLINE_SECONDS: "2700"
+      FULL_RECONCILE_LOCAL_HOUR: "7"
 
     steps:
       - name: Checkout
