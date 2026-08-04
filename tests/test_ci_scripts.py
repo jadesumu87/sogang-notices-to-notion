@@ -167,6 +167,25 @@ class CiScriptTests(unittest.TestCase):
             workflow,
         )
 
+    def test_workflows_prevent_spurious_warning_output(self) -> None:
+        for workflow_name in ("ci.yml", "crawler.yml"):
+            workflow = (
+                ROOT / ".github" / "workflows" / workflow_name
+            ).read_text(encoding="utf-8")
+            self.assertEqual(
+                workflow.count(
+                    "git config --global init.defaultBranch main"
+                ),
+                workflow.count("uses: actions/checkout@"),
+            )
+        ci_workflow = (
+            ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'CRAWLER_ACTIONS_ANNOTATIONS: "0"',
+            ci_workflow,
+        )
+
     def test_cache_projection_removes_private_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "run-state.json"

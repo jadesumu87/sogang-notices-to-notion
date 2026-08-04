@@ -319,6 +319,17 @@ def add_destination_quarantine_issues(
         )
 
 
+def should_emit_github_annotation() -> bool:
+    enabled = os.environ.get(
+        "CRAWLER_ACTIONS_ANNOTATIONS",
+        "1",
+    ).strip().lower()
+    return (
+        os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
+        and enabled not in {"0", "false", "no", "off"}
+    )
+
+
 def report_destination_safety_hold(
     summary: str,
     *,
@@ -330,7 +341,7 @@ def report_destination_safety_hold(
         mode,
         summary,
     )
-    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+    if should_emit_github_annotation():
         print(
             "::warning title=Notion 안전 재확인 대기::"
             f"{summary} 다음 독립 실행에서 다시 확인합니다."
@@ -696,7 +707,7 @@ def report_deduplicated_failure(incident: dict[str, Any]) -> None:
         category,
         count,
     )
-    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+    if should_emit_github_annotation():
         print(
             "::warning title=반복 실패 지속::"
             "동일 장애 알림 지문은 유지했으며 Actions 실행 결과는 실패로 기록합니다. "

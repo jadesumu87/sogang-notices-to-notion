@@ -240,6 +240,7 @@ class CrawlerRegressionTests(unittest.TestCase):
                 "API_MAX_SECONDS": "60",
                 "BACKFILL_DETAIL_LIMIT": "100",
                 "BBS_PAGE_SIZE": "2",
+                "CRAWLER_ACTIONS_ANNOTATIONS": "0",
                 "CRAWL_HARD_PAGE_LIMIT": "10",
                 "FALLBACK_MAX_REQUESTS": "100",
                 "FALLBACK_MAX_SECONDS": "60",
@@ -252,6 +253,36 @@ class CrawlerRegressionTests(unittest.TestCase):
 
     def tearDown(self):
         self.env.stop()
+
+    def test_actions_annotations_respect_explicit_gate(self):
+        incident = {"category": "internal", "count": 2}
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "CRAWLER_ACTIONS_ANNOTATIONS": "0",
+                    "GITHUB_ACTIONS": "true",
+                },
+            ),
+            patch("builtins.print") as print_mock,
+        ):
+            crawler_main.report_destination_safety_hold("대기")
+            crawler_main.report_deduplicated_failure(incident)
+        print_mock.assert_not_called()
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "CRAWLER_ACTIONS_ANNOTATIONS": "1",
+                    "GITHUB_ACTIONS": "true",
+                },
+            ),
+            patch("builtins.print") as print_mock,
+        ):
+            crawler_main.report_destination_safety_hold("대기")
+            crawler_main.report_deduplicated_failure(incident)
+        self.assertEqual(print_mock.call_count, 2)
 
     def test_default_backfill_detail_limit_is_bounded_for_short_runs(self):
         with patch.dict(
