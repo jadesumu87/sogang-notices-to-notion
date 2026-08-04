@@ -16,6 +16,7 @@ from models import (
     DestinationConsistencyError,
     FailureCategory,
     LocalConfigurationError,
+    MutationKind,
     RunRecord,
     SourceCrawlResult,
     SourceStatus,
@@ -875,6 +876,28 @@ def main() -> None:
                         f"출처={','.join(plan.quarantined_source_ids)}"
                     )
                 record.planned_writes = plan.write_count
+                write_actions = [
+                    action
+                    for action in plan.actions
+                    if action.kind
+                    not in {MutationKind.CONFLICT, MutationKind.NOOP}
+                ]
+                for index, action in enumerate(write_actions[:50], start=1):
+                    LOGGER.info(
+                        "드라이런 쓰기 계획: %s/%s, 종류=%s, 출처=%s, "
+                        "공지=%s, 사유=%s",
+                        index,
+                        len(write_actions),
+                        action.kind.value,
+                        action.source_id,
+                        action.notice_id,
+                        action.reason or "-",
+                    )
+                if len(write_actions) > 50:
+                    LOGGER.info(
+                        "드라이런 쓰기 계획 생략: %s건",
+                        len(write_actions) - 50,
+                    )
                 record.finished_at = utc_now_iso()
                 record.status = (
                     "dry_run_deferred"
