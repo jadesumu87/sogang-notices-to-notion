@@ -138,6 +138,7 @@ class DestinationPreflight:
     body_media_reuse_status: str = "valid"
     quote_fingerprint: str = ""
     allow_untracked_body_recovery: bool = False
+    deferred_reason: str = ""
 
     def __post_init__(self) -> None:
         if not self.page_fingerprint:
@@ -1726,18 +1727,44 @@ def resolve_destination_preflight(
             if existing_page
             else ""
         )
+        unavailable_attachment_urls: list[str] = []
         attachment_content_state = (
             collect_attachment_content_state(
-                item.get("attachments") or []
+                item.get("attachments") or [],
+                unavailable_source_urls=(
+                    unavailable_attachment_urls
+                ),
             )
             if context.has_attachments_property
             else []
         )
         body_blocks = item.get("body_blocks") or []
+        unavailable_body_media: list[tuple[str, str]] = []
         body_media_content_state = collect_body_media_content_state(
-            body_blocks
+            body_blocks,
+            unavailable_media=unavailable_body_media,
         )
         body_media_reuse_status = "valid"
+        existing_properties = (
+            existing_page.get("properties", {})
+            if existing_page
+            else {}
+        )
+        existing_attachment_state = (
+            extract_attachment_state(existing_properties)
+            if existing_page
+            else []
+        )
+        existing_body_media_state = (
+            extract_body_media_state(existing_properties)
+            if existing_page
+            else []
+        )
+        deferred_reasons: list[str] = []
+        if unavailable_attachment_urls and existing_attachment_state:
+            deferred_reasons.append("attachment_content_unavailable")
+        if unavailable_body_media and existing_body_media_state:
+            deferred_reasons.append("body_media_content_unavailable")
         if (
             existing_page
             and should_upload_files_to_notion()
@@ -1747,22 +1774,20 @@ def resolve_destination_preflight(
                 inspect_existing_uploaded_media_blocks(
                     context.token,
                     page_id,
-                    extract_body_media_state(
-                        existing_page.get("properties", {})
-                    ),
+                    existing_body_media_state,
                 )
             )
             if body_media_reuse_status == "unavailable":
-                raise RuntimeError(
-                    "기존 본문 미디어 상태를 사전검증할 수 없습니다"
-                )
+                deferred_reasons.append("body_media_state_unavailable")
+        deferred_reason = ",".join(sorted(set(deferred_reasons)))
         operation_id = operation_id_for_item(
             item,
             attachment_state=attachment_content_state,
             body_media_state=body_media_content_state,
         )
         allow_untracked_recovery = (
-            body_sync_requested(item)
+            not deferred_reason
+            and body_sync_requested(item)
             and untracked_body_recovery_allowed(
                 existing_page,
                 operation_id,
@@ -1779,7 +1804,11 @@ def resolve_destination_preflight(
                     item
                 ),
             )
-            if existing_page and body_sync_requested(item)
+            if (
+                existing_page
+                and body_sync_requested(item)
+                and not deferred_reason
+            )
             else ""
         )
         owner = f"{source_id}:{notice_id}"
@@ -1796,13 +1825,17 @@ def resolve_destination_preflight(
                 existing_page=existing_page,
                 operation_id=operation_id,
                 shrink_key=shrink_key,
-                shrink_candidate=shrink_candidate_for_item(
-                    context.token,
-                    item,
-                    existing_page,
-                    body_media_content_state=(
-                        body_media_content_state
-                    ),
+                shrink_candidate=(
+                    None
+                    if deferred_reason
+                    else shrink_candidate_for_item(
+                        context.token,
+                        item,
+                        existing_page,
+                        body_media_content_state=(
+                            body_media_content_state
+                        ),
+                    )
                 ),
                 page_fingerprint=managed_page_fingerprint(existing_page),
                 attachment_content_state=attachment_content_state,
@@ -1812,6 +1845,7 @@ def resolve_destination_preflight(
                 allow_untracked_body_recovery=(
                     allow_untracked_recovery
                 ),
+                deferred_reason=deferred_reason,
             )
         )
     LOGGER.info("목적지 사전검증 준비 완료: 항목=%s", len(resolved))
@@ -2354,6 +2388,29 @@ def _apply_report(
     )
     counters.pending_seen = len(pending_page_ids)
     counters.quarantined_source_ids = sorted(quarantined_sources)
+    deferred_preflight = [
+        entry for entry in preflight if entry.deferred_reason
+    ]
+    for entry in deferred_preflight:
+        source_id = str(entry.item.get("source_id") or "")
+        notice_id = str(entry.item.get("notice_id") or "")
+        pending_ids = counters.unresolved_pending_notices.setdefault(
+            source_id,
+            [],
+        )
+        if notice_id not in pending_ids:
+            pending_ids.append(notice_id)
+        if len(pending_ids) > 1000:
+            raise DestinationConsistencyError(
+                "출처별 대기 공지 상태가 보존 한도를 초과했습니다"
+            )
+        counters.media_deferred += 1
+        LOGGER.warning(
+            "외부 미디어 검증 보류: 출처=%s, 공지=%s, 사유=%s",
+            source_id,
+            notice_id,
+            entry.deferred_reason,
+        )
     for entry in preflight:
         page_id = (
             str(entry.existing_page.get("id") or "").strip()
@@ -2386,6 +2443,7 @@ def _apply_report(
         for entry in preflight
         if str(entry.item.get("source_id") or "").strip()
         not in quarantined_sources
+        and not entry.deferred_reason
     ]
     validate_destination_preflight_entries(
         context,
@@ -2469,8 +2527,9 @@ def _apply_report(
         if entry_page_id in pending_page_ids:
             verified_pending_page_ids.add(entry_page_id)
     LOGGER.info(
-        "목적지 항목 처리 완료: 항목=%s",
+        "목적지 항목 처리 완료: 항목=%s, 외부 미디어 보류=%s",
         total_active_entries,
+        counters.media_deferred,
     )
     remaining_pending = inspect_pending_pages(token, database_id)
     (
@@ -2521,7 +2580,8 @@ def _apply_report(
             source_id,
             [],
         )
-        pending_ids.append(notice_id)
+        if notice_id not in pending_ids:
+            pending_ids.append(notice_id)
         if len(pending_ids) > 1000:
             raise DestinationConsistencyError(
                 "출처별 대기 공지 상태가 보존 한도를 초과했습니다"
@@ -2825,6 +2885,32 @@ def build_dry_run_plan(
                     )
                 )
                 plan.conflicts.append(f"{key}:{reason}")
+                continue
+            if preflight.deferred_reason:
+                plan.actions.append(
+                    MutationAction(
+                        kind=MutationKind.CONFLICT,
+                        source_id=result.source.config_fk,
+                        notice_id=str(item["notice_id"]),
+                        page_id=(
+                            str(existing.get("id") or "")
+                            if existing
+                            else ""
+                        ),
+                        operation_id=operation_id,
+                        reason=preflight.deferred_reason,
+                    )
+                )
+                plan.conflicts.append(
+                    f"{key}:{preflight.deferred_reason}"
+                )
+                LOGGER.warning(
+                    "드라이런 외부 미디어 검증 보류: "
+                    "출처=%s, 공지=%s, 사유=%s",
+                    result.source.config_fk,
+                    str(item["notice_id"]),
+                    preflight.deferred_reason,
+                )
                 continue
             candidate_confirmed = shrink_candidate_confirmed(
                 preflight,

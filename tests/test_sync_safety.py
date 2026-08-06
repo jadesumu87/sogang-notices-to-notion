@@ -2610,6 +2610,90 @@ class SyncSafetyTests(unittest.TestCase):
             )
         )
 
+    def test_dry_run_isolates_media_deferred_notice(self):
+        result = source_result(
+            "2",
+            SourceStatus.SUCCESS,
+            [
+                {
+                    "notice_id": "200",
+                    "title": "공지 200",
+                    "url": "https://www.sogang.ac.kr/ko/detail/200",
+                    "top": False,
+                    "body_blocks": [],
+                },
+                {
+                    "notice_id": "201",
+                    "title": "공지 201",
+                    "url": "https://www.sogang.ac.kr/ko/detail/201",
+                    "top": False,
+                    "body_blocks": [],
+                },
+            ],
+        )
+        report = CrawlReport(sources=[result])
+        prepared = sync_engine.prepare_source_items(result)
+        preflight = [
+            sync_engine.DestinationPreflight(
+                item=prepared[0],
+                existing_page=managed_page("page-200", "2", "200"),
+                operation_id="operation-200",
+                shrink_key="2:200",
+                shrink_candidate=None,
+                deferred_reason="body_media_content_unavailable",
+            ),
+            sync_engine.DestinationPreflight(
+                item=prepared[1],
+                existing_page=None,
+                operation_id="operation-201",
+                shrink_key="2:201",
+                shrink_candidate=None,
+            ),
+        ]
+
+        with (
+            patch.object(
+                sync_engine,
+                "fetch_database",
+                return_value={
+                    "properties": complete_destination_schema()
+                },
+            ),
+            patch.object(
+                sync_engine,
+                "inspect_pending_pages",
+                return_value=[],
+            ),
+            patch.object(
+                sync_engine,
+                "resolve_destination_preflight",
+                return_value=preflight,
+            ),
+        ):
+            plan = sync_engine.build_dry_run_plan(
+                "run-media-isolated",
+                report,
+                token="token",
+                database_id="database",
+            )
+
+        self.assertEqual(plan.write_count, 1)
+        self.assertTrue(
+            any(
+                action.kind == MutationKind.CONFLICT
+                and action.notice_id == "200"
+                and action.reason == "body_media_content_unavailable"
+                for action in plan.actions
+            )
+        )
+        self.assertTrue(
+            any(
+                action.kind == MutationKind.CREATE
+                and action.notice_id == "201"
+                for action in plan.actions
+            )
+        )
+
     def test_dry_run_emits_noop_when_body_and_properties_are_unchanged(self):
         body_blocks = [paragraph_block("동일 본문")]
         item = {
@@ -3006,6 +3090,327 @@ class SyncSafetyTests(unittest.TestCase):
         create.assert_not_called()
         update.assert_not_called()
         replace.assert_not_called()
+
+    def test_preflight_defers_existing_upload_when_source_media_is_unavailable(
+        self,
+    ):
+        body_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/body.jpg"
+        )
+        item = {
+            "source_id": "2",
+            "notice_id": "200",
+            "title": "[학사] 검증 불가",
+            "url": "https://www.sogang.ac.kr/ko/detail/200?bbsConfigFk=2",
+            "classification": "학사공지",
+            "top": False,
+            "body_status": "present",
+            "body_blocks": [
+                {
+                    "type": "image",
+                    "image": {
+                        "type": "external",
+                        "external": {"url": body_url},
+                    },
+                }
+            ],
+        }
+        existing = managed_page("page-200", "2", "200")
+        existing["properties"][sync_engine.BODY_MEDIA_STATE_PROPERTY] = (
+            rich_text_property(
+                json.dumps(
+                    [
+                        {
+                            "type": "image",
+                            "source_url": body_url,
+                            "upload_id": "old-upload",
+                            "block_id": "old-block",
+                            "hosted_file_key": (
+                                "notionusercontent.com/original"
+                            ),
+                            "content_sha256": (
+                                utils.compute_content_sha256(b"image")
+                            ),
+                        }
+                    ],
+                    separators=(",", ":"),
+                )
+            )
+        )
+        context = sync_engine.DestinationContext(
+            "token",
+            "database",
+            has_attachments_property=False,
+        )
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                sync_engine,
+                "find_existing_page",
+                return_value=existing,
+            ),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ),
+            patch.object(
+                sync_engine,
+                "inspect_existing_uploaded_media_blocks",
+                return_value=({}, "valid"),
+            ),
+            patch.object(
+                sync_engine,
+                "destination_quote_fingerprint",
+            ) as quote_fingerprint,
+            patch.object(
+                sync_engine,
+                "shrink_candidate_for_item",
+            ) as shrink_candidate,
+        ):
+            preflight = sync_engine.resolve_destination_preflight(
+                context,
+                [item],
+                atomic_recheck=False,
+            )[0]
+
+        self.assertEqual(
+            preflight.deferred_reason,
+            "body_media_content_unavailable",
+        )
+        quote_fingerprint.assert_not_called()
+        shrink_candidate.assert_not_called()
+
+    def test_preflight_preserves_unavailable_media_for_new_notice(self):
+        body_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/body.jpg"
+        )
+        item = {
+            "source_id": "2",
+            "notice_id": "200",
+            "title": "[학사] 신규 원문 보존",
+            "url": "https://www.sogang.ac.kr/ko/detail/200?bbsConfigFk=2",
+            "classification": "학사공지",
+            "top": False,
+            "body_status": "present",
+            "body_blocks": [
+                {
+                    "type": "image",
+                    "image": {
+                        "type": "external",
+                        "external": {"url": body_url},
+                    },
+                }
+            ],
+        }
+        context = sync_engine.DestinationContext(
+            "token",
+            "database",
+            has_attachments_property=False,
+        )
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                sync_engine,
+                "find_existing_page",
+                return_value=None,
+            ),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ),
+        ):
+            preflight = sync_engine.resolve_destination_preflight(
+                context,
+                [item],
+                atomic_recheck=False,
+            )[0]
+
+        self.assertEqual(preflight.deferred_reason, "")
+        self.assertEqual(preflight.body_media_content_state, [])
+
+    def test_preflight_defers_existing_attachment_when_source_is_unavailable(
+        self,
+    ):
+        attachment_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/image.jpg"
+        )
+        item = {
+            "source_id": "2",
+            "notice_id": "200",
+            "title": "[학사] 첨부 검증 불가",
+            "url": "https://www.sogang.ac.kr/ko/detail/200?bbsConfigFk=2",
+            "classification": "학사공지",
+            "top": False,
+            "body_status": "confirmed_empty",
+            "body_blocks": [],
+            "attachments": [
+                {
+                    "name": "image.jpg",
+                    "type": "external",
+                    "external": {"url": attachment_url},
+                }
+            ],
+        }
+        existing = managed_page("page-200", "2", "200")
+        existing["properties"][sync_engine.ATTACHMENT_STATE_PROPERTY] = (
+            rich_text_property(
+                json.dumps(
+                    [
+                        {
+                            "source_url": attachment_url,
+                            "name": "image.jpg",
+                            "occurrence": 1,
+                            "upload_id": "old-upload",
+                            "hosted_file_key": (
+                                "notionusercontent.com/original"
+                            ),
+                            "content_sha256": (
+                                utils.compute_content_sha256(b"image")
+                            ),
+                        }
+                    ],
+                    separators=(",", ":"),
+                )
+            )
+        )
+        context = sync_engine.DestinationContext(
+            "token",
+            "database",
+        )
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                sync_engine,
+                "find_existing_page",
+                return_value=existing,
+            ),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ),
+            patch.object(
+                sync_engine,
+                "destination_quote_fingerprint",
+            ) as quote_fingerprint,
+            patch.object(
+                sync_engine,
+                "shrink_candidate_for_item",
+            ) as shrink_candidate,
+        ):
+            preflight = sync_engine.resolve_destination_preflight(
+                context,
+                [item],
+                atomic_recheck=False,
+            )[0]
+
+        self.assertEqual(
+            preflight.deferred_reason,
+            "attachment_content_unavailable",
+        )
+        quote_fingerprint.assert_not_called()
+        shrink_candidate.assert_not_called()
+
+    def test_media_deferred_item_does_not_block_other_notice(self):
+        deferred_item = {
+            "notice_id": "200",
+            "title": "공지 200",
+            "url": "https://www.sogang.ac.kr/ko/detail/200",
+            "top": False,
+            "body_blocks": [],
+        }
+        healthy_item = {
+            "notice_id": "201",
+            "title": "공지 201",
+            "url": "https://www.sogang.ac.kr/ko/detail/201",
+            "top": False,
+            "body_blocks": [],
+        }
+        result = source_result(
+            "2",
+            SourceStatus.SUCCESS,
+            [deferred_item, healthy_item],
+        )
+        report = CrawlReport(sources=[result])
+        prepared = sync_engine.prepare_source_items(result)
+        preflight = [
+            sync_engine.DestinationPreflight(
+                item=prepared[0],
+                existing_page=managed_page("page-200", "2", "200"),
+                operation_id="operation-200",
+                shrink_key="2:200",
+                shrink_candidate=None,
+                deferred_reason="body_media_content_unavailable",
+            ),
+            sync_engine.DestinationPreflight(
+                item=prepared[1],
+                existing_page=None,
+                operation_id="operation-201",
+                shrink_key="2:201",
+                shrink_candidate=None,
+            ),
+        ]
+        context = sync_engine.DestinationContext("token", "database")
+        applied: list[str] = []
+
+        with (
+            patch.object(
+                sync_engine,
+                "prepare_destination",
+                return_value=context,
+            ),
+            patch.object(
+                sync_engine,
+                "resolve_destination_preflight",
+                return_value=preflight,
+            ),
+            patch.object(
+                sync_engine,
+                "validate_destination_preflight_entries",
+            ) as validate_entries,
+            patch.object(
+                sync_engine,
+                "refresh_destination_preflight_entry",
+                return_value=None,
+            ),
+            patch.object(
+                sync_engine,
+                "apply_item",
+                side_effect=lambda _context, item, *_args, **_kwargs: (
+                    applied.append(str(item["notice_id"]))
+                ),
+            ),
+            patch.object(
+                sync_engine,
+                "inspect_pending_pages",
+                return_value=[],
+            ),
+        ):
+            counters = sync_engine.apply_report(
+                "token",
+                "database",
+                report,
+                False,
+                run_id="run-media-isolated",
+            )
+
+        self.assertEqual(applied, ["201"])
+        validated = validate_entries.call_args.args[1]
+        self.assertEqual(
+            [entry.item["notice_id"] for entry in validated],
+            ["201"],
+        )
+        self.assertEqual(counters.media_deferred, 1)
+        self.assertEqual(
+            counters.unresolved_pending_notices,
+            {"2": ["200"]},
+        )
+        self.assertEqual(counters.quarantined_source_ids, [])
 
     def test_safe_source_results_selects_only_successful_source(self):
         partial = source_result("141", SourceStatus.PARTIAL)

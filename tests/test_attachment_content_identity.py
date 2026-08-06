@@ -327,6 +327,42 @@ class AttachmentContentIdentityTests(unittest.TestCase):
             ),
         )
 
+    def test_unavailable_attachment_is_preserved_without_second_download(
+        self,
+    ) -> None:
+        source_attachment = self.attachment(self.new_url)
+        unavailable: list[str] = []
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ) as download,
+            patch.object(notion_client, "create_file_upload") as create,
+        ):
+            preflight_state = notion_client.collect_attachment_content_state(
+                [source_attachment],
+                unavailable_source_urls=unavailable,
+            )
+            prepared, applied_state = (
+                notion_client.prepare_attachments_for_sync(
+                    "token",
+                    [source_attachment],
+                )
+            )
+
+        download.assert_called_once()
+        create.assert_not_called()
+        self.assertEqual(preflight_state, [])
+        self.assertEqual(applied_state, [])
+        self.assertEqual(prepared, [source_attachment])
+        self.assertEqual(
+            unavailable,
+            [utils.normalize_attachment_identity_url(self.new_url)],
+        )
+
     def test_file_upload_cache_key_includes_content_hash(self) -> None:
         with (
             patch.object(
@@ -797,6 +833,75 @@ class BodyMediaContentIdentityTests(unittest.TestCase):
         )
         self.assertEqual(state[0]["content_sha256"], self.old_hash)
 
+    def test_unavailable_body_image_is_preserved_without_second_download(
+        self,
+    ) -> None:
+        unavailable: list[tuple[str, str]] = []
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ) as download,
+            patch.object(
+                notion_client,
+                "upload_external_file_to_notion",
+            ) as upload,
+        ):
+            preflight_state = (
+                notion_client.collect_body_media_content_state(
+                    [self.block],
+                    unavailable_media=unavailable,
+                )
+            )
+            blocks, hash_blocks, applied_state = (
+                notion_client.prepare_body_blocks_for_sync(
+                    "token",
+                    [self.block],
+                )
+            )
+
+        download.assert_called_once()
+        upload.assert_not_called()
+        self.assertEqual(preflight_state, [])
+        self.assertEqual(applied_state, [])
+        self.assertEqual(blocks, [self.block])
+        self.assertEqual(hash_blocks, [self.block])
+        self.assertEqual(
+            unavailable,
+            [
+                (
+                    "image",
+                    utils.normalize_attachment_identity_url(
+                        self.new_url
+                    ),
+                )
+            ],
+        )
+
+    def test_download_circuit_still_stops_unavailable_body_preflight(
+        self,
+    ) -> None:
+        with (
+            notion_client.external_download_run_scope(
+                force_new=True
+            ) as policy,
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ),
+        ):
+            policy.open_circuit(429, "60")
+            with self.assertRaises(
+                notion_client.ExternalDownloadRunStoppedError
+            ):
+                notion_client.collect_body_media_content_state(
+                    [self.block]
+                )
+
     def test_changed_body_bytes_create_new_upload_and_hash(self) -> None:
         with (
             patch.object(
@@ -891,6 +996,61 @@ class BodyMediaContentIdentityTests(unittest.TestCase):
                 item,
                 body_media_state=applied_state,
             ),
+        )
+
+    def test_unavailable_body_file_is_preserved_without_second_download(
+        self,
+    ) -> None:
+        url = (
+            "https://scc.sogang.ac.kr/Download3"
+            "?pathStr=1&fileName=notice.pdf"
+        )
+        block = {
+            "object": "block",
+            "type": "embed",
+            "embed": {"url": url},
+        }
+        unavailable: list[tuple[str, str]] = []
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ) as download,
+            patch.object(
+                notion_client,
+                "upload_external_file_to_notion",
+            ) as upload,
+        ):
+            preflight_state = (
+                notion_client.collect_body_media_content_state(
+                    [block],
+                    unavailable_media=unavailable,
+                )
+            )
+            blocks, hash_blocks, applied_state = (
+                notion_client.prepare_body_blocks_for_sync(
+                    "token",
+                    [block],
+                )
+            )
+
+        download.assert_called_once()
+        upload.assert_not_called()
+        self.assertEqual(preflight_state, [])
+        self.assertEqual(applied_state, [])
+        self.assertEqual(blocks, [block])
+        self.assertEqual(hash_blocks, [block])
+        self.assertEqual(
+            unavailable,
+            [
+                (
+                    "pdf",
+                    utils.normalize_attachment_identity_url(url),
+                )
+            ],
         )
 
     def test_rejected_large_body_image_preserves_external_block_identity(

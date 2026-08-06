@@ -178,6 +178,7 @@ class SyncCounters:
     writes: int = 0
     http_reads: int = 0
     upload_attempts: int = 0
+    media_deferred: int = 0
     external_download_requests: int = 0
     external_download_stopped_reason: str = ""
     external_download_status_code: Optional[int] = None

@@ -2709,6 +2709,8 @@ def pop_reusable_uploaded_attachment_id(
 
 def collect_attachment_content_state(
     attachments: list[JsonObject],
+    *,
+    unavailable_source_urls: Optional[list[str]] = None,
 ) -> list[JsonObject]:
     if not attachments or not should_upload_files_to_notion():
         return []
@@ -2734,7 +2736,20 @@ def collect_attachment_content_state(
         )
         if not payload:
             raise_if_external_download_stopped()
-            raise RuntimeError("첨부 콘텐츠 사전검증에 실패했습니다")
+            cache_external_preflight_download(
+                url,
+                False,
+                (b"", content_type),
+            )
+            if unavailable_source_urls is not None:
+                unavailable_source_urls.append(
+                    normalize_attachment_identity_url(url)
+                )
+            LOGGER.warning(
+                "첨부 콘텐츠 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
+                summarize_external_request_target(url),
+            )
+            continue
         cache_external_preflight_download(
             url,
             False,
@@ -2760,6 +2775,8 @@ def collect_attachment_content_state(
 
 def collect_body_media_content_state(
     blocks: list[JsonObject],
+    *,
+    unavailable_media: Optional[list[tuple[str, str]]] = None,
 ) -> list[JsonObject]:
     if not blocks or not should_upload_files_to_notion():
         return []
@@ -2781,9 +2798,23 @@ def collect_body_media_content_state(
             )
             if not payload:
                 raise_if_external_download_stopped()
-                raise RuntimeError(
-                    "본문 이미지 콘텐츠 사전검증에 실패했습니다"
+                cache_external_preflight_download(
+                    url,
+                    False,
+                    (b"", content_type),
                 )
+                if unavailable_media is not None:
+                    unavailable_media.append(
+                        (
+                            "image",
+                            normalize_attachment_identity_url(url),
+                        )
+                    )
+                LOGGER.warning(
+                    "본문 이미지 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
+                    summarize_external_request_target(url),
+                )
+                continue
             cache_external_preflight_download(
                 url,
                 False,
@@ -2826,9 +2857,29 @@ def collect_body_media_content_state(
         )
         if not payload:
             raise_if_external_download_stopped()
-            raise RuntimeError(
-                "본문 파일 콘텐츠 사전검증에 실패했습니다"
+            cache_external_preflight_download(
+                url,
+                True,
+                (b"", content_type),
             )
+            if unavailable_media is not None:
+                unavailable_media.append(
+                    (
+                        "pdf" if is_pdf_name_or_url(
+                            derive_filename_from_url(
+                                url,
+                                fallback="file",
+                            ),
+                            url,
+                        ) else "file",
+                        normalize_attachment_identity_url(url),
+                    )
+                )
+            LOGGER.warning(
+                "본문 파일 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
+                summarize_external_request_target(url),
+            )
+            continue
         cache_external_preflight_download(
             url,
             True,
