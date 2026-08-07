@@ -5,7 +5,7 @@ import re
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
 
 from common import (
     ATTACHMENTS_STATUS_KNOWN,
@@ -75,6 +75,10 @@ JsonObject = dict[str, Any]
 BODY_GENERATION_MANIFEST_VERSION = 2
 BODY_GENERATION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 BODY_GENERATION_HASH_RE = re.compile(r"[0-9a-f]{64}")
+PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
+URL_UNRESERVED_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
 DEFAULT_COLOR_BLOCK_TYPES = frozenset(
     {
         "bulleted_list_item",
@@ -1317,6 +1321,37 @@ def update_quote_block(token: str, block_id: str, rich_text: list[JsonObject]) -
     notion_request("PATCH", url, token, payload)
 
 
+def normalize_percent_encoded_component(value: str, safe: str) -> str:
+    normalized: list[str] = []
+    cursor = 0
+    for match in PERCENT_ESCAPE_RE.finditer(value):
+        normalized.append(quote(value[cursor : match.start()], safe=safe))
+        octet = int(match.group(1), 16)
+        character = chr(octet)
+        normalized.append(
+            character
+            if character in URL_UNRESERVED_CHARACTERS
+            else f"%{octet:02X}"
+        )
+        cursor = match.end()
+    normalized.append(quote(value[cursor:], safe=safe))
+    return "".join(normalized)
+
+
+def normalize_link_query(query: str) -> str:
+    if not query:
+        return ""
+    return urlencode(
+        parse_qsl(
+            query,
+            keep_blank_values=True,
+            encoding="utf-8",
+            errors="strict",
+        ),
+        doseq=True,
+    )
+
+
 def normalize_notion_link_identity(raw_link: object) -> str:
     link = str(raw_link or "")
     if not link:
@@ -1325,32 +1360,33 @@ def normalize_notion_link_identity(raw_link: object) -> str:
         parsed = urlsplit(link)
     except ValueError:
         return link
-    if (
-        parsed.scheme.lower() not in {"http", "https"}
-        or not parsed.netloc
-    ):
+    scheme = parsed.scheme.lower()
+    if scheme in {"http", "https"} and parsed.netloc:
+        netloc = parsed.netloc
+        path = parsed.path or "/"
+        path_safe = "/:@!$&'()*+,;=-._~"
+    elif scheme == "mailto" and not parsed.netloc and parsed.path:
+        netloc = ""
+        path = parsed.path
+        path_safe = "@!$&'()*+,;=:-._~"
+    else:
         return link
-    query = parsed.query
-    if query:
-        try:
-            query = urlencode(
-                parse_qsl(
-                    query,
-                    keep_blank_values=True,
-                    encoding="utf-8",
-                    errors="strict",
-                ),
-                doseq=True,
-            )
-        except (UnicodeError, ValueError):
-            return link
+    try:
+        path = normalize_percent_encoded_component(path, path_safe)
+        query = normalize_link_query(parsed.query)
+        fragment = normalize_percent_encoded_component(
+            parsed.fragment,
+            "/?:@!$&'()*+,;=-._~",
+        )
+    except (UnicodeError, ValueError):
+        return link
     return urlunsplit(
         (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path or "/",
+            scheme,
+            netloc,
+            path,
             query,
-            parsed.fragment,
+            fragment,
         )
     )
 

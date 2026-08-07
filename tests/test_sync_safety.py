@@ -1384,6 +1384,76 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(manifest["p"][0]["h"], actual_hash)
         self.assertNotIn(store.old_id, store.root_ids())
 
+    def test_body_generation_accepts_notion_equivalent_mailto_encoding(self):
+        source_url = "mailto:첨부하여onestop@sogang.ac.kr"
+        notion_url = (
+            "mailto:%EC%B2%A8%EB%B6%80%ED%95%98%EC%97%AConestop"
+            "@sogang.ac.kr"
+        )
+        visible = paragraph_block("2025학년도 1학기 휴학 안내")
+        linked = paragraph_block("첨부하여onestop@sogang.ac.kr")
+        linked["paragraph"]["rich_text"][0]["text"]["link"] = {
+            "url": source_url
+        }
+        store = StatefulBlockStore()
+        append_children = store.append_children
+
+        def append_with_notion_mailto_encoding(
+            token: str,
+            parent_id: str,
+            blocks: list[dict],
+        ) -> dict:
+            response = append_children(token, parent_id, blocks)
+            if parent_id == store.root_id:
+                candidate_id = str(response["results"][0]["id"])
+                store.children[candidate_id][0]["paragraph"]["rich_text"][0][
+                    "text"
+                ]["link"] = {"url": notion_url}
+            return response
+
+        store.append_children = append_with_notion_mailto_encoding
+
+        result = self.run_body_sync(
+            store,
+            generation_id="notion-mailto-normalization",
+            blocks=[visible, linked],
+        )
+
+        manifest = sync.extract_body_generation_manifest(
+            notion_read_properties(store.properties)
+        )
+        self.assertEqual(result, "notion-mailto-normalization")
+        self.assertEqual(manifest["s"], "committed")
+        self.assertEqual(store.root_append_count, 1)
+        self.assertNotIn(store.old_id, store.root_ids())
+
+    def test_notion_mailto_normalization_preserves_distinct_targets(self):
+        self.assertEqual(
+            sync.normalize_notion_link_identity(
+                "mailto:onestop@sogang.ac.kr?subject=휴학 신청"
+            ),
+            sync.normalize_notion_link_identity(
+                "mailto:onestop@sogang.ac.kr"
+                "?subject=%ED%9C%B4%ED%95%99%20%EC%8B%A0%EC%B2%AD"
+            ),
+        )
+        self.assertNotEqual(
+            sync.normalize_notion_link_identity(
+                "mailto:onestop@sogang.ac.kr?subject=휴학"
+            ),
+            sync.normalize_notion_link_identity(
+                "mailto:onestop@sogang.ac.kr?subject=복학"
+            ),
+        )
+        self.assertNotEqual(
+            sync.normalize_notion_link_identity(
+                "mailto:onestop@sogang.ac.kr"
+            ),
+            sync.normalize_notion_link_identity(
+                "mailto:student@sogang.ac.kr"
+            ),
+        )
+
     def test_body_generation_accepts_notion_root_link_slash(self):
         source_url = "https://www.kosaf.go.kr"
         notion_url = "https://www.kosaf.go.kr/"
@@ -1431,6 +1501,27 @@ class SyncSafetyTests(unittest.TestCase):
             ),
             sync.normalize_notion_link_identity(
                 "https://www.kosaf.go.kr/path/"
+            ),
+        )
+
+    def test_notion_link_normalization_accepts_unicode_path_encoding(self):
+        self.assertEqual(
+            sync.normalize_notion_link_identity(
+                "https://www.sogang.ac.kr/학사 공지"
+            ),
+            sync.normalize_notion_link_identity(
+                "https://www.sogang.ac.kr/%ED%95%99%EC%82%AC%20"
+                "%EA%B3%B5%EC%A7%80"
+            ),
+        )
+
+    def test_notion_link_normalization_preserves_encoded_path_separator(self):
+        self.assertNotEqual(
+            sync.normalize_notion_link_identity(
+                "https://www.sogang.ac.kr/ko%2Fdetail"
+            ),
+            sync.normalize_notion_link_identity(
+                "https://www.sogang.ac.kr/ko/detail"
             ),
         )
 
@@ -1542,6 +1633,109 @@ class SyncSafetyTests(unittest.TestCase):
             store.events.index(("list", candidate_id)),
             store.events.index(("delete", failed_id)),
         )
+
+    def test_pending_mailto_failure_recovers_full_body_without_duplicate(self):
+        source_url = "mailto:첨부하여onestop@sogang.ac.kr"
+        notion_url = (
+            "mailto:%EC%B2%A8%EB%B6%80%ED%95%98%EC%97%AConestop"
+            "@sogang.ac.kr"
+        )
+        visible = paragraph_block("2025학년도 1학기 휴학 안내")
+        expected_children = [
+            paragraph_block(f"본문 {index}") for index in range(123)
+        ]
+        expected_children[12]["paragraph"]["rich_text"][0]["text"][
+            "link"
+        ] = {"url": source_url}
+        failed_children = copy.deepcopy(expected_children[:50])
+        failed_children[12]["paragraph"]["rich_text"][0]["text"][
+            "link"
+        ] = {"url": notion_url}
+        failed_id = "failed-mailto-generation"
+        generation_id = "pending-mailto-generation"
+        store = StatefulBlockStore()
+        store.root_blocks = [
+            {
+                "id": store.manual_id,
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"plain_text": "manual"}]},
+            },
+            {
+                "id": failed_id,
+                "type": "quote",
+                "quote": {
+                    "rich_text": copy.deepcopy(
+                        visible["paragraph"]["rich_text"]
+                    ),
+                    "color": "default",
+                },
+                "has_children": True,
+            },
+        ]
+        store.children = {failed_id: failed_children}
+        with patch.object(
+            sync,
+            "list_block_children",
+            side_effect=store.list_children,
+        ):
+            failed_hash = sync.sync_container_actual_hash(
+                "token",
+                store.root_blocks[1],
+            )
+        store.properties = {
+            sync.SYNC_GENERATION_PROPERTY: (
+                sync.body_generation_property_payload(
+                    {
+                        "v": 2,
+                        "g": generation_id,
+                        "s": "pending",
+                        "op": generation_id,
+                        "t": 1,
+                        "p": [],
+                        "o": [{"i": failed_id, "h": failed_hash}],
+                    }
+                )
+            )
+        }
+        append_children = store.append_children
+
+        def append_with_notion_mailto_encoding(
+            token: str,
+            parent_id: str,
+            blocks: list[dict],
+        ) -> dict:
+            response = append_children(token, parent_id, blocks)
+            if parent_id == store.root_id:
+                candidate_id = str(response["results"][0]["id"])
+                store.children[candidate_id][12]["paragraph"]["rich_text"][
+                    0
+                ]["text"]["link"] = {"url": notion_url}
+            return response
+
+        store.append_children = append_with_notion_mailto_encoding
+
+        result = self.run_body_sync(
+            store,
+            generation_id=generation_id,
+            blocks=[visible, *expected_children],
+        )
+
+        manifest = sync.extract_body_generation_manifest(
+            notion_read_properties(store.properties)
+        )
+        quote_ids = [
+            str(block.get("id") or "")
+            for block in store.root_blocks
+            if block.get("type") == "quote"
+        ]
+        candidate_id = str(manifest["p"][0]["i"])
+        self.assertEqual(result, generation_id)
+        self.assertEqual(manifest["s"], "committed")
+        self.assertEqual(quote_ids, [candidate_id])
+        self.assertEqual(len(store.children[candidate_id]), 123)
+        self.assertEqual(store.child_batch_sizes, [50, 23])
+        self.assertIn(failed_id, store.deleted_ids)
+        self.assertIn(store.manual_id, store.root_ids())
 
     def test_body_generation_rejects_different_link_query(self):
         expected_link = "https://www.sogang.ac.kr/ko/detail/1?bbsConfigFk=2"
