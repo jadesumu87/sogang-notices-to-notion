@@ -157,6 +157,11 @@ class CiScriptTests(unittest.TestCase):
         )
         self.assertIn("existing_pages_migration:", workflow)
         self.assertIn("existing_pages_confirmation:", workflow)
+        self.assertIn("recovery_notice_ids:", workflow)
+        self.assertIn(
+            "MANUAL_NOTICE_RECOVERY_IDS: ${{ inputs.recovery_notice_ids }}",
+            workflow,
+        )
         self.assertIn('FULL_RECONCILE_LOCAL_HOUR: "7"', workflow)
         self.assertIn("--all-pages", workflow)
         self.assertIn(

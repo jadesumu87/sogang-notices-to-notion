@@ -788,6 +788,8 @@ def classify_exception(exc: BaseException) -> FailureCategory:
             return FailureCategory.DESTINATION_AUTH
         if exc.failure_kind == "destination_contract":
             return FailureCategory.DESTINATION_CONTRACT
+        if exc.failure_kind == "source_contract":
+            return FailureCategory.SOURCE_CONTRACT
         return FailureCategory.INTERNAL
     origin = str(getattr(exc, "failure_origin", "") or "")
     failure_kind = str(getattr(exc, "failure_kind", "") or "")

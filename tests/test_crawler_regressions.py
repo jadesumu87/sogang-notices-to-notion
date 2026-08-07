@@ -529,6 +529,55 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertTrue(rate_limit_incident["should_signal_failure"])
         self.assertEqual(rate_limit_incident["count"], 1)
 
+    def test_write_failure_preserves_all_report_items_for_retry(self):
+        state = default_run_state()
+        state["sources"]["141"] = {
+            "pending_notice_ids": ["999"],
+        }
+        report = CrawlReport(
+            sources=[
+                crawl_result(
+                    items=[
+                        complete_notice("100"),
+                        complete_notice("101"),
+                    ]
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            crawler_main.persist_failed_run(
+                state,
+                crawler_main.create_run_record(False, False),
+                RuntimeError("destination failure"),
+                report,
+                Path(temp_dir) / "run-state.json",
+                Path(temp_dir) / "incident.json",
+            )
+
+        self.assertEqual(
+            state["sources"]["141"]["pending_notice_ids"],
+            ["100", "101", "999"],
+        )
+
+    def test_dry_run_failure_does_not_schedule_report_items_for_retry(self):
+        state = default_run_state()
+        report = CrawlReport(
+            sources=[crawl_result(items=[complete_notice("100")])]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            crawler_main.persist_failed_run(
+                state,
+                crawler_main.create_run_record(False, True),
+                RuntimeError("dry run failure"),
+                report,
+                Path(temp_dir) / "run-state.json",
+                Path(temp_dir) / "incident.json",
+            )
+
+        self.assertNotIn("141", state["sources"])
+
     def test_scheduled_duplicate_failure_notice_is_deduplicated_until_repeat(self):
         state = default_run_state()
         fixed_now = datetime.now(timezone.utc).replace(
@@ -2373,6 +2422,54 @@ class CrawlerRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_targeted_refresh_missing_is_not_write_safe(self):
+        pages = {
+            1: api_page([api_entry("1010"), api_entry("1009")]),
+            2: api_page([], terminal_verified=True),
+        }
+
+        with (
+            patch.object(
+                crawler,
+                "fetch_bbs_list_result",
+                side_effect=lambda page, *args, **kwargs: pages[page],
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_detail",
+                side_effect=lambda notice_id, **kwargs: api_detail(
+                    notice_id
+                ),
+            ),
+            patch.object(
+                crawler,
+                "get_detail_html_fallback_reason",
+                return_value=None,
+            ),
+            patch.object(
+                crawler,
+                "extract_body_blocks_from_html",
+                return_value=BODY,
+            ),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                known_ids={"1009", "1003"},
+                incremental=True,
+                refresh_known_ids={"1003"},
+                targeted_refresh_ids={"1003"},
+            )
+
+        self.assertFalse(result.write_safe)
+        self.assertEqual(result.status, SourceStatus.DEGRADED)
+        self.assertEqual(
+            result.termination_reason,
+            "targeted_refresh_missing",
+        )
+        self.assertEqual(result.error, "targeted_refresh_missing:1003")
+
     def test_incremental_checkpoint_stops_after_verified_overlap(self):
         known_ids = {"1004", "1003", "1002", "1001", "1000"}
         pages = {
@@ -3254,6 +3351,95 @@ class CrawlerRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_fallback_targeted_refresh_missing_is_not_write_safe(self):
+        date = "2026-07-27T12:00:00+09:00"
+
+        def entry(notice_id):
+            return {
+                "title": f"공지 {notice_id}",
+                "date": date,
+                "top": False,
+                "url": (
+                    "https://www.sogang.ac.kr/ko/detail/"
+                    f"{notice_id}?bbsConfigFk=141"
+                ),
+            }
+
+        def page(number, notice_ids):
+            values = [entry(notice_id) for notice_id in notice_ids]
+            return FallbackPageResult(
+                ok=True,
+                requested_page=number,
+                effective_page=number,
+                source_config_fk="141",
+                entries=values,
+                final_url=f"{SOURCE.list_url}?page={number}",
+                contract_verified=True,
+                explicit_empty=not values,
+                raw_entry_count=len(values),
+            )
+
+        pages = {
+            1: page(1, ["1010", "1009"]),
+            2: page(2, []),
+        }
+
+        def fetch_detail(item, _number):
+            notice_id = (
+                crawler.extract_detail_id_from_text(item["url"]) or ""
+            )
+            return FallbackDetailResult(
+                ok=True,
+                notice_id=notice_id,
+                url=item["url"],
+                title=item["title"],
+                date=date,
+                body_blocks=BODY,
+                body_status=crawler.BODY_STATUS_PRESENT,
+                attachments=[
+                    {
+                        "name": "attachment.pdf",
+                        "type": "external",
+                        "external": {
+                            "url": (
+                                "https://www.sogang.ac.kr/"
+                                "file-fe-prd/board/attachment.pdf"
+                            )
+                        },
+                    }
+                ],
+                attachments_status=crawler.ATTACHMENTS_STATUS_KNOWN,
+            )
+
+        original = SourceCrawlResult(
+            source=SOURCE,
+            status=SourceStatus.FAILED,
+            method="api",
+            category=FailureCategory.SOURCE_UPSTREAM,
+            error="api_failed",
+        )
+        result = crawler.crawl_fallback_with_fetchers(
+            SOURCE,
+            True,
+            0,
+            {"1009", "1003"},
+            True,
+            "fallback_http",
+            original,
+            lambda number: pages[number],
+            fetch_detail,
+            refresh_known_ids={"1003"},
+            targeted_refresh_ids={"1003"},
+        )
+
+        self.assertFalse(result.write_safe)
+        self.assertEqual(result.status, SourceStatus.DEGRADED)
+        self.assertEqual(
+            result.termination_reason,
+            "targeted_refresh_missing",
+        )
+        self.assertEqual(result.error, "targeted_refresh_missing:1003")
+
     def test_repeated_new_pinned_top_does_not_dirty_fallback_overlap(
         self,
     ):
@@ -3468,6 +3654,107 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
             captured["targeted_refresh_ids_by_source"]["2"],
             {"548926"},
         )
+
+    def test_collect_report_targets_manual_recovery_notice_ids(self):
+        state = fresh_state()
+        state["sources"]["2"] = {
+            "observed_ids": ["550000"],
+        }
+        captured = {}
+
+        def crawl_sources(**kwargs):
+            captured.update(kwargs)
+            return CrawlReport([])
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "MANUAL_NOTICE_RECOVERY_IDS": (
+                        "2:546129,2:546127,2:546129"
+                    )
+                },
+            ),
+            patch.object(
+                crawler_main,
+                "resolve_html_path",
+                return_value=None,
+            ),
+            patch.object(
+                crawler_main,
+                "get_bbs_config_fks",
+                return_value=["2"],
+            ),
+            patch.object(
+                crawler_main,
+                "crawl_sources",
+                side_effect=crawl_sources,
+            ),
+        ):
+            crawler_main.collect_report(
+                state,
+                full_reconcile=False,
+            )
+
+        self.assertEqual(
+            captured["known_ids_by_source"]["2"],
+            {"550000", "546129", "546127"},
+        )
+        self.assertEqual(
+            captured["refresh_ids_by_source"]["2"],
+            {"546129", "546127"},
+        )
+        self.assertEqual(
+            captured["targeted_refresh_ids_by_source"]["2"],
+            {"546129", "546127"},
+        )
+
+    def test_collect_report_rejects_invalid_manual_recovery_id(self):
+        state = fresh_state()
+        state["sources"]["2"] = {"observed_ids": ["546129"]}
+
+        with (
+            patch.dict(
+                os.environ,
+                {"MANUAL_NOTICE_RECOVERY_IDS": "2-546127"},
+            ),
+            patch.object(
+                crawler_main,
+                "resolve_html_path",
+                return_value=None,
+            ),
+            patch.object(
+                crawler_main,
+                "get_bbs_config_fks",
+                return_value=["2"],
+            ),
+            self.assertRaisesRegex(
+                crawler_main.LocalConfigurationError,
+                "출처ID:공지ID",
+            ),
+        ):
+            crawler_main.collect_report(
+                state,
+                full_reconcile=False,
+            )
+
+    def test_manual_recovery_request_is_bounded_before_crawl(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"MANUAL_NOTICE_RECOVERY_IDS": "2:1,2:2"},
+            ),
+            patch.object(
+                crawler_main,
+                "get_backfill_detail_limit",
+                return_value=1,
+            ),
+            self.assertRaisesRegex(
+                crawler_main.LocalConfigurationError,
+                "처리 한도",
+            ),
+        ):
+            crawler_main.manual_recovery_notice_ids(["2"])
 
     def test_collect_report_schedules_due_refresh_during_incremental_run(self):
         state = fresh_state()

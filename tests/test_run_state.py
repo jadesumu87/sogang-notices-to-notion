@@ -352,6 +352,10 @@ class RunStateTests(unittest.TestCase):
             "NOTION_SCHEMA_MIGRATION=1이 필요합니다",
             "destination_contract",
         )
+        source_contract_error = LocalConfigurationError(
+            "수동 복구 공지 형식이 잘못됐습니다",
+            "source_contract",
+        )
 
         self.assertEqual(
             run_state.classify_exception(auth_error),
@@ -360,6 +364,10 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(
             run_state.classify_exception(contract_error),
             FailureCategory.DESTINATION_CONTRACT,
+        )
+        self.assertEqual(
+            run_state.classify_exception(source_contract_error),
+            FailureCategory.SOURCE_CONTRACT,
         )
         signature = run_state.stable_exception_signature(auth_error)
         self.assertEqual(signature["origin"], "local_config")

@@ -2852,6 +2852,16 @@ def crawl_top_items_api_result(
             if stable_page_number == 1:
                 first_page_top_verified = True
 
+    missing_targeted_refresh_ids = targeted_refresh_ids - set(
+        refreshed_known_ids
+    )
+    if missing_targeted_refresh_ids and not terminal_error:
+        terminal_error = "targeted_refresh_missing:" + ",".join(
+            sorted(missing_targeted_refresh_ids)
+        )
+        terminal_category = FailureCategory.SOURCE_PARTIAL
+        termination_reason = "targeted_refresh_missing"
+
     status = SourceStatus.SUCCESS
     category = terminal_category
     error = terminal_error
@@ -4850,6 +4860,16 @@ def crawl_fallback_with_fetchers(
                 break
             if verified_page_number == 1:
                 first_page_top_verified = True
+
+    missing_targeted_refresh_ids = targeted_refresh_ids - set(
+        refreshed_known_ids
+    )
+    if missing_targeted_refresh_ids and not terminal_error:
+        terminal_error = "targeted_refresh_missing:" + ",".join(
+            sorted(missing_targeted_refresh_ids)
+        )
+        terminal_category = FailureCategory.SOURCE_PARTIAL
+        termination_reason = "targeted_refresh_missing"
 
     if terminal_reached and not terminal_error and not detail_failures and not rejected_count:
         status = (

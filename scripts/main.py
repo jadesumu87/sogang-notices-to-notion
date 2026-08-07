@@ -136,6 +136,51 @@ def pending_notice_ids(
     )[:get_backfill_detail_limit()]
 
 
+def manual_recovery_notice_ids(
+    configured_source_ids: list[str],
+) -> dict[str, set[str]]:
+    raw = os.environ.get("MANUAL_NOTICE_RECOVERY_IDS", "").strip()
+    if not raw:
+        return {}
+    configured = set(configured_source_ids)
+    raw_entries = raw.split(",")
+    entry_limit = max(1, len(configured)) * get_backfill_detail_limit()
+    if len(raw) > 16384 or len(raw_entries) > entry_limit:
+        raise LocalConfigurationError(
+            "수동 복구 공지 요청이 처리 한도를 초과했습니다",
+            "source_contract",
+        )
+    recovered: dict[str, set[str]] = {}
+    for raw_entry in raw_entries:
+        entry = raw_entry.strip()
+        if not entry or entry.count(":") != 1:
+            raise LocalConfigurationError(
+                "수동 복구 공지 형식은 출처ID:공지ID 목록이어야 합니다",
+                "source_contract",
+            )
+        source_id, notice_id = (
+            value.strip() for value in entry.split(":", 1)
+        )
+        if (
+            source_id not in configured
+            or not notice_id.isascii()
+            or not notice_id.isdigit()
+            or len(notice_id) > 20
+        ):
+            raise LocalConfigurationError(
+                "수동 복구 공지 식별자를 신뢰할 수 없습니다",
+                "source_contract",
+            )
+        source_notice_ids = recovered.setdefault(source_id, set())
+        source_notice_ids.add(notice_id)
+        if len(source_notice_ids) > get_backfill_detail_limit():
+            raise LocalConfigurationError(
+                "출처별 수동 복구 공지가 상세 수집 한도를 초과했습니다",
+                "source_contract",
+            )
+    return recovered
+
+
 def should_refresh_destination_pending_state(
     state: dict[str, Any],
 ) -> bool:
@@ -360,10 +405,28 @@ def collect_report(
         config_fks = get_bbs_config_fks()
         materialize_reconcile_local_dates(state, config_fks)
         reconcile_local_hour = get_full_reconcile_local_hour()
-        known_ids_by_source = {
+        state_known_ids_by_source = {
             config_fk: known_ids_for_source(state, config_fk)
             for config_fk in config_fks
         }
+        manual_recovery_ids_by_source = manual_recovery_notice_ids(
+            config_fks
+        )
+        known_ids_by_source = {
+            config_fk: (
+                state_known_ids_by_source[config_fk]
+                | manual_recovery_ids_by_source.get(config_fk, set())
+            )
+            for config_fk in config_fks
+        }
+        if manual_recovery_ids_by_source:
+            LOGGER.info(
+                "수동 복구 공지를 수집 계획에 반영했습니다: %s",
+                sum(
+                    len(values)
+                    for values in manual_recovery_ids_by_source.values()
+                ),
+            )
         source_states = state.get("sources", {})
         reconcile_schedule_by_source = {
             config_fk: source_reconcile_schedule(
@@ -410,10 +473,10 @@ def collect_report(
         scheduled_refresh_ids_by_source = {
             config_fk: select_refresh_ids(
                 source_states.get(config_fk, {}),
-                known_ids_by_source[config_fk],
+                state_known_ids_by_source[config_fk],
             )
             if (
-                known_ids_by_source[config_fk]
+                state_known_ids_by_source[config_fk]
                 and isinstance(source_states.get(config_fk), dict)
             )
             else []
@@ -424,13 +487,17 @@ def collect_report(
                 [
                     *pending_shrink_ids(state, config_fk),
                     *scheduled_refresh_ids_by_source[config_fk],
+                    *manual_recovery_ids_by_source.get(config_fk, set()),
                 ]
             )
             for config_fk in config_fks
         }
         targeted_refresh_ids_by_source = {
             config_fk: set(
-                pending_notice_ids(state, config_fk)
+                [
+                    *pending_notice_ids(state, config_fk),
+                    *manual_recovery_ids_by_source.get(config_fk, set()),
+                ]
             )
             for config_fk in config_fks
         }
@@ -653,6 +720,8 @@ def persist_failed_run(
     state_path: Path,
     incident_path: Path,
 ) -> tuple[dict[str, Any], bool]:
+    if report is not None and not record.dry_run:
+        preserve_failed_report_notice_ids(state, report)
     mark_exception_failure(state, exc)
     category = classify_exception(exc)
     record.finished_at = utc_now_iso()
@@ -675,6 +744,55 @@ def persist_failed_run(
     write_run_state_atomic(state_path, state)
     write_json_atomic(incident_path, incident)
     return incident, deduplicated
+
+
+def preserve_failed_report_notice_ids(
+    state: dict[str, Any],
+    report: CrawlReport,
+) -> int:
+    sources = state.get("sources")
+    if not isinstance(sources, dict):
+        raise DestinationConsistencyError(
+            "실행 상태의 출처 정보를 신뢰할 수 없습니다"
+        )
+    preserved = 0
+    for result in safe_source_results(report):
+        source_id = result.source.config_fk
+        retry_ids = {
+            str(item.get("notice_id") or "").strip()
+            for item in result.items
+            if str(item.get("notice_id") or "").strip()
+        }
+        if not retry_ids:
+            continue
+        source_state = sources.setdefault(source_id, {})
+        if not isinstance(source_state, dict):
+            raise DestinationConsistencyError(
+                "실행 상태의 출처 정보를 신뢰할 수 없습니다"
+            )
+        existing = source_state.get("pending_notice_ids", [])
+        if not isinstance(existing, list):
+            raise DestinationConsistencyError(
+                "실행 상태의 대기 공지 ID를 신뢰할 수 없습니다"
+            )
+        existing_ids = {
+            str(value).strip()
+            for value in existing
+            if str(value).strip()
+        }
+        pending_ids = sorted(existing_ids | retry_ids)
+        if len(pending_ids) > 1000:
+            raise DestinationConsistencyError(
+                "출처별 대기 공지 상태가 보존 한도를 초과했습니다"
+            )
+        source_state["pending_notice_ids"] = pending_ids
+        preserved += len(set(pending_ids) - existing_ids)
+    if preserved:
+        LOGGER.warning(
+            "실패한 적용 계획을 다음 실행의 복구 대상으로 보존했습니다: %s",
+            preserved,
+        )
+    return preserved
 
 
 def should_deduplicate_scheduled_failure_notice(

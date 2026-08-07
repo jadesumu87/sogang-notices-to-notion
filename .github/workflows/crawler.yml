@@ -25,6 +25,11 @@ on:
         required: false
         type: string
         default: ""
+      recovery_notice_ids:
+        description: 재확인할 출처ID:공지ID 목록
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -86,6 +91,7 @@ jobs:
           SCHEMA_MIGRATION: ${{ inputs.schema_migration }}
           EXISTING_PAGES_MIGRATION: ${{ inputs.existing_pages_migration }}
           EXISTING_PAGES_CONFIRMATION: ${{ inputs.existing_pages_confirmation }}
+          RECOVERY_NOTICE_IDS: ${{ inputs.recovery_notice_ids }}
         run: |
           if [[ "$DRY_RUN" == "true" && "$SCHEMA_MIGRATION" == "true" ]]; then
             echo "::error::드라이런과 스키마 갱신을 동시에 선택할 수 없습니다."
@@ -101,6 +107,10 @@ jobs:
           fi
           if [[ "$DRY_RUN" == "true" && -n "$EXISTING_PAGES_CONFIRMATION" ]]; then
             echo "::error::기존 페이지 이관 적용에는 드라이런을 해제해야 합니다."
+            exit 1
+          fi
+          if [[ -n "$RECOVERY_NOTICE_IDS" && ( "$SCHEMA_MIGRATION" == "true" || "$EXISTING_PAGES_MIGRATION" == "true" ) ]]; then
+            echo "::error::공지 복구와 마이그레이션을 동시에 실행할 수 없습니다."
             exit 1
           fi
 
@@ -128,6 +138,7 @@ jobs:
           SYNC_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
           NOTION_SCHEMA_MIGRATION: ${{ github.event_name == 'workflow_dispatch' && inputs.schema_migration && '1' || '0' }}
           NOTION_SCHEMA_MIGRATION_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.schema_migration && '1' || '0' }}
+          MANUAL_NOTICE_RECOVERY_IDS: ${{ inputs.recovery_notice_ids }}
 
       - name: Run existing page migration
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.existing_pages_migration }}
