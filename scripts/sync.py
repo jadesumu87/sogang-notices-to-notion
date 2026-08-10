@@ -692,20 +692,13 @@ def sanitize_uploaded_media_block(block: JsonObject, upload_id: str) -> Optional
     return None
 
 
-def extract_body_media_state(properties: JsonObject) -> list[JsonObject]:
-    raw = extract_rich_text_value(properties, BODY_MEDIA_STATE_PROPERTY)
-    if not raw:
-        return []
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        LOGGER.info("본문 미디어 상태 파싱 실패: JSON 해석 오류")
-        return []
-    if not isinstance(payload, list):
-        LOGGER.info("본문 미디어 상태 파싱 실패: 배열이 아님")
+def normalize_body_media_state_entries(
+    entries: object,
+) -> list[JsonObject]:
+    if not isinstance(entries, list):
         return []
     items: list[JsonObject] = []
-    for entry in payload:
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
         media_type = str(entry.get("type") or "").strip()
@@ -732,6 +725,21 @@ def extract_body_media_state(properties: JsonObject) -> list[JsonObject]:
             normalized_entry["content_sha256"] = content_sha256
         items.append(normalized_entry)
     return items
+
+
+def extract_body_media_state(properties: JsonObject) -> list[JsonObject]:
+    raw = extract_rich_text_value(properties, BODY_MEDIA_STATE_PROPERTY)
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        LOGGER.info("본문 미디어 상태 파싱 실패: JSON 해석 오류")
+        return []
+    if not isinstance(payload, list):
+        LOGGER.info("본문 미디어 상태 파싱 실패: 배열이 아님")
+        return []
+    return normalize_body_media_state_entries(payload)
 
 
 def normalize_attachment_state_entries(entries: list[JsonObject]) -> list[JsonObject]:

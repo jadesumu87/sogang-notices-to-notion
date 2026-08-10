@@ -76,6 +76,7 @@ from sync import (
     managed_page_fingerprint,
     normalize_notion_hosted_file_key,
     normalize_attachment_state_entries,
+    normalize_body_media_state_entries,
     normalize_item_attachments,
     split_body_container_parts,
     sync_container_content_hash,
@@ -1538,10 +1539,12 @@ def _apply_item(
                 actual_media_state,
                 generation_id,
             )
-            actual_media_state = [
-                {**entry, "generation_id": generation_id}
-                for entry in actual_media_state
-            ]
+            actual_media_state = normalize_body_media_state_entries(
+                [
+                    {**entry, "generation_id": generation_id}
+                    for entry in actual_media_state
+                ]
+            )
             post_properties[BODY_HASH_PROPERTY] = {
                 "rich_text": build_rich_text_chunks(
                     desired_body_hash
@@ -1565,10 +1568,12 @@ def _apply_item(
             counters.writes += 1
             body_changed = True
     if existing_media_state and not body_changed:
-        existing_media_state = [
-            {**entry, "generation_id": completed_generation}
-            for entry in existing_media_state
-        ]
+        existing_media_state = normalize_body_media_state_entries(
+            [
+                {**entry, "generation_id": completed_generation}
+                for entry in existing_media_state
+            ]
+        )
         media_state_raw = json.dumps(
             existing_media_state,
             ensure_ascii=False,

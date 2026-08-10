@@ -3533,7 +3533,7 @@ class SyncSafetyTests(unittest.TestCase):
                 side_effect=lambda _token, _page_id, state, _generation: state,
             ),
             patch.object(sync_engine, "verify_committed_item"),
-            patch.object(sync_engine, "update_page"),
+            patch.object(sync_engine, "update_page") as update,
         ):
             sync_engine.apply_item(
                 context,
@@ -3550,6 +3550,26 @@ class SyncSafetyTests(unittest.TestCase):
             body_hash,
         )
         self.assertEqual(counters.body_updates, 1)
+        media_payloads = [
+            properties[sync_engine.BODY_MEDIA_STATE_PROPERTY]
+            for _, _, properties in (
+                call.args for call in update.call_args_list
+            )
+            if sync_engine.BODY_MEDIA_STATE_PROPERTY in properties
+        ]
+        self.assertEqual(len(media_payloads), 1)
+        media_raw = sync.rich_text_value_from_payload(media_payloads[0])
+        normalized_media = sync.normalize_body_media_state_entries(
+            json.loads(media_raw)
+        )
+        self.assertEqual(
+            media_raw,
+            json.dumps(
+                normalized_media,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
 
     def test_unavailable_body_media_validation_fails_before_write(self):
         item = {
@@ -4753,6 +4773,95 @@ class SyncSafetyTests(unittest.TestCase):
             )
 
         self.assertEqual(reasons, [])
+
+    def test_body_media_state_generation_update_is_immediately_canonical(self):
+        body_blocks = [
+            {
+                "type": "image",
+                "image": {
+                    "type": "external",
+                    "external": {"url": "https://www.sogang.ac.kr/body.png"},
+                },
+            }
+        ]
+        body_hash = sync_engine.compute_body_hash(
+            body_blocks,
+            image_mode=sync_engine.BODY_HASH_IMAGE_MODE_UPLOAD,
+        )
+        item = {
+            "source_id": "2",
+            "notice_id": "media-generation",
+            "title": "미디어 세대 보정",
+            "url": (
+                "https://www.sogang.ac.kr/ko/detail/media-generation"
+                "?bbsConfigFk=2"
+            ),
+            "top": False,
+            "body_status": "present",
+            "body_blocks": body_blocks,
+        }
+        media_state = [
+            {
+                "type": "image",
+                "source_url": "https://www.sogang.ac.kr/body.png",
+                "upload_id": "upload-1",
+                "block_id": "block-1",
+                "hosted_file_key": "notionusercontent.com/body.png",
+                "content_sha256": "a" * 64,
+            }
+        ]
+        existing = managed_page("page-media-generation", "2", "media-generation")
+        existing["properties"][sync_engine.BODY_HASH_PROPERTY] = (
+            rich_text_property(body_hash)
+        )
+        existing["properties"][sync_engine.BODY_MEDIA_STATE_PROPERTY] = (
+            rich_text_property(json.dumps(media_state, separators=(",", ":")))
+        )
+        context = sync_engine.DestinationContext(
+            "token",
+            "database",
+            has_views_property=False,
+            has_attachments_property=False,
+            has_classification_property=False,
+        )
+        with (
+            patch.object(sync_engine, "check_run_control"),
+            patch.object(sync_engine, "build_properties", return_value={}),
+            patch.object(sync_engine, "should_upload_files_to_notion", return_value=True),
+            patch.object(
+                sync_engine,
+                "inspect_existing_uploaded_media_blocks",
+                return_value=({}, "valid"),
+            ),
+            patch.object(
+                sync_engine,
+                "prepare_body_blocks_for_sync",
+                return_value=(body_blocks, body_blocks, media_state),
+            ),
+            patch.object(sync_engine, "is_body_generation_current", return_value=True),
+            patch.object(sync_engine, "verify_committed_item"),
+            patch.object(sync_engine, "update_page") as update,
+        ):
+            sync_engine.apply_item(
+                context,
+                item,
+                SyncCounters(),
+                existing_page=existing,
+                existing_page_resolved=True,
+            )
+
+        payloads = [
+            properties[sync_engine.BODY_MEDIA_STATE_PROPERTY]
+            for _, _, properties in (call.args for call in update.call_args_list)
+            if sync_engine.BODY_MEDIA_STATE_PROPERTY in properties
+        ]
+        self.assertEqual(len(payloads), 1)
+        media_raw = sync.rich_text_value_from_payload(payloads[0])
+        normalized_media = sync.normalize_body_media_state_entries(json.loads(media_raw))
+        self.assertEqual(
+            media_raw,
+            json.dumps(normalized_media, ensure_ascii=False, separators=(",", ":")),
+        )
 
     def test_committed_readback_rejects_tampered_body_generation(self):
         body_blocks = [paragraph_block("본문")]
