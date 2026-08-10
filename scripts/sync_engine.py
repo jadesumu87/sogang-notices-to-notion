@@ -3139,13 +3139,15 @@ def build_dry_run_plan(
                 existing_body_media_state
                 and not body_needs_update
             ):
-                expected_body_media_state = [
-                    {
-                        **entry,
-                        "generation_id": completed_generation,
-                    }
-                    for entry in existing_body_media_state
-                ]
+                expected_body_media_state = normalize_body_media_state_entries(
+                    [
+                        {
+                            **entry,
+                            "generation_id": completed_generation,
+                        }
+                        for entry in existing_body_media_state
+                    ]
+                )
                 if json.dumps(
                     expected_body_media_state,
                     ensure_ascii=False,
