@@ -1384,6 +1384,212 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(manifest["p"][0]["h"], actual_hash)
         self.assertNotIn(store.old_id, store.root_ids())
 
+    def test_body_generation_accepts_notion_equivalent_idna_hostname(self):
+        source_url = "http://Q.한국/"
+        notion_url = "http://q.xn--3e0b707e/"
+        visible = paragraph_block("첫 문단")
+        linked = paragraph_block("Q.한국 가톨릭 교양 공유대학이란?")
+        linked["paragraph"]["rich_text"][0]["text"]["link"] = {
+            "url": source_url
+        }
+        store = StatefulBlockStore()
+        append_children = store.append_children
+
+        def append_with_notion_idna_hostname(
+            token: str,
+            parent_id: str,
+            blocks: list[dict],
+        ) -> dict:
+            response = append_children(token, parent_id, blocks)
+            if parent_id == store.root_id:
+                candidate_id = str(response["results"][0]["id"])
+                store.children[candidate_id][0]["paragraph"]["rich_text"][0][
+                    "text"
+                ]["link"] = {"url": notion_url}
+            return response
+
+        store.append_children = append_with_notion_idna_hostname
+
+        result = self.run_body_sync(
+            store,
+            generation_id="notion-idna-hostname",
+            blocks=[visible, linked],
+        )
+
+        manifest = sync.extract_body_generation_manifest(
+            notion_read_properties(store.properties)
+        )
+        self.assertEqual(result, "notion-idna-hostname")
+        self.assertEqual(manifest["s"], "committed")
+        self.assertEqual(store.root_append_count, 1)
+        self.assertEqual(
+            store.root_payloads[0]["quote"]["children"][0]["paragraph"]
+            ["rich_text"][0]["text"]["link"]["url"],
+            source_url,
+        )
+        self.assertNotIn(store.old_id, store.root_ids())
+
+    def test_notion_http_hostname_normalization_is_conservative(self):
+        equivalent_pairs = (
+            ("http://Q.한국/", "http://q.xn--3e0b707e/"),
+            ("HTTP://EXAMPLE.COM:080", "http://example.com/"),
+            ("https://EXAMPLE.COM:0443/a", "https://example.com/a"),
+            (
+                "http://User:암호@Q.%ED%95%9C%EA%B5%AD:80/a",
+                "http://User:%EC%95%94%ED%98%B8@q.xn--3e0b707e/a",
+            ),
+            (
+                "http://[2001:0DB8:0:0:0:0:0:1]:80/",
+                "http://[2001:db8::1]/",
+            ),
+            (
+                "https://예시。한국/안내",
+                "https://xn--vv4b11d.xn--3e0b707e/%EC%95%88%EB%82%B4",
+            ),
+        )
+        for source_url, notion_url in equivalent_pairs:
+            with self.subTest(source_url=source_url, notion_url=notion_url):
+                self.assertEqual(
+                    sync.normalize_notion_link_identity(source_url),
+                    sync.normalize_notion_link_identity(notion_url),
+                )
+
+        distinct_pairs = (
+            ("http://q.한국/", "http://r.한국/"),
+            ("http://example.com:8080/", "http://example.com/"),
+            ("http://User@example.com/", "http://user@example.com/"),
+            ("http://example.com./", "http://example.com/"),
+        )
+        for first_url, second_url in distinct_pairs:
+            with self.subTest(first_url=first_url, second_url=second_url):
+                self.assertNotEqual(
+                    sync.normalize_notion_link_identity(first_url),
+                    sync.normalize_notion_link_identity(second_url),
+                )
+
+        malformed = "http://example.com:not-a-port/path"
+        self.assertEqual(
+            sync.normalize_notion_link_identity(malformed),
+            malformed,
+        )
+
+    def test_notion_link_normalization_is_idempotent(self):
+        links = (
+            "http://Q.한국/",
+            "HTTP://User:암호@Q.%ED%95%9C%EA%B5%AD:080/a b",
+            "https://[2001:0DB8:0:0:0:0:0:1]:443/학사 공지",
+            "mailto:Student@Q.한국,other@예시.한국?subject=학사 공지",
+            "http://example.com:not-a-port/path",
+            "custom:Q.한국",
+        )
+        for link in links:
+            with self.subTest(link=link):
+                normalized = sync.normalize_notion_link_identity(link)
+                self.assertEqual(
+                    sync.normalize_notion_link_identity(normalized),
+                    normalized,
+                )
+
+    def test_body_generation_accepts_notion_equivalent_urls_in_url_blocks(self):
+        source_host = "Q.한국"
+        notion_host = "q.xn--3e0b707e"
+        visible = paragraph_block("첫 문단")
+        body_blocks = [
+            {
+                "type": "image",
+                "image": {
+                    "type": "external",
+                    "external": {"url": f"http://{source_host}/image.png"},
+                },
+            },
+            {
+                "type": "embed",
+                "embed": {"url": f"http://{source_host}/document.pdf"},
+            },
+            {
+                "type": "bookmark",
+                "bookmark": {
+                    "url": f"http://{source_host}/guide",
+                    "caption": [],
+                },
+            },
+        ]
+        store = StatefulBlockStore()
+        append_children = store.append_children
+
+        def append_with_notion_idna_urls(
+            token: str,
+            parent_id: str,
+            blocks: list[dict],
+        ) -> dict:
+            response = append_children(token, parent_id, blocks)
+            if parent_id == store.root_id:
+                candidate_id = str(response["results"][0]["id"])
+                children = store.children[candidate_id]
+                children[0]["image"]["external"]["url"] = (
+                    f"http://{notion_host}/image.png"
+                )
+                children[1]["embed"]["url"] = (
+                    f"http://{notion_host}/document.pdf"
+                )
+                children[2]["bookmark"]["url"] = (
+                    f"http://{notion_host}/guide"
+                )
+            return response
+
+        store.append_children = append_with_notion_idna_urls
+
+        result = self.run_body_sync(
+            store,
+            generation_id="notion-idna-url-blocks",
+            blocks=[visible, *body_blocks],
+        )
+
+        manifest = sync.extract_body_generation_manifest(
+            notion_read_properties(store.properties)
+        )
+        self.assertEqual(result, "notion-idna-url-blocks")
+        self.assertEqual(manifest["s"], "committed")
+        self.assertEqual(store.root_payloads[0]["quote"]["children"], body_blocks)
+        self.assertNotIn(store.old_id, store.root_ids())
+
+    def test_property_comparison_accepts_notion_equivalent_idna_urls(self):
+        existing = {
+            sync.URL_PROPERTY: {
+                "type": "url",
+                "url": "http://q.xn--3e0b707e/notice",
+            },
+            sync.ATTACHMENT_PROPERTY: {
+                "type": "files",
+                "files": [
+                    {
+                        "name": "안내.pdf",
+                        "type": "external",
+                        "external": {
+                            "url": "http://q.xn--3e0b707e/guide.pdf"
+                        },
+                    }
+                ],
+            },
+        }
+        desired = {
+            sync.URL_PROPERTY: {"url": "http://Q.한국/notice"},
+            sync.ATTACHMENT_PROPERTY: {
+                "files": [
+                    {
+                        "name": "안내.pdf",
+                        "type": "external",
+                        "external": {"url": "http://Q.한국/guide.pdf"},
+                    }
+                ]
+            },
+        }
+
+        self.assertEqual(
+            sync.filter_changed_properties(existing, desired),
+            {},
+        )
+
     def test_body_generation_accepts_notion_equivalent_mailto_encoding(self):
         source_url = "mailto:첨부하여onestop@sogang.ac.kr"
         notion_url = (
@@ -1452,6 +1658,25 @@ class SyncSafetyTests(unittest.TestCase):
             sync.normalize_notion_link_identity(
                 "mailto:student@sogang.ac.kr"
             ),
+        )
+        self.assertEqual(
+            sync.normalize_notion_link_identity("mailto:Student@Q.한국"),
+            sync.normalize_notion_link_identity(
+                "mailto:Student@q.xn--3e0b707e"
+            ),
+        )
+        self.assertEqual(
+            sync.normalize_notion_link_identity(
+                "mailto:Student@Q.한국,other@예시.한국"
+            ),
+            sync.normalize_notion_link_identity(
+                "mailto:Student@q.xn--3e0b707e,"
+                "other@xn--vv4b11d.xn--3e0b707e"
+            ),
+        )
+        self.assertNotEqual(
+            sync.normalize_notion_link_identity("mailto:Student@Q.한국"),
+            sync.normalize_notion_link_identity("mailto:student@Q.한국"),
         )
 
     def test_body_generation_accepts_notion_root_link_slash(self):
@@ -1632,6 +1857,125 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertLess(
             store.events.index(("list", candidate_id)),
             store.events.index(("delete", failed_id)),
+        )
+
+    def test_pending_idna_failures_recover_one_complete_body(self):
+        source_url = "http://Q.한국/"
+        notion_url = "http://q.xn--3e0b707e/"
+        visible = paragraph_block("첫 문단")
+        expected_children = [
+            paragraph_block(f"본문 {index}") for index in range(65)
+        ]
+        expected_children[5]["paragraph"]["rich_text"][0]["text"][
+            "link"
+        ] = {"url": source_url}
+        failed_children = copy.deepcopy(expected_children[:50])
+        failed_children[5]["paragraph"]["rich_text"][0]["text"][
+            "link"
+        ] = {"url": notion_url}
+        failed_ids = [f"failed-idna-{index}" for index in range(3)]
+        generation_id = "pending-idna-generation"
+        store = StatefulBlockStore()
+        store.root_blocks = [
+            {
+                "id": store.manual_id,
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"plain_text": "manual"}]},
+            },
+            *[
+                {
+                    "id": failed_id,
+                    "type": "quote",
+                    "quote": {
+                        "rich_text": copy.deepcopy(
+                            visible["paragraph"]["rich_text"]
+                        ),
+                        "color": "default",
+                    },
+                    "has_children": True,
+                }
+                for failed_id in failed_ids
+            ],
+        ]
+        store.children = {
+            failed_id: copy.deepcopy(failed_children)
+            for failed_id in failed_ids
+        }
+        old_refs = []
+        with patch.object(
+            sync,
+            "list_block_children",
+            side_effect=store.list_children,
+        ):
+            for block in store.root_blocks[1:]:
+                old_refs.append(
+                    {
+                        "i": str(block["id"]),
+                        "h": sync.sync_container_actual_hash(
+                            "token",
+                            block,
+                        ),
+                    }
+                )
+        store.properties = {
+            sync.SYNC_GENERATION_PROPERTY: (
+                sync.body_generation_property_payload(
+                    {
+                        "v": 2,
+                        "g": generation_id,
+                        "s": "pending",
+                        "op": generation_id,
+                        "t": 1,
+                        "p": [],
+                        "o": old_refs,
+                    }
+                )
+            )
+        }
+        append_children = store.append_children
+
+        def append_with_notion_idna_hostname(
+            token: str,
+            parent_id: str,
+            blocks: list[dict],
+        ) -> dict:
+            response = append_children(token, parent_id, blocks)
+            if parent_id == store.root_id:
+                candidate_id = str(response["results"][0]["id"])
+                store.children[candidate_id][5]["paragraph"]["rich_text"][0][
+                    "text"
+                ]["link"] = {"url": notion_url}
+            return response
+
+        store.append_children = append_with_notion_idna_hostname
+
+        result = self.run_body_sync(
+            store,
+            generation_id=generation_id,
+            blocks=[visible, *expected_children],
+        )
+
+        manifest = sync.extract_body_generation_manifest(
+            notion_read_properties(store.properties)
+        )
+        quote_ids = [
+            str(block.get("id") or "")
+            for block in store.root_blocks
+            if block.get("type") == "quote"
+        ]
+        candidate_id = str(manifest["p"][0]["i"])
+        self.assertEqual(result, generation_id)
+        self.assertEqual(manifest["s"], "committed")
+        self.assertEqual(quote_ids, [candidate_id])
+        self.assertEqual(len(store.children[candidate_id]), 65)
+        self.assertEqual(store.child_batch_sizes, [15])
+        self.assertEqual(store.root_append_count, 1)
+        self.assertEqual(set(store.deleted_ids), set(failed_ids))
+        self.assertIn(store.manual_id, store.root_ids())
+        self.assertEqual(
+            store.root_payloads[0]["quote"]["children"][5]["paragraph"]
+            ["rich_text"][0]["text"]["link"]["url"],
+            source_url,
         )
 
     def test_pending_mailto_failure_recovers_full_body_without_duplicate(self):

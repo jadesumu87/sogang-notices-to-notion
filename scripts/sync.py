@@ -4,8 +4,18 @@ import json
 import re
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from ipaddress import IPv6Address, ip_address
 from typing import Any, Optional
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import (
+    SplitResult,
+    parse_qsl,
+    quote,
+    unquote,
+    urlencode,
+    urlparse,
+    urlsplit,
+    urlunsplit,
+)
 
 from common import (
     ATTACHMENTS_STATUS_KNOWN,
@@ -1352,6 +1362,106 @@ def normalize_link_query(query: str) -> str:
     )
 
 
+def normalize_dns_hostname(hostname: str) -> Optional[str]:
+    try:
+        normalized = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    if (
+        not normalized
+        or normalized.startswith(".")
+        or ".." in normalized
+        or re.fullmatch(r"[a-z0-9._-]+", normalized) is None
+    ):
+        return None
+    return normalized
+
+
+def normalize_http_netloc(
+    parsed: SplitResult,
+    scheme: str,
+) -> Optional[str]:
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    userinfo, separator, raw_host_port = parsed.netloc.rpartition("@")
+    bracketed = raw_host_port.startswith("[")
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        if bracketed:
+            return None
+        try:
+            decoded_hostname = unquote(
+                hostname,
+                encoding="utf-8",
+                errors="strict",
+            )
+        except UnicodeDecodeError:
+            return None
+        normalized_host = normalize_dns_hostname(decoded_hostname)
+        if normalized_host is None:
+            return None
+    else:
+        normalized_host = address.compressed
+        if isinstance(address, IPv6Address):
+            normalized_host = f"[{normalized_host}]"
+    if (scheme, port) in {("http", 80), ("https", 443)}:
+        port = None
+    normalized_port = f":{port}" if port is not None else ""
+    normalized_userinfo = ""
+    if separator:
+        normalized_userinfo = (
+            normalize_percent_encoded_component(
+                userinfo,
+                ":!$&'()*+,;=-._~",
+            )
+            + "@"
+        )
+    return f"{normalized_userinfo}{normalized_host}{normalized_port}"
+
+
+def normalize_mailto_path(path: str) -> str:
+    recipients = path.split(",")
+    normalized_recipients: list[str] = []
+    for recipient in recipients:
+        local_part, separator, domain = recipient.rpartition("@")
+        if not local_part or not separator or not domain:
+            return normalize_percent_encoded_component(
+                path,
+                "@!$&'()*+,;=:-._~",
+            )
+        try:
+            decoded_domain = unquote(
+                domain,
+                encoding="utf-8",
+                errors="strict",
+            )
+        except UnicodeDecodeError:
+            return normalize_percent_encoded_component(
+                path,
+                "@!$&'()*+,;=:-._~",
+            )
+        normalized_domain = normalize_dns_hostname(decoded_domain)
+        if normalized_domain is None:
+            return normalize_percent_encoded_component(
+                path,
+                "@!$&'()*+,;=:-._~",
+            )
+        normalized_local = normalize_percent_encoded_component(
+            local_part,
+            "!$&'()*+;=:-._~",
+        )
+        normalized_recipients.append(
+            f"{normalized_local}@{normalized_domain}"
+        )
+    return ",".join(normalized_recipients)
+
+
 def normalize_notion_link_identity(raw_link: object) -> str:
     link = str(raw_link or "")
     if not link:
@@ -1362,13 +1472,15 @@ def normalize_notion_link_identity(raw_link: object) -> str:
         return link
     scheme = parsed.scheme.lower()
     if scheme in {"http", "https"} and parsed.netloc:
-        netloc = parsed.netloc
+        netloc = normalize_http_netloc(parsed, scheme)
+        if netloc is None:
+            return link
         path = parsed.path or "/"
         path_safe = "/:@!$&'()*+,;=-._~"
     elif scheme == "mailto" and not parsed.netloc and parsed.path:
         netloc = ""
-        path = parsed.path
-        path_safe = "@!$&'()*+,;=:-._~"
+        path = normalize_mailto_path(parsed.path)
+        path_safe = "%@!$&'()*+,;=:-._~"
     else:
         return link
     try:
@@ -1458,6 +1570,8 @@ def media_signature(
             if isinstance(external, dict)
             else ""
         )
+        if normalize_links:
+            identity = normalize_notion_link_identity(identity)
         normalized_type = "external"
     elif media_type in {"file", "file_upload"}:
         identity = ""
@@ -1522,7 +1636,12 @@ def block_content_signature(
             normalize_links=normalize_links,
         )
     elif block_type in {"embed", "bookmark"}:
-        signature["url"] = str(payload.get("url") or "")
+        url = str(payload.get("url") or "")
+        signature["url"] = (
+            normalize_notion_link_identity(url)
+            if normalize_links
+            else url
+        )
         signature["caption"] = rich_text_signature(
             payload.get("caption"),
             normalize_links=normalize_links,
@@ -2630,7 +2749,7 @@ def canonical_property_value(value: JsonObject) -> object:
     if "number" in value:
         return value.get("number")
     if "url" in value:
-        return str(value.get("url") or "")
+        return normalize_notion_link_identity(value.get("url"))
     if "files" in value:
         normalized: list[tuple[str, str, str]] = []
         for entry in value.get("files") or []:
@@ -2639,6 +2758,8 @@ def canonical_property_value(value: JsonObject) -> object:
             identity = ""
             if isinstance(payload, dict):
                 identity = str(payload.get("url") or payload.get("id") or "")
+            if entry_type == "external":
+                identity = normalize_notion_link_identity(identity)
             normalized.append(
                 (str(entry.get("name") or ""), entry_type, identity)
             )
