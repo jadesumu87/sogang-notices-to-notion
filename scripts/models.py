@@ -185,6 +185,9 @@ class SyncCounters:
     external_download_retry_after: Optional[str] = None
     external_download_retry_after_seconds: Optional[float] = None
     external_download_elapsed_seconds: float = 0.0
+    external_download_host_circuits: dict[str, str] = field(
+        default_factory=dict
+    )
     pending_seen: int = 0
     pending_recovered: int = 0
     quarantined_source_ids: list[str] = field(default_factory=list)

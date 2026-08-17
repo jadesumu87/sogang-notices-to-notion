@@ -478,6 +478,9 @@ class RunStateTests(unittest.TestCase):
             external_download_retry_after="45",
             external_download_retry_after_seconds=45.0,
             external_download_elapsed_seconds=1.25,
+            external_download_host_circuits={
+                "scc.sogang.ac.kr": "http_502"
+            },
         )
 
         run_state.append_run_record(state, record, counters)
@@ -496,6 +499,10 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(
             metrics["external_download_retry_after_seconds"],
             45.0,
+        )
+        self.assertEqual(
+            metrics["external_download_host_circuits"],
+            {"scc.sogang.ac.kr": "http_502"},
         )
 
     def test_new_source_reconciles_even_with_recent_global_watermark(self):

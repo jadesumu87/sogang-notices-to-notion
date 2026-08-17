@@ -902,6 +902,45 @@ class BodyMediaContentIdentityTests(unittest.TestCase):
                     [self.block]
                 )
 
+    def test_host_circuit_defers_body_media_without_stopping_preflight(
+        self,
+    ) -> None:
+        unavailable: list[tuple[str, str]] = []
+        with (
+            notion_client.external_download_run_scope(
+                force_new=True
+            ) as policy,
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ),
+        ):
+            policy.open_host_circuit(self.new_url, "http_502")
+            state = notion_client.collect_body_media_content_state(
+                [self.block],
+                unavailable_media=unavailable,
+            )
+            snapshot = policy.snapshot()
+
+        self.assertEqual(state, [])
+        self.assertEqual(
+            unavailable,
+            [
+                (
+                    "image",
+                    utils.normalize_attachment_identity_url(
+                        self.new_url
+                    ),
+                )
+            ],
+        )
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(
+            snapshot["host_circuits"],
+            {"www.sogang.ac.kr": "http_502"},
+        )
+
     def test_changed_body_bytes_create_new_upload_and_hash(self) -> None:
         with (
             patch.object(

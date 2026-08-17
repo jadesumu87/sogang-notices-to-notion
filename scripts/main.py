@@ -1254,13 +1254,14 @@ def main() -> None:
                 if counters is not None:
                     LOGGER.info(
                         "동기화 완료: 생성=%s, 속성=%s, 본문=%s, TOP해제=%s, "
-                        "무변경=%s, 미디어보류=%s, 전체쓰기=%s",
+                        "무변경=%s, 미디어보류=%s, 호스트보류=%s, 전체쓰기=%s",
                         counters.created,
                         counters.property_updates,
                         counters.body_updates,
                         counters.top_disabled,
                         counters.unchanged,
                         counters.media_deferred,
+                        len(counters.external_download_host_circuits),
                         counters.writes,
                     )
             if deferred_error is not None and deferred_incident is not None:

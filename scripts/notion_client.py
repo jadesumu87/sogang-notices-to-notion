@@ -5,6 +5,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import struct
 import sys
 import threading
@@ -90,6 +91,22 @@ EXTERNAL_DOWNLOAD_MAX_SECONDS = 600.0
 EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 EXTERNAL_DOWNLOAD_MAX_CONNECT_ADDRESSES = 8
 EXTERNAL_PREFLIGHT_CACHE_MAX_BYTES = 128 * 1024 * 1024
+TRANSIENT_NETWORK_ERRNOS = frozenset(
+    value
+    for name in (
+        "ECONNABORTED",
+        "ECONNREFUSED",
+        "ECONNRESET",
+        "EHOSTDOWN",
+        "EHOSTUNREACH",
+        "ENETDOWN",
+        "ENETRESET",
+        "ENETUNREACH",
+        "EPIPE",
+        "ETIMEDOUT",
+    )
+    if isinstance((value := getattr(errno, name, None)), int)
+)
 IMAGE_MAX_PIXELS = 40_000_000
 IMAGE_MAX_DIMENSION = 16_384
 ZIP_MAX_ENTRIES = 10_000
@@ -538,6 +555,10 @@ class ExternalDownloadRunStoppedError(RuntimeError):
     pass
 
 
+class ExternalDownloadHostCircuitOpenError(RuntimeError):
+    pass
+
+
 class ExternalDownloadRunPolicy:
     def __init__(self) -> None:
         self.max_requests = self._integer_env(
@@ -568,6 +589,7 @@ class ExternalDownloadRunPolicy:
         self.status_code: Optional[int] = None
         self.retry_after: Optional[str] = None
         self.retry_after_seconds: Optional[float] = None
+        self.host_circuits: dict[str, str] = {}
         self.next_request_at_by_host: dict[str, float] = {}
         self.active_seconds = 0.0
         self.active_started_at: Optional[float] = None
@@ -661,7 +683,6 @@ class ExternalDownloadRunPolicy:
                 return False
             remaining = self.max_seconds - self._elapsed_seconds(now)
             if delay >= remaining:
-                self.stopped_reason = "time_cap"
                 return False
         sleep_with_run_control(delay)
         return self.can_continue()
@@ -711,6 +732,26 @@ class ExternalDownloadRunPolicy:
             )
             self.stopped_reason = f"http_{status_code}"
 
+    def open_host_circuit(self, url: str, reason: str) -> bool:
+        host = (urlsplit(url).hostname or "").lower()
+        normalized_reason = (
+            str(reason or "").strip() or "transient_failure"
+        )
+        if not host:
+            return False
+        with self._lock:
+            if host in self.host_circuits:
+                return False
+            self.host_circuits[host] = normalized_reason[:80]
+            return True
+
+    def host_circuit_reason(self, url: str) -> str:
+        host = (urlsplit(url).hostname or "").lower()
+        if not host:
+            return ""
+        with self._lock:
+            return self.host_circuits.get(host, "")
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             if not self.stopped_reason:
@@ -727,6 +768,7 @@ class ExternalDownloadRunPolicy:
                 "retry_after": self.retry_after,
                 "retry_after_seconds": self.retry_after_seconds,
                 "elapsed_seconds": self._elapsed_seconds(),
+                "host_circuits": dict(sorted(self.host_circuits.items())),
             }
 
 
@@ -862,6 +904,11 @@ class ValidatedExternalRedirectHandler(urllib.request.HTTPRedirectHandler):
         if not is_safe_external_download_target(newurl):
             fp.close()
             raise UnsafeExternalDownloadError(newurl)
+        if policy is not None and policy.host_circuit_reason(newurl):
+            fp.close()
+            raise ExternalDownloadHostCircuitOpenError(
+                "external_host_circuit_open"
+            )
         redirected = super().redirect_request(
             req,
             fp,
@@ -1070,6 +1117,112 @@ def raise_if_external_download_stopped() -> None:
         raise external_download_stopped_error(policy)
 
 
+def transient_external_transport_reason(exc: BaseException) -> str:
+    candidate: object = exc
+    if isinstance(exc, urllib.error.URLError):
+        candidate = exc.reason
+    if isinstance(candidate, (socket.timeout, TimeoutError)):
+        return "timeout"
+    if isinstance(candidate, http.client.RemoteDisconnected):
+        return "remote_disconnected"
+    if isinstance(candidate, socket.gaierror):
+        return "dns_error"
+    if isinstance(candidate, ConnectionError):
+        return "connection_error"
+    if isinstance(
+        candidate,
+        (
+            http.client.HTTPException,
+            ssl.SSLEOFError,
+            ssl.SSLZeroReturnError,
+            ssl.SSLWantReadError,
+            ssl.SSLWantWriteError,
+        ),
+    ):
+        return "protocol_error"
+    if (
+        isinstance(candidate, OSError)
+        and candidate.errno in TRANSIENT_NETWORK_ERRNOS
+    ):
+        return "network_error"
+    return ""
+
+
+def external_failure_circuit_url(
+    request_url: str,
+    failure_url: object,
+) -> str:
+    candidate = (
+        str(failure_url).strip()
+        if isinstance(failure_url, str)
+        else ""
+    )
+    try:
+        parsed = urlsplit(candidate)
+        valid_port = parsed.port in {None, 443}
+    except ValueError:
+        valid_port = False
+        parsed = None
+    if (
+        parsed is not None
+        and parsed.scheme == "https"
+        and valid_port
+        and is_allowed_external_download_url(candidate)
+    ):
+        return candidate
+    return request_url
+
+
+def open_external_host_circuit(
+    policy: ExternalDownloadRunPolicy,
+    url: str,
+    reason: str,
+) -> None:
+    if not policy.open_host_circuit(url, reason):
+        return
+    host = (urlsplit(url).hostname or "unknown").lower()
+    LOGGER.warning(
+        "외부 파일 다운로드 호스트 보류: %s (사유=%s)",
+        host,
+        reason,
+    )
+
+
+def retry_external_download_failure(
+    policy: ExternalDownloadRunPolicy,
+    url: str,
+    attempt: int,
+    reason: str,
+    *,
+    retry_after: Optional[str] = None,
+    circuit_url: str = "",
+) -> bool:
+    failure_target = external_failure_circuit_url(
+        url,
+        circuit_url,
+    )
+    if attempt >= EXTERNAL_FETCH_MAX_RETRIES:
+        open_external_host_circuit(policy, failure_target, reason)
+        return False
+    sleep_s = get_external_retry_sleep_seconds(
+        attempt,
+        retry_after=retry_after,
+    )
+    LOGGER.info(
+        "외부 파일 다운로드 재시도(%s/%s): %s -> %s, 대기=%.1fs",
+        attempt + 1,
+        EXTERNAL_FETCH_MAX_RETRIES,
+        summarize_external_request_target(url),
+        reason,
+        sleep_s,
+    )
+    if policy.wait_for_retry(sleep_s):
+        return True
+    if policy.can_continue():
+        open_external_host_circuit(policy, failure_target, reason)
+    return False
+
+
 def download_file_bytes(
     url: str,
     require_file_hint: bool = False,
@@ -1102,6 +1255,14 @@ def _download_file_bytes_with_policy(
     if not is_allowed_external_download_url(url, require_file_hint=require_file_hint):
         LOGGER.warning("외부 파일 다운로드 차단: %s", request_target)
         return None, None
+    host_circuit_reason = policy.host_circuit_reason(url)
+    if host_circuit_reason:
+        LOGGER.info(
+            "외부 파일 다운로드 호스트 보류로 건너뜀: %s (사유=%s)",
+            request_target,
+            host_circuit_reason,
+        )
+        return None, None
     for attempt in range(EXTERNAL_FETCH_MAX_RETRIES + 1):
         check_run_control()
         if not policy.can_continue():
@@ -1115,8 +1276,15 @@ def _download_file_bytes_with_policy(
         if not policy.reserve_request(url):
             return None, None
         req = urllib.request.Request(url, headers=build_site_headers())
+        attempt_target = url
+
+        def remember_redirect(newurl: str) -> bool:
+            nonlocal attempt_target
+            attempt_target = newurl
+            return True
+
         try:
-            opener = build_external_download_opener()
+            opener = build_external_download_opener(remember_redirect)
             timeout_seconds = min(30.0, policy.remaining_seconds())
             if timeout_seconds <= 0:
                 return None, None
@@ -1148,6 +1316,8 @@ def _download_file_bytes_with_policy(
         except UnsafeExternalDownloadError:
             LOGGER.warning("외부 파일 리다이렉트 차단: %s", request_target)
             return None, None
+        except ExternalDownloadHostCircuitOpenError:
+            return None, None
         except ExternalDownloadRunStoppedError:
             return None, None
         except urllib.error.HTTPError as exc:
@@ -1166,69 +1336,66 @@ def _download_file_bytes_with_policy(
                     policy.retry_after or "-",
                 )
                 return None, None
-            if is_retryable_http_status(exc.code) and attempt < EXTERNAL_FETCH_MAX_RETRIES:
-                sleep_s = get_external_retry_sleep_seconds(
+            if is_retryable_http_status(exc.code):
+                if retry_external_download_failure(
+                    policy,
+                    url,
                     attempt,
+                    f"http_{exc.code}",
                     retry_after=retry_after,
-                )
-                LOGGER.info(
-                    "외부 파일 다운로드 재시도(%s/%s): %s -> HTTP %s, 대기=%.1fs",
-                    attempt + 1,
-                    EXTERNAL_FETCH_MAX_RETRIES,
-                    request_target,
-                    exc.code,
-                    sleep_s,
-                )
-                if not policy.wait_for_retry(sleep_s):
-                    return None, None
-                continue
+                    circuit_url=exc.geturl(),
+                ):
+                    continue
+                return None, None
             LOGGER.info(
                 "파일 다운로드 실패: %s (HTTP %s)",
                 request_target,
                 exc.code,
             )
+            return None, None
         except urllib.error.URLError as exc:
-            is_timeout = isinstance(exc.reason, socket.timeout)
-            if attempt < EXTERNAL_FETCH_MAX_RETRIES and is_timeout:
-                sleep_s = get_external_retry_sleep_seconds(attempt)
-                LOGGER.info(
-                    "외부 파일 다운로드 재시도(%s/%s): %s -> 타임아웃, 대기=%.1fs",
-                    attempt + 1,
-                    EXTERNAL_FETCH_MAX_RETRIES,
-                    request_target,
-                    sleep_s,
-                )
-                if not policy.wait_for_retry(sleep_s):
-                    return None, None
-                continue
-            if is_timeout:
-                LOGGER.info(
-                    "파일 다운로드 실패: %s (타임아웃)",
-                    request_target,
-                )
-            else:
+            reason = transient_external_transport_reason(exc)
+            if reason:
+                if retry_external_download_failure(
+                    policy,
+                    url,
+                    attempt,
+                    reason,
+                    circuit_url=attempt_target,
+                ):
+                    continue
+                return None, None
+            LOGGER.info(
+                "파일 다운로드 실패: %s (%s)",
+                request_target,
+                exc.reason,
+            )
+            return None, None
+        except (
+            socket.timeout,
+            ConnectionError,
+            http.client.HTTPException,
+            OSError,
+            ssl.SSLEOFError,
+            ssl.SSLZeroReturnError,
+        ) as exc:
+            reason = transient_external_transport_reason(exc)
+            if not reason:
                 LOGGER.info(
                     "파일 다운로드 실패: %s (%s)",
                     request_target,
-                    exc.reason,
+                    type(exc).__name__,
                 )
-        except socket.timeout:
-            if attempt < EXTERNAL_FETCH_MAX_RETRIES:
-                sleep_s = get_external_retry_sleep_seconds(attempt)
-                LOGGER.info(
-                    "외부 파일 다운로드 재시도(%s/%s): %s -> 타임아웃, 대기=%.1fs",
-                    attempt + 1,
-                    EXTERNAL_FETCH_MAX_RETRIES,
-                    request_target,
-                    sleep_s,
-                )
-                if not policy.wait_for_retry(sleep_s):
-                    return None, None
+                return None, None
+            if retry_external_download_failure(
+                policy,
+                url,
+                attempt,
+                reason,
+                circuit_url=attempt_target,
+            ):
                 continue
-            LOGGER.info(
-                "파일 다운로드 실패: %s (타임아웃)",
-                request_target,
-            )
+            return None, None
     return None, None
 
 

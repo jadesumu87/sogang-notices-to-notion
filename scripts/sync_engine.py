@@ -2783,6 +2783,15 @@ def apply_report(
     counters.external_download_elapsed_seconds = float(
         snapshot["elapsed_seconds"]
     )
+    host_circuits = snapshot["host_circuits"]
+    counters.external_download_host_circuits = (
+        {
+            str(host): str(reason)
+            for host, reason in host_circuits.items()
+        }
+        if isinstance(host_circuits, dict)
+        else {}
+    )
     return counters
 
 

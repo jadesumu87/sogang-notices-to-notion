@@ -1,7 +1,11 @@
+import errno
+import http.client
 import os
 import socket
+import ssl
 import sys
 import unittest
+import urllib.error
 import urllib.request
 import urllib.response
 from email.message import Message
@@ -35,7 +39,10 @@ class FakeHttpsHandler(urllib.request.HTTPSHandler):
 
     def https_open(self, req):
         self.requested_urls.append(req.full_url)
-        status, raw_headers, payload = self.routes[req.full_url]
+        route = self.routes[req.full_url]
+        if isinstance(route, BaseException):
+            raise route
+        status, raw_headers, payload = route
         headers = Message()
         for name, value in raw_headers.items():
             headers[name] = value
@@ -381,6 +388,49 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
         self.assertEqual(result, (payload, "image/png"))
         self.assertEqual(transport.requested_urls, [source_url, target_url])
 
+    def test_redirect_to_deferred_host_is_skipped_without_request(self):
+        source_url = "https://www.sogang.ac.kr/file-fe-prd/board/image.png"
+        target_url = "https://cdn.sogang.ac.kr/file-fe-prd/board/image.png"
+        transport = FakeHttpsHandler(
+            {
+                source_url: (
+                    302,
+                    {"Location": target_url, "Content-Type": "text/html"},
+                    b"",
+                ),
+                target_url: (
+                    200,
+                    {"Content-Type": "image/png"},
+                    b"unexpected",
+                ),
+            }
+        )
+        opener = urllib.request.build_opener(
+            transport,
+            notion_client.ValidatedExternalRedirectHandler(),
+        )
+        with (
+            patch.object(utils.socket, "getaddrinfo", side_effect=public_dns),
+            patch.object(
+                notion_client,
+                "build_external_download_opener",
+                return_value=opener,
+            ),
+        ):
+            with notion_client.external_download_run_scope() as policy:
+                policy.open_host_circuit(target_url, "http_502")
+                result = notion_client.download_file_bytes(source_url)
+                snapshot = policy.snapshot()
+
+        self.assertEqual(result, (None, None))
+        self.assertEqual(transport.requested_urls, [source_url])
+        self.assertEqual(snapshot["requests"], 1)
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(
+            snapshot["host_circuits"],
+            {"cdn.sogang.ac.kr": "http_502"},
+        )
+
     def test_redirect_hop_consumes_the_same_run_request_budget(self):
         source_url = (
             "https://www.sogang.ac.kr/file-fe-prd/board/image.png"
@@ -625,6 +675,406 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
         self.assertEqual(len(opener.open_calls), 3)
         self.assertEqual(snapshot["requests"], 3)
 
+    def test_remote_disconnect_is_retried_and_recovers(self):
+        clock = FakeClock()
+        payload = b"recovered"
+        response = TrackingResponse(
+            payload,
+            {
+                "Content-Type": "application/pdf",
+                "Content-Length": str(len(payload)),
+            },
+        )
+        opener = QueueOpener(
+            [
+                http.client.RemoteDisconnected(
+                    "Remote end closed connection without response"
+                ),
+                response,
+            ]
+        )
+        url = "https://scc.sogang.ac.kr/Download3?file=notice.pdf"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS": "0.1",
+                    "EXTERNAL_DOWNLOAD_MAX_REQUESTS": "10",
+                    "EXTERNAL_DOWNLOAD_MAX_SECONDS": "30",
+                },
+            ),
+            patch.object(utils.socket, "getaddrinfo", side_effect=public_dns),
+            patch.object(
+                notion_client,
+                "build_external_download_opener",
+                return_value=opener,
+            ),
+            patch.object(
+                notion_client.time,
+                "monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch.object(
+                notion_client,
+                "sleep_with_run_control",
+                side_effect=clock.sleep,
+            ),
+        ):
+            with notion_client.external_download_run_scope() as policy:
+                result = notion_client.download_file_bytes(
+                    url,
+                    require_file_hint=True,
+                )
+                snapshot = policy.snapshot()
+
+        self.assertEqual(result, (payload, "application/pdf"))
+        self.assertEqual(len(opener.open_calls), 2)
+        self.assertEqual(clock.sleeps, [1.0])
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(snapshot["host_circuits"], {})
+
+    def test_transient_os_network_error_is_retried_and_recovers(self):
+        clock = FakeClock()
+        payload = b"recovered"
+        response = TrackingResponse(
+            payload,
+            {
+                "Content-Type": "application/pdf",
+                "Content-Length": str(len(payload)),
+            },
+        )
+        opener = QueueOpener(
+            [
+                OSError(errno.ENETUNREACH, "network unreachable"),
+                response,
+            ]
+        )
+        url = "https://scc.sogang.ac.kr/Download3?file=notice.pdf"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS": "0.1",
+                    "EXTERNAL_DOWNLOAD_MAX_REQUESTS": "10",
+                    "EXTERNAL_DOWNLOAD_MAX_SECONDS": "30",
+                },
+            ),
+            patch.object(utils.socket, "getaddrinfo", side_effect=public_dns),
+            patch.object(
+                notion_client,
+                "build_external_download_opener",
+                return_value=opener,
+            ),
+            patch.object(
+                notion_client.time,
+                "monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch.object(
+                notion_client,
+                "sleep_with_run_control",
+                side_effect=clock.sleep,
+            ),
+        ):
+            with notion_client.external_download_run_scope() as policy:
+                result = notion_client.download_file_bytes(
+                    url,
+                    require_file_hint=True,
+                )
+                snapshot = policy.snapshot()
+
+        self.assertEqual(result, (payload, "application/pdf"))
+        self.assertEqual(len(opener.open_calls), 2)
+        self.assertEqual(clock.sleeps, [1.0])
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(snapshot["host_circuits"], {})
+
+    def test_transient_transport_failures_are_classified(self):
+        cases = (
+            (
+                urllib.error.URLError(
+                    ConnectionResetError("connection reset")
+                ),
+                "connection_error",
+            ),
+            (http.client.IncompleteRead(b"partial"), "protocol_error"),
+            (socket.gaierror("temporary dns failure"), "dns_error"),
+            (ssl.SSLEOFError(8, "unexpected eof"), "protocol_error"),
+            (
+                OSError(errno.ENETUNREACH, "network unreachable"),
+                "network_error",
+            ),
+        )
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__):
+                self.assertEqual(
+                    notion_client.transient_external_transport_reason(
+                        error
+                    ),
+                    expected,
+                )
+        self.assertEqual(
+            notion_client.transient_external_transport_reason(
+                ssl.SSLCertVerificationError(
+                    1,
+                    "certificate verify failed",
+                )
+            ),
+            "",
+        )
+
+    def test_redirect_target_502_opens_only_target_host_circuit(self):
+        clock = FakeClock()
+        source_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/source.pdf"
+        )
+        failed_url = (
+            "https://scc.sogang.ac.kr/Download3?file=failed.pdf"
+        )
+        payload = b"healthy"
+        opener = QueueOpener(
+            [
+                *[self.http_error(failed_url, 502) for _ in range(4)],
+                TrackingResponse(
+                    payload,
+                    {
+                        "Content-Type": "application/pdf",
+                        "Content-Length": str(len(payload)),
+                    },
+                ),
+            ]
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS": "0.1",
+                    "EXTERNAL_DOWNLOAD_MAX_REQUESTS": "10",
+                    "EXTERNAL_DOWNLOAD_MAX_SECONDS": "30",
+                },
+            ),
+            patch.object(utils.socket, "getaddrinfo", side_effect=public_dns),
+            patch.object(
+                notion_client,
+                "build_external_download_opener",
+                return_value=opener,
+            ),
+            patch.object(
+                notion_client.time,
+                "monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch.object(
+                notion_client,
+                "sleep_with_run_control",
+                side_effect=clock.sleep,
+            ),
+        ):
+            with notion_client.external_download_run_scope() as policy:
+                failed = notion_client.download_file_bytes(source_url)
+                skipped = notion_client.download_file_bytes(failed_url)
+                healthy = notion_client.download_file_bytes(source_url)
+                snapshot = policy.snapshot()
+
+        self.assertEqual(failed, (None, None))
+        self.assertEqual(skipped, (None, None))
+        self.assertEqual(healthy, (payload, "application/pdf"))
+        self.assertEqual(len(opener.open_calls), 5)
+        self.assertEqual(clock.sleeps[:3], [1.0, 2.0, 4.0])
+        self.assertEqual(len(clock.sleeps), 4)
+        self.assertAlmostEqual(clock.sleeps[3], 0.1)
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(
+            snapshot["host_circuits"],
+            {"scc.sogang.ac.kr": "http_502"},
+        )
+
+    def test_redirect_target_disconnect_opens_target_host_circuit(self):
+        clock = FakeClock()
+        source_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/source.pdf"
+        )
+        failed_url = (
+            "https://scc.sogang.ac.kr/Download3?file=failed.pdf"
+        )
+        transport = FakeHttpsHandler(
+            {
+                source_url: (
+                    302,
+                    {"Location": failed_url, "Content-Type": "text/html"},
+                    b"",
+                ),
+                failed_url: http.client.RemoteDisconnected(
+                    "Remote end closed connection without response"
+                ),
+            }
+        )
+
+        def build_opener(before_redirect=None):
+            return urllib.request.build_opener(
+                transport,
+                notion_client.ValidatedExternalRedirectHandler(
+                    before_redirect
+                ),
+            )
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS": "0.1",
+                    "EXTERNAL_DOWNLOAD_MAX_REQUESTS": "20",
+                    "EXTERNAL_DOWNLOAD_MAX_SECONDS": "30",
+                },
+            ),
+            patch.object(utils.socket, "getaddrinfo", side_effect=public_dns),
+            patch.object(
+                notion_client,
+                "build_external_download_opener",
+                side_effect=build_opener,
+            ),
+            patch.object(
+                notion_client.time,
+                "monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch.object(
+                notion_client,
+                "sleep_with_run_control",
+                side_effect=clock.sleep,
+            ),
+        ):
+            with notion_client.external_download_run_scope() as policy:
+                first = notion_client.download_file_bytes(source_url)
+                second = notion_client.download_file_bytes(source_url)
+                snapshot = policy.snapshot()
+
+        self.assertEqual(first, (None, None))
+        self.assertEqual(second, (None, None))
+        self.assertEqual(transport.requested_urls.count(source_url), 5)
+        self.assertEqual(transport.requested_urls.count(failed_url), 4)
+        self.assertEqual(snapshot["requests"], 9)
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(
+            snapshot["host_circuits"],
+            {"scc.sogang.ac.kr": "remote_disconnected"},
+        )
+
+    def test_blank_host_circuit_reason_uses_safe_default(self):
+        url = "https://scc.sogang.ac.kr/Download3?file=notice.pdf"
+        policy = notion_client.ExternalDownloadRunPolicy()
+
+        self.assertTrue(policy.open_host_circuit(url, "   "))
+        self.assertEqual(
+            policy.host_circuit_reason(url),
+            "transient_failure",
+        )
+
+    def test_repeated_502_opens_only_failing_host_circuit(self):
+        clock = FakeClock()
+        blocked_url = (
+            "https://scc.sogang.ac.kr/Download3?file=blocked.pdf"
+        )
+        skipped_url = (
+            "https://scc.sogang.ac.kr/Download3?file=skipped.pdf"
+        )
+        healthy_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/healthy.pdf"
+        )
+        payload = b"healthy"
+        opener = QueueOpener(
+            [
+                *[self.http_error(blocked_url, 502) for _ in range(4)],
+                TrackingResponse(
+                    payload,
+                    {
+                        "Content-Type": "application/pdf",
+                        "Content-Length": str(len(payload)),
+                    },
+                ),
+            ]
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS": "0.1",
+                    "EXTERNAL_DOWNLOAD_MAX_REQUESTS": "10",
+                    "EXTERNAL_DOWNLOAD_MAX_SECONDS": "30",
+                },
+            ),
+            patch.object(utils.socket, "getaddrinfo", side_effect=public_dns),
+            patch.object(
+                notion_client,
+                "build_external_download_opener",
+                return_value=opener,
+            ),
+            patch.object(
+                notion_client.time,
+                "monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch.object(
+                notion_client,
+                "sleep_with_run_control",
+                side_effect=clock.sleep,
+            ),
+        ):
+            with notion_client.external_download_run_scope() as policy:
+                blocked = notion_client.download_file_bytes(blocked_url)
+                skipped = notion_client.download_file_bytes(skipped_url)
+                healthy = notion_client.download_file_bytes(healthy_url)
+                snapshot = policy.snapshot()
+
+        self.assertEqual(blocked, (None, None))
+        self.assertEqual(skipped, (None, None))
+        self.assertEqual(healthy, (payload, "application/pdf"))
+        self.assertEqual(len(opener.open_calls), 5)
+        self.assertEqual(clock.sleeps, [1.0, 2.0, 4.0])
+        self.assertEqual(snapshot["requests"], 5)
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(
+            snapshot["host_circuits"],
+            {"scc.sogang.ac.kr": "http_502"},
+        )
+
+    def test_non_retryable_failure_is_not_repeated(self):
+        url = "https://www.sogang.ac.kr/file-fe-prd/board/missing.pdf"
+        for error in (
+            self.http_error(url, 404),
+            urllib.error.URLError("permanent failure"),
+            urllib.error.URLError(
+                ssl.SSLCertVerificationError(
+                    1,
+                    "certificate verify failed",
+                )
+            ),
+        ):
+            with self.subTest(error=type(error).__name__):
+                opener = QueueOpener([error])
+                with (
+                    patch.object(
+                        utils.socket,
+                        "getaddrinfo",
+                        side_effect=public_dns,
+                    ),
+                    patch.object(
+                        notion_client,
+                        "build_external_download_opener",
+                        return_value=opener,
+                    ),
+                ):
+                    with (
+                        notion_client.external_download_run_scope()
+                    ) as policy:
+                        result = notion_client.download_file_bytes(url)
+                        snapshot = policy.snapshot()
+
+                self.assertEqual(result, (None, None))
+                self.assertEqual(len(opener.open_calls), 1)
+                self.assertEqual(snapshot["stopped_reason"], "")
+                self.assertEqual(snapshot["host_circuits"], {})
+
     def test_first_403_or_429_opens_circuit_without_another_request(self):
         first_url = (
             "https://www.sogang.ac.kr/file-fe-prd/board/blocked.png"
@@ -856,7 +1306,7 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
         self.assertIn("활성 시간 차단", joined)
         self.assertNotIn("용량 차단", joined)
 
-    def test_retry_after_longer_than_download_budget_stops_without_sleep(self):
+    def test_retry_after_longer_than_budget_defers_only_affected_host(self):
         url = "https://www.sogang.ac.kr/file-fe-prd/board/file.png"
         opener = QueueOpener(
             [self.http_error(url, 503, retry_after="30")]
@@ -896,7 +1346,11 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
         self.assertEqual(len(opener.open_calls), 1)
         self.assertEqual(clock.sleeps, [])
         self.assertEqual(snapshot["requests"], 1)
-        self.assertEqual(snapshot["stopped_reason"], "time_cap")
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(
+            snapshot["host_circuits"],
+            {"www.sogang.ac.kr": "http_503"},
+        )
 
     def test_apply_report_transfers_circuit_and_resets_next_run(self):
         policies = []
@@ -907,6 +1361,10 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
             policies.append(policy)
             if len(policies) == 1:
                 policy.open_circuit(429, "45")
+                policy.open_host_circuit(
+                    "https://scc.sogang.ac.kr/Download3",
+                    "http_502",
+                )
             return SyncCounters()
 
         with patch.object(
@@ -947,9 +1405,14 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
             first.external_download_stopped_reason,
             "http_429",
         )
+        self.assertEqual(
+            first.external_download_host_circuits,
+            {"scc.sogang.ac.kr": "http_502"},
+        )
         self.assertIsNone(second.external_download_status_code)
         self.assertIsNone(second.external_download_retry_after)
         self.assertEqual(second.external_download_stopped_reason, "")
+        self.assertEqual(second.external_download_host_circuits, {})
         self.assertIsNone(
             notion_client.current_external_download_run_policy()
         )
