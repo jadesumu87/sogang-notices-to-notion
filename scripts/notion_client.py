@@ -1055,11 +1055,12 @@ class ValidatedExternalHTTPSHandler(urllib.request.HTTPSHandler):
 
 def build_external_download_opener(
     before_redirect: Optional[Callable[[str], bool]] = None,
+    ssl_context: Optional[ssl.SSLContext] = None,
 ) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         ValidatedExternalRedirectHandler(before_redirect),
-        ValidatedExternalHTTPSHandler(),
+        ValidatedExternalHTTPSHandler(context=ssl_context),
     )
 
 

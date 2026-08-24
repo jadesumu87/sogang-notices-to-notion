@@ -12,7 +12,7 @@
 
 ### 2. 공지 수집과 검증
 
-`crawler.py`가 게시판별 목록과 상세 공지를 수집한다. 서강대학교 API를 우선 사용하고 필요한 경우 HTML/HTTP 조회나 Playwright 브라우저 수집으로 보완한다.
+`crawler.py`가 게시판별 목록과 상세 공지를 수집한다. 서강대학교 API를 우선 사용하고 필요한 경우 HTML/HTTP 조회나 Playwright 브라우저 수집으로 보완한다. `certificates/`의 공개 중간 인증서는 출처 서버가 해당 체인을 누락했을 때만 기본 운영체제 TLS 신뢰 저장소를 보완하며, 고정된 DER 해시와 호스트 범위를 통과해야 한다.
 
 `bbs_parser.py`는 목록 행, 상세 본문, 작성일과 첨부파일을 해석한다. `common.py`와 `utils.py`는 URL, 공지 ID, 날짜, 파일명과 본문 블록을 공통 형식으로 변환한다.
 
@@ -44,6 +44,7 @@
 | 파일 | 역할 |
 | --- | --- |
 | `main.py` | 전체 실행과 드라이런·실제 적용 분기 |
+| `certificates/` | 해시로 고정한 출처 TLS 중간 인증서와 검증 정보 |
 | `models.py` | 수집·검증·동기화 공통 자료형 |
 | `settings.py` | 환경 변수, 게시판과 Notion 설정 |
 | `crawler.py` | API·HTTP·Playwright 수집과 첨부파일 점검 |

@@ -201,12 +201,13 @@ class CrawlerContractTests(unittest.TestCase):
         clock = FakeClock()
         holder = {}
 
-        def build_opener(before_redirect=None):
+        def build_opener(before_redirect=None, ssl_context=None):
             opener = RedirectingOpener(
                 before_redirect,
                 target_url,
                 FakeResponse(b"ok", content_type="text/plain"),
             )
+            self.assertIsNotNone(ssl_context)
             holder["opener"] = opener
             return opener
 
@@ -259,12 +260,13 @@ class CrawlerContractTests(unittest.TestCase):
         target_url = "https://www.sogang.ac.kr/api/target"
         holder = {}
 
-        def build_opener(before_redirect=None):
+        def build_opener(before_redirect=None, ssl_context=None):
             opener = RedirectingOpener(
                 before_redirect,
                 target_url,
                 FakeResponse(b"unexpected"),
             )
+            self.assertIsNotNone(ssl_context)
             holder["opener"] = opener
             return opener
 
