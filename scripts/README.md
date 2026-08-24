@@ -45,6 +45,7 @@
 | --- | --- |
 | `main.py` | 전체 실행과 드라이런·실제 적용 분기 |
 | `certificates/` | 해시로 고정한 출처 TLS 중간 인증서와 검증 정보 |
+| `source_tls.py` | API·본문 미디어·첨부파일 요청의 출처별 TLS 체인 보완 |
 | `models.py` | 수집·검증·동기화 공통 자료형 |
 | `settings.py` | 환경 변수, 게시판과 Notion 설정 |
 | `crawler.py` | API·HTTP·Playwright 수집과 첨부파일 점검 |

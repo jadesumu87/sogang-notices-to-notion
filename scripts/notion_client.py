@@ -27,6 +27,7 @@ from urllib.parse import quote, urlencode, urlsplit
 
 from log import LOGGER, summarize_url_for_log
 from run_control import check_run_control, sleep_with_run_control
+import source_tls
 from settings import (
     ATTACHMENT_PROPERTY,
     ATTACHMENT_STATE_PROPERTY,
@@ -1046,10 +1047,13 @@ class ValidatedExternalHTTPSConnection(http.client.HTTPSConnection):
 
 class ValidatedExternalHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req: urllib.request.Request) -> Any:
+        context = source_tls.source_ssl_context_for_url(req.full_url)
+        if context is None:
+            context = getattr(self, "_context")
         return self.do_open(
             ValidatedExternalHTTPSConnection,
             req,
-            context=getattr(self, "_context"),
+            context=context,
         )
 
 

@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import crawler
 import notion_client
+import source_tls
 from models import FailureCategory
 
 
@@ -66,19 +67,19 @@ class FakeOpener:
 
 class SourceTLSContextTests(unittest.TestCase):
     def tearDown(self) -> None:
-        crawler.build_sogang_source_ssl_context.cache_clear()
+        source_tls.build_sogang_source_ssl_context.cache_clear()
 
     def test_pinned_intermediate_is_loaded_without_partial_chain_trust(
         self,
     ) -> None:
-        context = crawler.build_sogang_source_ssl_context()
+        context = source_tls.build_sogang_source_ssl_context()
 
         loaded_digests = {
             hashlib.sha256(certificate).hexdigest()
             for certificate in context.get_ca_certs(binary_form=True)
         }
         self.assertIn(
-            crawler.SOGANG_TLS_INTERMEDIATE_DER_SHA256,
+            source_tls.SOGANG_TLS_INTERMEDIATE_DER_SHA256,
             loaded_digests,
         )
         self.assertTrue(context.check_hostname)
@@ -96,7 +97,7 @@ class SourceTLSContextTests(unittest.TestCase):
             "https://WWW.SOGANG.AC.KR./ko/source",
         ):
             with self.subTest(url=url):
-                self.assertIsNotNone(crawler.source_ssl_context_for_url(url))
+                self.assertIsNotNone(source_tls.source_ssl_context_for_url(url))
 
         for url in (
             "http://www.sogang.ac.kr/ko/source",
@@ -107,7 +108,7 @@ class SourceTLSContextTests(unittest.TestCase):
             "https://[invalid/source",
         ):
             with self.subTest(url=url):
-                self.assertIsNone(crawler.source_ssl_context_for_url(url))
+                self.assertIsNone(source_tls.source_ssl_context_for_url(url))
 
     def test_tampered_bundle_fails_closed_before_network_access(
         self,
@@ -117,7 +118,7 @@ class SourceTLSContextTests(unittest.TestCase):
             invalid_path.write_text("not a certificate", encoding="ascii")
             with (
                 patch.object(
-                    crawler,
+                    source_tls,
                     "SOGANG_TLS_INTERMEDIATE_PATH",
                     invalid_path,
                 ),
@@ -131,7 +132,7 @@ class SourceTLSContextTests(unittest.TestCase):
                     "build_external_download_opener",
                 ) as build_opener,
             ):
-                crawler.build_sogang_source_ssl_context.cache_clear()
+                source_tls.build_sogang_source_ssl_context.cache_clear()
                 result = crawler.fetch_site_result(
                     "https://www.sogang.ac.kr/ko/source",
                     "source",
@@ -148,7 +149,7 @@ class SourceTLSContextTests(unittest.TestCase):
     ) -> None:
         with (
             patch.object(
-                crawler,
+                source_tls,
                 "SOGANG_TLS_INTERMEDIATE_DER_SHA256",
                 "0" * 64,
             ),
@@ -162,7 +163,7 @@ class SourceTLSContextTests(unittest.TestCase):
                 "build_external_download_opener",
             ) as build_opener,
         ):
-            crawler.build_sogang_source_ssl_context.cache_clear()
+            source_tls.build_sogang_source_ssl_context.cache_clear()
             result = crawler.fetch_site_result(
                 "https://www.sogang.ac.kr/ko/source",
                 "source",
@@ -213,7 +214,7 @@ class SourceTLSContextTests(unittest.TestCase):
         self.assertIsNotNone(captured["before_redirect"])
         self.assertIs(
             captured["ssl_context"],
-            crawler.build_sogang_source_ssl_context(),
+            source_tls.build_sogang_source_ssl_context(),
         )
 
     def test_unrelated_fetch_keeps_the_platform_default_context(
@@ -273,6 +274,83 @@ class SourceTLSContextTests(unittest.TestCase):
         )
 
         self.assertIs(handler._context, context)
+
+    def test_validated_handler_selects_the_context_for_every_request(
+        self,
+    ) -> None:
+        context = ssl.create_default_context()
+        handler = notion_client.ValidatedExternalHTTPSHandler()
+        request = urllib.request.Request(
+            "https://www.sogang.ac.kr/file-fe-prd/board/image.jpg"
+        )
+        with (
+            patch.object(
+                source_tls,
+                "source_ssl_context_for_url",
+                return_value=context,
+            ) as resolve_context,
+            patch.object(
+                handler,
+                "do_open",
+                return_value="response",
+            ) as do_open,
+        ):
+            response = handler.https_open(request)
+
+        self.assertEqual(response, "response")
+        resolve_context.assert_called_once_with(request.full_url)
+        self.assertIs(do_open.call_args.kwargs["context"], context)
+
+    def test_validated_handler_preserves_default_for_unrelated_hosts(
+        self,
+    ) -> None:
+        handler = notion_client.ValidatedExternalHTTPSHandler()
+        default_context = cast(
+            ssl.SSLContext,
+            getattr(handler, "_context"),
+        )
+        request = urllib.request.Request("https://example.com/image.jpg")
+        with (
+            patch.object(
+                source_tls,
+                "source_ssl_context_for_url",
+                return_value=None,
+            ) as resolve_context,
+            patch.object(
+                handler,
+                "do_open",
+                return_value="response",
+            ) as do_open,
+        ):
+            response = handler.https_open(request)
+
+        self.assertEqual(response, "response")
+        resolve_context.assert_called_once_with(request.full_url)
+        self.assertIs(do_open.call_args.kwargs["context"], default_context)
+        self.assertTrue(default_context.check_hostname)
+        self.assertEqual(default_context.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_validated_handler_fails_before_network_for_invalid_bundle(
+        self,
+    ) -> None:
+        handler = notion_client.ValidatedExternalHTTPSHandler()
+        request = urllib.request.Request(
+            "https://www.sogang.ac.kr/file-fe-prd/board/image.jpg"
+        )
+        with (
+            patch.object(
+                source_tls,
+                "source_ssl_context_for_url",
+                side_effect=source_tls.SourceTLSConfigurationError(
+                    "invalid bundle"
+                ),
+            ),
+            patch.object(handler, "do_open") as do_open,
+            self.assertRaises(source_tls.SourceTLSConfigurationError),
+        ):
+            handler.https_open(request)
+
+        do_open.assert_not_called()
 
 
 if __name__ == "__main__":

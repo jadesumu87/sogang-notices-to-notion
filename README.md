@@ -23,6 +23,7 @@
 ├─ scripts/
 │  ├─ certificates/              # 출처 TLS 중간 인증서와 검증 정보
 │  ├─ main.py                     # 실행 흐름
+│  ├─ source_tls.py               # 출처별 TLS 체인 보완
 │  ├─ crawler.py                  # 공지 수집
 │  ├─ bbs_parser.py               # HTML·본문·첨부파일 파싱
 │  ├─ notion_client.py            # Notion API와 파일 처리
