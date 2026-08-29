@@ -4,10 +4,12 @@ import http.client
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
 import struct
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -19,6 +21,7 @@ import zipfile
 import zlib
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from io import BytesIO, StringIO
@@ -91,7 +94,10 @@ EXTERNAL_DOWNLOAD_MAX_REQUESTS = 300
 EXTERNAL_DOWNLOAD_MAX_SECONDS = 600.0
 EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS = 1.0
 EXTERNAL_DOWNLOAD_MAX_CONNECT_ADDRESSES = 8
-EXTERNAL_PREFLIGHT_CACHE_MAX_BYTES = 128 * 1024 * 1024
+EXTERNAL_PREFLIGHT_CACHE_MAX_BYTES = (
+    EXTERNAL_DOWNLOAD_MAX_BYTES * EXTERNAL_DOWNLOAD_MAX_REQUESTS
+)
+EXTERNAL_PREFLIGHT_CACHE_MIN_FREE_BYTES = 512 * 1024 * 1024
 TRANSIENT_NETWORK_ERRNOS = frozenset(
     value
     for name in (
@@ -773,17 +779,113 @@ class ExternalDownloadRunPolicy:
             }
 
 
+@dataclass
+class ExternalPreflightCacheBlob:
+    path: str
+    size: int
+    references: int
+
+
 class ExternalPreflightDownloadCache:
     def __init__(
         self,
         max_bytes: int = EXTERNAL_PREFLIGHT_CACHE_MAX_BYTES,
+        min_free_bytes: int = EXTERNAL_PREFLIGHT_CACHE_MIN_FREE_BYTES,
     ) -> None:
+        if max_bytes <= 0:
+            raise ValueError("외부 파일 사전검증 캐시 상한은 양수여야 합니다")
+        if min_free_bytes < 0:
+            raise ValueError("외부 파일 사전검증 캐시 여유 공간은 음수일 수 없습니다")
         self.max_bytes = max_bytes
+        self.min_free_bytes = min_free_bytes
         self.total_bytes = 0
+        self.peak_bytes = 0
+        self.unique_blob_count = 0
+        self.deduplicated_count = 0
+        self.entry_count = 0
+        self._closed = False
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="sogang-preflight-"
+        )
+        self.directory = self._temporary_directory.name
+        os.chmod(self.directory, 0o700)
+        self.blobs: dict[str, ExternalPreflightCacheBlob] = {}
         self.files: dict[
             tuple[str, bool],
-            list[tuple[bytes, Optional[str]]],
+            list[tuple[str, Optional[str]]],
         ] = {}
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("외부 파일 사전검증 캐시가 이미 닫혔습니다")
+
+    def _store_blob(self, digest: str, payload: bytes) -> None:
+        next_total = self.total_bytes + len(payload)
+        if next_total > self.max_bytes:
+            raise RuntimeError(
+                "외부 파일 사전검증 캐시 용량을 초과했습니다"
+            )
+        try:
+            free_bytes = shutil.disk_usage(self.directory).free
+        except OSError as exc:
+            raise RuntimeError(
+                "외부 파일 사전검증 임시 저장공간을 확인할 수 없습니다"
+            ) from exc
+        if free_bytes - len(payload) < self.min_free_bytes:
+            raise RuntimeError(
+                "외부 파일 사전검증 임시 저장공간이 부족합니다"
+            )
+        path = os.path.join(self.directory, digest)
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as handle:
+                written = handle.write(payload)
+                if written != len(payload):
+                    raise OSError("short preflight cache write")
+        except BaseException as exc:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            if isinstance(exc, OSError):
+                raise RuntimeError(
+                    "외부 파일 사전검증 임시 캐시를 저장할 수 없습니다"
+                ) from exc
+            raise
+        self.blobs[digest] = ExternalPreflightCacheBlob(
+            path=path,
+            size=len(payload),
+            references=1,
+        )
+        self.total_bytes = next_total
+        self.peak_bytes = max(self.peak_bytes, self.total_bytes)
+        self.unique_blob_count += 1
+
+    def _load_blob(self, digest: str) -> bytes:
+        blob = self.blobs.get(digest)
+        if blob is None:
+            raise RuntimeError(
+                "외부 파일 사전검증 캐시 참조를 찾을 수 없습니다"
+            )
+        try:
+            with open(blob.path, "rb") as handle:
+                payload = handle.read()
+        except OSError as exc:
+            raise RuntimeError(
+                "외부 파일 사전검증 캐시를 읽을 수 없습니다"
+            ) from exc
+        if (
+            len(payload) != blob.size
+            or compute_content_sha256(payload) != digest
+        ):
+            raise RuntimeError(
+                "외부 파일 사전검증 캐시 무결성 검증에 실패했습니다"
+            )
+        return payload
 
     def add(
         self,
@@ -791,31 +893,75 @@ class ExternalPreflightDownloadCache:
         require_file_hint: bool,
         downloaded_file: tuple[bytes, Optional[str]],
     ) -> None:
-        next_total = self.total_bytes + len(downloaded_file[0])
-        if next_total > self.max_bytes:
-            raise RuntimeError(
-                "외부 파일 사전검증 캐시 용량을 초과했습니다"
-            )
+        self._ensure_open()
+        payload, content_type = downloaded_file
+        digest = compute_content_sha256(payload) if payload else ""
+        if digest:
+            blob = self.blobs.get(digest)
+            if blob is None:
+                self._store_blob(digest, payload)
+            else:
+                if blob.size != len(payload):
+                    raise RuntimeError(
+                        "외부 파일 사전검증 캐시 해시 충돌을 감지했습니다"
+                    )
+                blob.references += 1
+                self.deduplicated_count += 1
         self.files.setdefault(
             (str(url or "").strip(), require_file_hint),
             [],
-        ).append(downloaded_file)
-        self.total_bytes = next_total
+        ).append((digest, content_type))
+        self.entry_count += 1
 
     def pop(
         self,
         url: str,
         require_file_hint: bool,
     ) -> Optional[tuple[bytes, Optional[str]]]:
+        self._ensure_open()
         key = (str(url or "").strip(), require_file_hint)
         candidates = self.files.get(key) or []
         if not candidates:
             return None
-        downloaded_file = candidates.pop(0)
-        self.total_bytes -= len(downloaded_file[0])
+        digest, content_type = candidates.pop(0)
         if not candidates:
             self.files.pop(key, None)
-        return downloaded_file
+        if not digest:
+            return b"", content_type
+        payload = self._load_blob(digest)
+        blob = self.blobs[digest]
+        blob.references -= 1
+        if blob.references == 0:
+            try:
+                os.unlink(blob.path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise RuntimeError(
+                    "외부 파일 사전검증 임시 캐시를 정리할 수 없습니다"
+                ) from exc
+            self.total_bytes -= blob.size
+            self.blobs.pop(digest, None)
+        return payload, content_type
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        remaining_entries = sum(len(values) for values in self.files.values())
+        if self.entry_count:
+            LOGGER.info(
+                "외부 파일 사전검증 임시 캐시 정리: 최고=%s, 고유=%s, "
+                "중복재사용=%s, 잔여=%s",
+                self.peak_bytes,
+                self.unique_blob_count,
+                self.deduplicated_count,
+                remaining_entries,
+            )
+        self.files.clear()
+        self.blobs.clear()
+        self.total_bytes = 0
+        self._temporary_directory.cleanup()
+        self._closed = True
 
 
 _EXTERNAL_DOWNLOAD_RUN_POLICY: ContextVar[
@@ -842,16 +988,18 @@ def external_download_run_scope(
         return
     policy = ExternalDownloadRunPolicy()
     policy_token = _EXTERNAL_DOWNLOAD_RUN_POLICY.set(policy)
-    downloads_token = _EXTERNAL_PREFLIGHT_DOWNLOADS.set(
-        ExternalPreflightDownloadCache(
-            EXTERNAL_PREFLIGHT_CACHE_MAX_BYTES
-        )
+    downloads = ExternalPreflightDownloadCache(
+        EXTERNAL_PREFLIGHT_CACHE_MAX_BYTES
     )
+    downloads_token = _EXTERNAL_PREFLIGHT_DOWNLOADS.set(downloads)
     try:
         yield policy
     finally:
-        _EXTERNAL_PREFLIGHT_DOWNLOADS.reset(downloads_token)
-        _EXTERNAL_DOWNLOAD_RUN_POLICY.reset(policy_token)
+        try:
+            downloads.close()
+        finally:
+            _EXTERNAL_PREFLIGHT_DOWNLOADS.reset(downloads_token)
+            _EXTERNAL_DOWNLOAD_RUN_POLICY.reset(policy_token)
 
 
 def current_external_download_run_policy() -> Optional[ExternalDownloadRunPolicy]:

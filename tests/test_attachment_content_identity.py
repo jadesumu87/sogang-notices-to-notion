@@ -405,29 +405,156 @@ class AttachmentContentIdentityTests(unittest.TestCase):
         self.assertEqual(new_upload, "new-upload")
         self.assertEqual(create.call_count, 2)
 
-    def test_preflight_cache_counts_repeated_url_bytes(self) -> None:
+    def test_preflight_cache_deduplicates_repeated_payload_bytes(self) -> None:
         cache = notion_client.ExternalPreflightDownloadCache(
-            max_bytes=5
+            max_bytes=5,
+            min_free_bytes=0,
         )
+        try:
+            cache.add(
+                self.old_url,
+                False,
+                (b"123", "image/jpeg"),
+            )
+            cache.add(
+                self.old_url,
+                False,
+                (b"123", "image/jpeg"),
+            )
+
+            self.assertEqual(cache.total_bytes, 3)
+            self.assertEqual(cache.peak_bytes, 3)
+            self.assertEqual(cache.unique_blob_count, 1)
+            self.assertEqual(cache.deduplicated_count, 1)
+            self.assertEqual(
+                cache.pop(self.old_url, False),
+                (b"123", "image/jpeg"),
+            )
+            self.assertEqual(cache.total_bytes, 3)
+            self.assertEqual(
+                cache.pop(self.old_url, False),
+                (b"123", "image/jpeg"),
+            )
+            self.assertEqual(cache.total_bytes, 0)
+        finally:
+            cache.close()
+
+    def test_preflight_cache_detects_temporary_blob_tampering(self) -> None:
+        cache = notion_client.ExternalPreflightDownloadCache(
+            max_bytes=10,
+            min_free_bytes=0,
+        )
+        try:
+            cache.add(
+                self.old_url,
+                False,
+                (b"123", "image/jpeg"),
+            )
+            blob = next(iter(cache.blobs.values()))
+            with open(blob.path, "wb") as handle:
+                handle.write(b"456")
+
+            with self.assertRaisesRegex(RuntimeError, "무결성"):
+                cache.pop(self.old_url, False)
+        finally:
+            cache.close()
+
+    def test_preflight_cache_close_removes_temporary_directory(self) -> None:
+        cache = notion_client.ExternalPreflightDownloadCache(
+            max_bytes=10,
+            min_free_bytes=0,
+        )
+        directory = cache.directory
         cache.add(
             self.old_url,
             False,
             (b"123", "image/jpeg"),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "캐시 용량"):
+        self.assertTrue(os.path.isdir(directory))
+        cache.close()
+
+        self.assertFalse(os.path.exists(directory))
+        with self.assertRaisesRegex(RuntimeError, "이미 닫혔습니다"):
             cache.add(
                 self.old_url,
                 False,
-                (b"456", "image/jpeg"),
+                (b"123", "image/jpeg"),
             )
 
-        self.assertEqual(cache.total_bytes, 3)
-        self.assertEqual(
-            cache.pop(self.old_url, False),
-            (b"123", "image/jpeg"),
+    def test_preflight_cache_uses_private_storage_permissions(self) -> None:
+        cache = notion_client.ExternalPreflightDownloadCache(
+            max_bytes=10,
+            min_free_bytes=0,
         )
-        self.assertEqual(cache.total_bytes, 0)
+        try:
+            cache.add(
+                self.old_url,
+                False,
+                (b"123", "image/jpeg"),
+            )
+            blob = next(iter(cache.blobs.values()))
+
+            self.assertEqual(os.stat(cache.directory).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(blob.path).st_mode & 0o777, 0o600)
+        finally:
+            cache.close()
+
+    def test_preflight_cache_preserves_free_disk_reserve(self) -> None:
+        cache = notion_client.ExternalPreflightDownloadCache(
+            max_bytes=10,
+            min_free_bytes=8,
+        )
+        disk_usage = type("DiskUsage", (), {"free": 10})()
+        try:
+            with (
+                patch.object(
+                    notion_client.shutil,
+                    "disk_usage",
+                    return_value=disk_usage,
+                ),
+                self.assertRaisesRegex(RuntimeError, "저장공간"),
+            ):
+                cache.add(
+                    self.old_url,
+                    False,
+                    (b"123", "image/jpeg"),
+                )
+
+            self.assertEqual(cache.total_bytes, 0)
+            self.assertEqual(cache.blobs, {})
+        finally:
+            cache.close()
+
+    def test_preflight_scope_cleans_cache_after_failure(self) -> None:
+        original_cache = notion_client.ExternalPreflightDownloadCache
+        created_caches: list[
+            notion_client.ExternalPreflightDownloadCache
+        ] = []
+
+        def create_cache(*args: Any, **kwargs: Any):
+            cache = original_cache(*args, **kwargs)
+            created_caches.append(cache)
+            return cache
+
+        with (
+            patch.object(
+                notion_client,
+                "ExternalPreflightDownloadCache",
+                side_effect=create_cache,
+            ),
+            self.assertRaisesRegex(RuntimeError, "실패"),
+        ):
+            with notion_client.external_download_run_scope(force_new=True):
+                notion_client.cache_external_preflight_download(
+                    self.old_url,
+                    False,
+                    (b"123", "image/jpeg"),
+                )
+                raise RuntimeError("실패")
+
+        self.assertEqual(len(created_caches), 1)
+        self.assertFalse(os.path.exists(created_caches[0].directory))
 
     def test_preflight_cache_limit_fails_before_destination_write(
         self,
@@ -457,7 +584,10 @@ class AttachmentContentIdentityTests(unittest.TestCase):
             patch.object(
                 notion_client,
                 "download_file_bytes",
-                return_value=(b"123", "image/jpeg"),
+                side_effect=[
+                    (b"123", "image/jpeg"),
+                    (b"456", "image/jpeg"),
+                ],
             ),
             patch.object(
                 sync_engine,
