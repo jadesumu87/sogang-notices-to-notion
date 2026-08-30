@@ -5526,7 +5526,14 @@ class SyncSafetyTests(unittest.TestCase):
                     "run_id": "run-1",
                     "run_attempt": "1",
                     "execution_id": "run-1:1",
-                }
+                    "dry_run": False,
+                },
+                {
+                    "run_id": "dry-run",
+                    "run_attempt": "1",
+                    "execution_id": "dry-run:1",
+                    "dry_run": True,
+                },
             ],
             "sources": {},
             "destination_holds": {
@@ -6595,7 +6602,10 @@ class SyncSafetyTests(unittest.TestCase):
         apply_item.assert_not_called()
         candidate = first.shrink_candidate_observations["2:200"]
         state = {
-            "runs": [{"run_id": "run-1"}],
+            "runs": [
+                {"run_id": "run-1", "dry_run": False},
+                {"run_id": "dry-run", "dry_run": True},
+            ],
             "sources": {},
             "shrink_candidates": {
                 "2:200": {
@@ -7325,6 +7335,43 @@ class SyncSafetyTests(unittest.TestCase):
                 "last_observed_run_id",
                 "last_observed_at",
                 current_logical_run_id="101",
+                logical_run_id_key=(
+                    "last_observed_logical_run_id"
+                ),
+            )
+        )
+
+    def test_dry_run_does_not_break_destructive_gate_confirmation(self):
+        now = datetime.now(timezone.utc).isoformat()
+        state = {
+            "runs": [
+                {
+                    "run_id": "real-run",
+                    "run_attempt": "1",
+                    "execution_id": "real-run:1",
+                    "dry_run": False,
+                },
+                {
+                    "run_id": "dry-run",
+                    "run_attempt": "1",
+                    "execution_id": "dry-run:1",
+                    "dry_run": True,
+                },
+            ]
+        }
+        observation = {
+            "last_observed_run_id": "real-run:1",
+            "last_observed_logical_run_id": "real-run",
+            "last_observed_at": now,
+        }
+
+        self.assertTrue(
+            sync_engine.recent_consecutive_observation(
+                state,
+                observation,
+                "last_observed_run_id",
+                "last_observed_at",
+                current_logical_run_id="next-real-run",
                 logical_run_id_key=(
                     "last_observed_logical_run_id"
                 ),

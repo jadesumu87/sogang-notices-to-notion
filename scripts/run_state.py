@@ -63,6 +63,7 @@ PUBLIC_CACHE_SOURCE_FIELDS = frozenset(
 )
 PUBLIC_CACHE_RUN_FIELDS = frozenset(
     {
+        "dry_run",
         "execution_id",
         "run_attempt",
         "run_id",
@@ -311,7 +312,7 @@ def build_public_cache_state(state: dict[str, Any]) -> dict[str, Any]:
     }
     projected["runs"] = [
         project_mapping(run, PUBLIC_CACHE_RUN_FIELDS)
-        for run in validated["runs"][-2:]
+        for run in validated["runs"][-100:]
         if isinstance(run, dict)
     ]
     projected["shrink_candidates"] = {
@@ -1013,13 +1014,19 @@ def latest_run_identities(
     runs = state.get("runs", [])
     if not isinstance(runs, list) or not runs:
         return "", ""
-    latest = runs[-1]
-    if not isinstance(latest, dict):
-        return "", ""
-    return (
-        run_execution_id(latest),
-        str(latest.get("run_id") or "").strip(),
-    )
+    for latest in reversed(runs):
+        if not isinstance(latest, dict):
+            return "", ""
+        dry_run = latest.get("dry_run", False)
+        if not isinstance(dry_run, bool):
+            return "", ""
+        if dry_run:
+            continue
+        return (
+            run_execution_id(latest),
+            str(latest.get("run_id") or "").strip(),
+        )
+    return "", ""
 
 
 def observation_follows_distinct_logical_run(

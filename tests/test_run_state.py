@@ -66,6 +66,49 @@ def source_result(
 
 
 class RunStateTests(unittest.TestCase):
+    def test_latest_run_identities_ignore_trailing_dry_runs(self):
+        state = run_state.default_run_state()
+        state["runs"] = [
+            {
+                "run_id": "real-run",
+                "run_attempt": "2",
+                "execution_id": "real-run:2",
+                "dry_run": False,
+            },
+            {
+                "run_id": "dry-run-1",
+                "run_attempt": "1",
+                "execution_id": "dry-run-1:1",
+                "dry_run": True,
+            },
+            {
+                "run_id": "dry-run-2",
+                "run_attempt": "1",
+                "execution_id": "dry-run-2:1",
+                "dry_run": True,
+            },
+        ]
+        state["state_checksum"] = run_state.state_checksum(state)
+
+        projected = run_state.build_public_cache_state(state)
+
+        self.assertEqual(
+            run_state.latest_run_identities(projected),
+            ("real-run:2", "real-run"),
+        )
+        self.assertEqual(len(projected["runs"]), 3)
+        self.assertEqual(
+            [record.get("dry_run") for record in projected["runs"]],
+            [False, True, True],
+        )
+        projected["runs"].append(
+            {"run_id": "invalid", "dry_run": "true"}
+        )
+        self.assertEqual(
+            run_state.latest_run_identities(projected),
+            ("", ""),
+        )
+
     def test_full_reconcile_local_hour_defaults_and_bounds(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(settings.get_full_reconcile_local_hour(), 7)

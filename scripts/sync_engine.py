@@ -36,6 +36,7 @@ from notion_client import (
     validate_destination_schema,
 )
 from run_control import check_run_control, sleep_with_run_control
+from run_state import latest_run_identities
 from settings import (
     ATTACHMENT_PROPERTY,
     ATTACHMENT_STATE_PROPERTY,
@@ -2079,32 +2080,11 @@ def destructive_candidate_ttl_seconds() -> float:
 
 
 def latest_recorded_run_id(state: dict[str, Any]) -> str:
-    runs = state.get("runs", [])
-    if not isinstance(runs, list) or not runs:
-        return ""
-    latest = runs[-1]
-    if not isinstance(latest, dict):
-        return ""
-    execution_id = str(latest.get("execution_id") or "").strip()
-    if execution_id:
-        return execution_id
-    run_id = str(latest.get("run_id") or "").strip()
-    run_attempt = str(latest.get("run_attempt") or "").strip()
-    if run_id and run_attempt:
-        return f"{run_id}:{run_attempt}"
-    return run_id
+    return latest_run_identities(state)[0]
 
 
 def latest_recorded_logical_run_id(state: dict[str, Any]) -> str:
-    runs = state.get("runs", [])
-    if not isinstance(runs, list) or not runs:
-        return ""
-    latest = runs[-1]
-    return (
-        str(latest.get("run_id") or "").strip()
-        if isinstance(latest, dict)
-        else ""
-    )
+    return latest_run_identities(state)[1]
 
 
 def destination_hold_key(source_id: str, notice_id: str) -> str:
