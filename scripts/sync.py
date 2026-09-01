@@ -76,6 +76,7 @@ from utils import (
     normalize_attachment_identity_url,
     normalize_attachment_name,
     normalize_content_sha256,
+    normalize_notion_text_identity,
 )
 
 
@@ -1557,7 +1558,9 @@ def rich_text_signature(
         signature.append(
             {
                 "type": str(part.get("type") or "text"),
-                "content": str(content or ""),
+                "content": normalize_notion_text_identity(
+                    str(content or "")
+                ),
                 "link": normalized_link,
                 "annotations": annotations,
             }

@@ -1490,6 +1490,16 @@ class SyncSafetyTests(unittest.TestCase):
                     normalized,
                 )
 
+    def test_notion_text_normalization_is_narrow_and_idempotent(self):
+        source = "앞\u200b중간\u200c뒤\u200d끝\u2060\ufeff"
+        normalized = utils.normalize_notion_text_identity(source)
+
+        self.assertEqual(normalized, "앞중간\u200c뒤\u200d끝\u2060\ufeff")
+        self.assertEqual(
+            utils.normalize_notion_text_identity(normalized),
+            normalized,
+        )
+
     def test_body_generation_accepts_notion_equivalent_urls_in_url_blocks(self):
         source_host = "Q.한국"
         notion_host = "q.xn--3e0b707e"
@@ -1857,6 +1867,114 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertLess(
             store.events.index(("list", candidate_id)),
             store.events.index(("delete", failed_id)),
+        )
+
+    def test_pending_zero_width_space_failure_recovers_without_duplicate(
+        self,
+    ):
+        source_text = "발급을 재개할 예정\u200b이오니"
+        notion_text = "발급을 재개할 예정이오니"
+        visible = paragraph_block(source_text)
+        child = paragraph_block("감사합니다.")
+        failed_id = "failed-zero-width-generation"
+        generation_id = "pending-zero-width-generation"
+        store = StatefulBlockStore()
+        store.root_blocks = [
+            {
+                "id": store.manual_id,
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"plain_text": "manual"}]},
+            },
+            {
+                "id": failed_id,
+                "type": "quote",
+                "quote": {
+                    "rich_text": copy.deepcopy(
+                        paragraph_block(notion_text)["paragraph"]["rich_text"]
+                    ),
+                    "color": "default",
+                },
+                "has_children": True,
+            },
+        ]
+        store.children = {failed_id: [copy.deepcopy(child)]}
+        with patch.object(
+            sync,
+            "list_block_children",
+            side_effect=store.list_children,
+        ):
+            failed_hash = sync.sync_container_actual_hash(
+                "token",
+                store.root_blocks[1],
+            )
+        store.properties = {
+            sync.SYNC_GENERATION_PROPERTY: (
+                sync.body_generation_property_payload(
+                    {
+                        "v": 2,
+                        "g": generation_id,
+                        "s": "pending",
+                        "op": generation_id,
+                        "t": 1,
+                        "p": [],
+                        "o": [{"i": failed_id, "h": failed_hash}],
+                    }
+                )
+            )
+        }
+        append_children = store.append_children
+
+        def append_with_notion_zero_width_space_elision(
+            token: str,
+            parent_id: str,
+            blocks: list[dict],
+        ) -> dict:
+            response = append_children(token, parent_id, blocks)
+            if parent_id == store.root_id:
+                candidate_id = str(response["results"][0]["id"])
+                response["results"][0]["quote"]["rich_text"][0]["text"][
+                    "content"
+                ] = notion_text
+                candidate = next(
+                    block
+                    for block in store.root_blocks
+                    if block.get("id") == candidate_id
+                )
+                candidate["quote"]["rich_text"][0]["text"][
+                    "content"
+                ] = notion_text
+            return response
+
+        store.append_children = append_with_notion_zero_width_space_elision
+
+        result = self.run_body_sync(
+            store,
+            generation_id=generation_id,
+            blocks=[visible, child],
+        )
+
+        manifest = sync.extract_body_generation_manifest(
+            notion_read_properties(store.properties)
+        )
+        quote_ids = [
+            str(block.get("id") or "")
+            for block in store.root_blocks
+            if block.get("type") == "quote"
+        ]
+        candidate_id = str(manifest["p"][0]["i"])
+        candidate = next(
+            block
+            for block in store.root_blocks
+            if block.get("id") == candidate_id
+        )
+        self.assertEqual(result, generation_id)
+        self.assertEqual(manifest["s"], "committed")
+        self.assertEqual(quote_ids, [candidate_id])
+        self.assertEqual(store.root_append_count, 1)
+        self.assertIn(failed_id, store.deleted_ids)
+        self.assertEqual(
+            sync.rich_text_plain_text(candidate["quote"]["rich_text"]),
+            notion_text,
         )
 
     def test_pending_idna_failures_recover_one_complete_body(self):

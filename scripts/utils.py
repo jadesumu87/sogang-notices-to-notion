@@ -70,6 +70,11 @@ MAX_TABLE_ROWS = 200
 MAX_TABLE_COLUMNS = 100
 MAX_TABLE_CELLS = 5000
 
+
+def normalize_notion_text_identity(text: str) -> str:
+    return (text or "").replace("\u200b", "")
+
+
 def normalize_title_key(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 

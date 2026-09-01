@@ -31,6 +31,7 @@ from utils import (
     normalize_detail_url,
     normalize_file_url,
     normalize_link_url,
+    normalize_notion_text_identity,
     parse_datetime,
     parse_int,
     resolve_iframe_embed_url,
@@ -180,7 +181,9 @@ def extract_inline_color(style: str) -> Optional[str]:
 
 
 def normalize_inline_text(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalize_notion_text_identity(
+        text.replace("\r\n", "\n").replace("\r", "\n")
+    )
 
 
 def build_rich_text_from_segments(

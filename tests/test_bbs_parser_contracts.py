@@ -91,6 +91,22 @@ class ListRowContractTests(unittest.TestCase):
 
 
 class BodyBlockContractTests(unittest.TestCase):
+    def test_notion_elided_zero_width_space_is_removed_from_body_text(
+        self,
+    ) -> None:
+        html = """
+        <div class="tiptap">
+          <p>발급을 재개할 예정&#8203;이오니 참고하시기 바랍니다.</p>
+        </div>
+        """
+
+        blocks = bbs_parser.extract_body_blocks_from_html(html)
+
+        self.assertEqual(
+            rich_text_content(blocks[0]),
+            "발급을 재개할 예정이오니 참고하시기 바랍니다.",
+        )
+
     def test_heading_levels_paragraph_list_and_inline_styles_are_preserved(
         self,
     ) -> None:
