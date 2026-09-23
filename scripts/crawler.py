@@ -171,7 +171,7 @@ class SourceRequestBudget:
             )
         self.max_seconds = self._float_env(
             "SOURCE_MAX_SECONDS",
-            480.0,
+            600.0,
             10.0,
             3600.0,
         )

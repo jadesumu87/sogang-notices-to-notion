@@ -116,6 +116,19 @@ class RunControlTests(unittest.TestCase):
         )
         self.assertEqual(budget.actual_requests, 0)
 
+    def test_source_budget_default_is_ten_minutes(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                crawler,
+                "remaining_run_seconds",
+                return_value=None,
+            ),
+        ):
+            budget = crawler.SourceRequestBudget()
+
+        self.assertEqual(budget.max_seconds, 600.0)
+
     def test_source_budget_clamps_to_time_before_reserve(self):
         with (
             patch.dict(
