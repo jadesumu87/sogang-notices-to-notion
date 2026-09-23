@@ -1432,6 +1432,10 @@ class SyncSafetyTests(unittest.TestCase):
     def test_notion_http_hostname_normalization_is_conservative(self):
         equivalent_pairs = (
             ("http://Q.한국/", "http://q.xn--3e0b707e/"),
+            (
+                "http://www.kosaf.go.kr)접속",
+                "http://www.kosaf.go.xn--kr)-hn5nt4x/",
+            ),
             ("HTTP://EXAMPLE.COM:080", "http://example.com/"),
             ("https://EXAMPLE.COM:0443/a", "https://example.com/a"),
             (
@@ -1471,6 +1475,16 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(
             sync.normalize_notion_link_identity(malformed),
             malformed,
+        )
+        malformed_ascii_host = "http://www.kosaf.go.kr)/"
+        canonicalized_host = "http://www.kosaf.go.xn--kr)-hn5nt4x/"
+        self.assertEqual(
+            sync.normalize_notion_link_identity(malformed_ascii_host),
+            malformed_ascii_host,
+        )
+        self.assertNotEqual(
+            sync.normalize_notion_link_identity(malformed_ascii_host),
+            sync.normalize_notion_link_identity(canonicalized_host),
         )
 
     def test_notion_link_normalization_is_idempotent(self):
@@ -1861,13 +1875,10 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(result, generation_id)
         self.assertEqual(manifest["s"], "committed")
         self.assertEqual(quote_ids, [candidate_id])
-        self.assertNotEqual(candidate_id, failed_id)
-        self.assertIn(failed_id, store.deleted_ids)
+        self.assertEqual(candidate_id, failed_id)
+        self.assertEqual(store.root_append_count, 0)
+        self.assertNotIn(failed_id, store.deleted_ids)
         self.assertIn(store.manual_id, store.root_ids())
-        self.assertLess(
-            store.events.index(("list", candidate_id)),
-            store.events.index(("delete", failed_id)),
-        )
 
     def test_pending_zero_width_space_failure_recovers_without_duplicate(
         self,
@@ -1970,16 +1981,17 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(result, generation_id)
         self.assertEqual(manifest["s"], "committed")
         self.assertEqual(quote_ids, [candidate_id])
-        self.assertEqual(store.root_append_count, 1)
-        self.assertIn(failed_id, store.deleted_ids)
+        self.assertEqual(candidate_id, failed_id)
+        self.assertEqual(store.root_append_count, 0)
+        self.assertNotIn(failed_id, store.deleted_ids)
         self.assertEqual(
             sync.rich_text_plain_text(candidate["quote"]["rich_text"]),
             notion_text,
         )
 
     def test_pending_idna_failures_recover_one_complete_body(self):
-        source_url = "http://Q.한국/"
-        notion_url = "http://q.xn--3e0b707e/"
+        source_url = "http://www.kosaf.go.kr)접속"
+        notion_url = "http://www.kosaf.go.xn--kr)-hn5nt4x/"
         visible = paragraph_block("첫 문단")
         expected_children = [
             paragraph_block(f"본문 {index}") for index in range(65)
@@ -2085,15 +2097,20 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(result, generation_id)
         self.assertEqual(manifest["s"], "committed")
         self.assertEqual(quote_ids, [candidate_id])
+        self.assertIn(candidate_id, failed_ids)
         self.assertEqual(len(store.children[candidate_id]), 65)
         self.assertEqual(store.child_batch_sizes, [15])
-        self.assertEqual(store.root_append_count, 1)
-        self.assertEqual(set(store.deleted_ids), set(failed_ids))
+        self.assertEqual(store.root_append_count, 0)
+        self.assertEqual(len(store.deleted_ids), len(failed_ids) - 1)
+        self.assertEqual(
+            set(store.deleted_ids),
+            set(failed_ids) - {candidate_id},
+        )
         self.assertIn(store.manual_id, store.root_ids())
         self.assertEqual(
-            store.root_payloads[0]["quote"]["children"][5]["paragraph"]
+            store.children[candidate_id][5]["paragraph"]
             ["rich_text"][0]["text"]["link"]["url"],
-            source_url,
+            notion_url,
         )
 
     def test_pending_mailto_failure_recovers_full_body_without_duplicate(self):
@@ -2196,7 +2213,9 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(quote_ids, [candidate_id])
         self.assertEqual(len(store.children[candidate_id]), 123)
         self.assertEqual(store.child_batch_sizes, [50, 23])
-        self.assertIn(failed_id, store.deleted_ids)
+        self.assertEqual(candidate_id, failed_id)
+        self.assertEqual(store.root_append_count, 0)
+        self.assertNotIn(failed_id, store.deleted_ids)
         self.assertIn(store.manual_id, store.root_ids())
 
     def test_body_generation_rejects_different_link_query(self):

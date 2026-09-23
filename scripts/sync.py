@@ -1371,16 +1371,28 @@ def normalize_link_query(query: str) -> str:
     )
 
 
-def normalize_dns_hostname(hostname: str) -> Optional[str]:
+def normalize_dns_hostname(
+    hostname: str,
+    *,
+    allow_notion_idna_parenthesis: bool = False,
+) -> Optional[str]:
     try:
         normalized = hostname.encode("idna").decode("ascii").lower()
     except UnicodeError:
         return None
+    valid_hostname = re.fullmatch(r"[a-z0-9._-]+", normalized) is not None
+    notion_canonicalized_hostname = (
+        allow_notion_idna_parenthesis
+        and not hostname.isascii()
+        and "xn--" in normalized
+        and normalized.count(")") == 1
+        and re.fullmatch(r"[a-z0-9._)-]+", normalized) is not None
+    )
     if (
         not normalized
         or normalized.startswith(".")
         or ".." in normalized
-        or re.fullmatch(r"[a-z0-9._-]+", normalized) is None
+        or not (valid_hostname or notion_canonicalized_hostname)
     ):
         return None
     return normalized
@@ -1412,7 +1424,10 @@ def normalize_http_netloc(
             )
         except UnicodeDecodeError:
             return None
-        normalized_host = normalize_dns_hostname(decoded_hostname)
+        normalized_host = normalize_dns_hostname(
+            decoded_hostname,
+            allow_notion_idna_parenthesis=True,
+        )
         if normalized_host is None:
             return None
     else:
@@ -1896,20 +1911,21 @@ def verify_sync_container_part(
     )
 
 
-def sync_container_prefix_length(
+def sync_container_prefix_validation(
     token: str,
     block: JsonObject,
     expected_rich_text: list[JsonObject],
     expected_children: list[JsonObject],
-) -> Optional[int]:
+) -> tuple[Optional[int], str]:
     block_id = str(block.get("id") or "").strip()
     quote = block.get("quote")
     if not block_id or not isinstance(quote, dict):
-        return None
+        return None, "container_missing"
     body_rich_text = sync_container_body_rich_text(block)
+    if body_rich_text is None:
+        return None, "container_rich_text_missing"
     if (
-        body_rich_text is None
-        or rich_text_signature(
+        rich_text_signature(
             body_rich_text,
             normalize_links=True,
         )
@@ -1918,11 +1934,11 @@ def sync_container_prefix_length(
             normalize_links=True,
         )
     ):
-        return None
+        return None, "container_rich_text_mismatch"
     actual_children = list_block_children(token, block_id)
     actual_count = len(actual_children)
     if actual_count > len(expected_children):
-        return None
+        return None, "child_count_exceeds_expected"
     if sync_child_signature(
         token,
         actual_children,
@@ -1934,8 +1950,23 @@ def sync_container_prefix_length(
         False,
         normalize_links=True,
     ):
-        return None
-    return actual_count
+        return None, "child_prefix_mismatch"
+    return actual_count, ""
+
+
+def sync_container_prefix_length(
+    token: str,
+    block: JsonObject,
+    expected_rich_text: list[JsonObject],
+    expected_children: list[JsonObject],
+) -> Optional[int]:
+    prefix_length, _ = sync_container_prefix_validation(
+        token,
+        block,
+        expected_rich_text,
+        expected_children,
+    )
+    return prefix_length
 
 
 def find_generation_parts(
@@ -2357,6 +2388,55 @@ def sync_page_body_blocks(
             return None
         return candidate
 
+    def candidate_from_old_ref() -> Optional[JsonObject]:
+        if not resume_untracked or pending_manifest.get("p"):
+            return None
+        root_by_id = {
+            str(block.get("id") or "").strip(): block
+            for block in current_root_blocks()
+            if str(block.get("id") or "").strip()
+        }
+        candidates: list[tuple[int, JsonObject, str]] = []
+        for old_ref in pending_manifest.get("o", []):
+            candidate_id = str(old_ref.get("i") or "").strip()
+            expected_hash = str(old_ref.get("h") or "")
+            candidate = root_by_id.get(candidate_id)
+            if (
+                not candidate_id
+                or not BODY_GENERATION_HASH_RE.fullmatch(expected_hash)
+                or candidate is None
+                or candidate.get("type") != "quote"
+            ):
+                continue
+            prefix_length = sync_container_prefix_length(
+                token,
+                candidate,
+                container_rich_text,
+                expected_children,
+            )
+            if prefix_length is None:
+                continue
+            actual_hash = sync_container_actual_hash(token, candidate)
+            if actual_hash != expected_hash:
+                continue
+            candidates.append((prefix_length, candidate, actual_hash))
+        if not candidates:
+            return None
+        _, candidate, candidate_hash = max(
+            candidates,
+            key=lambda entry: entry[0],
+        )
+        candidate_id = str(candidate.get("id") or "").strip()
+        pending_manifest["p"] = [
+            {
+                "i": candidate_id,
+                "n": 1,
+                "h": candidate_hash,
+            }
+        ]
+        write_body_generation_manifest(token, page_id, pending_manifest)
+        return candidate
+
     def untracked_candidates(
         *,
         require_complete: bool,
@@ -2403,6 +2483,8 @@ def sync_page_body_blocks(
         return candidates
 
     candidate = candidate_from_manifest()
+    if candidate is None:
+        candidate = candidate_from_old_ref()
     if candidate is None and resume_untracked:
         recovered = untracked_candidates(
             require_complete=False,
@@ -2444,12 +2526,13 @@ def sync_page_body_blocks(
             if append_error is not None:
                 raise append_error
             raise RuntimeError("본문 세대 생성 응답이 유효하지 않습니다")
-        if sync_container_prefix_length(
+        prefix_length, verification_reason = sync_container_prefix_validation(
             token,
             candidate,
             container_rich_text,
             expected_children,
-        ) is None:
+        )
+        if prefix_length is None:
             append_old_ref(candidate)
             write_body_generation_manifest(
                 token,
@@ -2458,7 +2541,8 @@ def sync_page_body_blocks(
             )
             raise RuntimeError(
                 "본문 세대 검증 실패: "
-                f"generation={generation_id}"
+                f"generation={generation_id}; "
+                f"reason={verification_reason}"
             )
     candidate_id = str(candidate.get("id") or "").strip()
     if not candidate_id:
