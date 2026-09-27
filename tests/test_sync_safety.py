@@ -575,22 +575,24 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertIn(failed_candidate, store.root_ids())
 
         store.creation_mode = "success"
-        result = self.run_body_sync(store)
+        for _ in range(3):
+            with self.assertRaisesRegex(RuntimeError, "기존 본문 세대 검증 실패"):
+                self.run_body_sync(store)
 
-        self.assertEqual(result, "new-generation")
-        self.assertNotIn(failed_candidate, store.root_ids())
-        self.assertNotIn(store.old_id, store.root_ids())
-        self.assertIn(failed_candidate, store.deleted_ids)
-        self.assertEqual(
-            len(
-                [
-                    block
-                    for block in store.root_blocks
-                    if block.get("type") == "quote"
-                ]
-            ),
-            1,
+        self.assertEqual(store.root_append_count, 1)
+        self.assertIn(failed_candidate, store.root_ids())
+        self.assertIn(store.old_id, store.root_ids())
+        self.assertIn(store.manual_id, store.root_ids())
+        self.assertEqual(store.deleted_ids, [])
+
+        store.children[failed_candidate] = copy.deepcopy(
+            store.root_payloads[0]["quote"]["children"]
         )
+        self.assertEqual(self.run_body_sync(store), "new-generation")
+        self.assertEqual(store.root_append_count, 1)
+        self.assertIn(failed_candidate, store.root_ids())
+        self.assertNotIn(store.old_id, store.root_ids())
+        self.assertIn(store.manual_id, store.root_ids())
 
     def test_body_generation_deletes_old_only_after_success(self):
         store = StatefulBlockStore()
@@ -1495,6 +1497,8 @@ class SyncSafetyTests(unittest.TestCase):
             "mailto:Student@Q.한국,other@예시.한국?subject=학사 공지",
             "http://example.com:not-a-port/path",
             "custom:Q.한국",
+            "http://www.kosaf.go.kr)",
+            "https://example.org)?a=1#part",
         )
         for link in links:
             with self.subTest(link=link):
@@ -1503,6 +1507,23 @@ class SyncSafetyTests(unittest.TestCase):
                     sync.normalize_notion_link_identity(normalized),
                     normalized,
                 )
+
+    def test_invalid_hostname_empty_path_only_normalizes_root_slash(self):
+        for authority in ("www.kosaf.go.kr)", "example.org)", "other.invalid("):
+            for suffix in ("", "?a=1", "#part", "?a=1#part"):
+                with self.subTest(authority=authority, suffix=suffix):
+                    source = f"https://{authority}{suffix}"
+                    readback = f"https://{authority}/{suffix}"
+                    self.assertEqual(sync.normalize_notion_link_identity(source), readback)
+                    for changed in (
+                        "https://example.org/" + suffix,
+                        f"https://{authority}/different{suffix}",
+                        f"https://{authority}/?a=2#other",
+                    ):
+                        self.assertNotEqual(
+                            sync.normalize_notion_link_identity(source),
+                            sync.normalize_notion_link_identity(changed),
+                        )
 
     def test_notion_text_normalization_is_narrow_and_idempotent(self):
         source = "앞\u200b중간\u200c뒤\u200d끝\u2060\ufeff"
@@ -1992,6 +2013,14 @@ class SyncSafetyTests(unittest.TestCase):
     def test_pending_idna_failures_recover_one_complete_body(self):
         source_url = "http://www.kosaf.go.kr)접속"
         notion_url = "http://www.kosaf.go.xn--kr)-hn5nt4x/"
+        self.assert_pending_link_failures_recover_one_complete_body(source_url, notion_url)
+
+    def test_pending_invalid_hostname_root_slash_recovers_one_complete_body(self):
+        self.assert_pending_link_failures_recover_one_complete_body(
+            "http://www.kosaf.go.kr)", "http://www.kosaf.go.kr)/"
+        )
+
+    def assert_pending_link_failures_recover_one_complete_body(self, source_url, notion_url):
         visible = paragraph_block("첫 문단")
         expected_children = [
             paragraph_block(f"본문 {index}") for index in range(65)

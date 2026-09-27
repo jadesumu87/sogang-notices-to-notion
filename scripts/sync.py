@@ -1498,6 +1498,8 @@ def normalize_notion_link_identity(raw_link: object) -> str:
     if scheme in {"http", "https"} and parsed.netloc:
         netloc = normalize_http_netloc(parsed, scheme)
         if netloc is None:
+            if not parsed.path:
+                return urlunsplit(parsed._replace(path="/"))
             return link
         path = parsed.path or "/"
         path_safe = "/:@!$&'()*+,;=-._~"
@@ -2335,22 +2337,6 @@ def sync_page_body_blocks(
     def current_root_blocks() -> list[JsonObject]:
         return list_block_children(token, page_id)
 
-    def append_old_ref(block: JsonObject) -> None:
-        block_id = str(block.get("id") or "").strip()
-        actual_hash = sync_container_actual_hash(token, block)
-        if (
-            not block_id
-            or not BODY_GENERATION_HASH_RE.fullmatch(actual_hash)
-        ):
-            raise RuntimeError("기존 본문 블록을 검증할 수 없습니다")
-        if all(
-            str(ref.get("i") or "") != block_id
-            for ref in pending_manifest["o"]
-        ):
-            pending_manifest["o"].append(
-                {"i": block_id, "h": actual_hash}
-            )
-
     def candidate_from_manifest() -> Optional[JsonObject]:
         entries = pending_manifest.get("p", [])
         if len(entries) > 1:
@@ -2372,20 +2358,18 @@ def sync_page_body_blocks(
                 pending_manifest,
             )
             return None
-        if sync_container_prefix_length(
+        prefix_length, verification_reason = sync_container_prefix_validation(
             token,
             candidate,
             container_rich_text,
             expected_children,
-        ) is None:
-            append_old_ref(candidate)
-            pending_manifest["p"] = []
-            write_body_generation_manifest(
-                token,
-                page_id,
-                pending_manifest,
+        )
+        if prefix_length is None:
+            raise RuntimeError(
+                "기존 본문 세대 검증 실패: "
+                f"generation={generation_id}; "
+                f"reason={verification_reason}"
             )
-            return None
         return candidate
 
     def candidate_from_old_ref() -> Optional[JsonObject]:
@@ -2533,7 +2517,13 @@ def sync_page_body_blocks(
             expected_children,
         )
         if prefix_length is None:
-            append_old_ref(candidate)
+            pending_manifest["p"] = [
+                {
+                    "i": str(candidate.get("id") or "").strip(),
+                    "n": 1,
+                    "h": sync_container_actual_hash(token, candidate),
+                }
+            ]
             write_body_generation_manifest(
                 token,
                 page_id,
