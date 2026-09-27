@@ -241,7 +241,13 @@ def normalize_body_blocks_for_hash(
     if not blocks:
         return []
     normalized: list[dict[str, Any]] = []
-    media_index = 0
+    content_hashes = {
+        (
+            str(entry.get("type") or ""),
+            normalize_attachment_identity_url(str(entry.get("source_url") or "")),
+        ): normalize_content_sha256(entry.get("content_sha256"))
+        for entry in media_content_state or []
+    }
     for block in blocks:
         block_type = block.get("type")
         if block_type == "image":
@@ -253,24 +259,12 @@ def normalize_body_blocks_for_hash(
                 and url
                 and is_allowed_external_download_url(url)
             ):
-                content_sha256 = ""
-                if (
-                    media_content_state
-                    and media_index < len(media_content_state)
-                ):
-                    content_entry = media_content_state[media_index]
-                    if (
-                        str(content_entry.get("type") or "")
-                        == "image"
-                        and normalize_attachment_identity_url(
-                            str(content_entry.get("source_url") or "")
-                        )
-                        == normalize_attachment_identity_url(url)
-                    ):
-                        content_sha256 = normalize_content_sha256(
-                            content_entry.get("content_sha256")
-                        )
-                media_index += 1
+                content_sha256 = content_hashes.get(
+                    ("image", normalize_attachment_identity_url(url)), ""
+                )
+                if media_content_state is not None and not content_sha256:
+                    normalized.append(block)
+                    continue
                 normalized.append(
                     build_uploaded_image_hash_block(
                         url,
@@ -291,24 +285,12 @@ def normalize_body_blocks_for_hash(
             ):
                 filename = derive_filename_from_url(url, fallback="file")
                 marker_type = "pdf" if is_pdf_name_or_url(filename, url) else "file"
-                content_sha256 = ""
-                if (
-                    media_content_state
-                    and media_index < len(media_content_state)
-                ):
-                    content_entry = media_content_state[media_index]
-                    if (
-                        str(content_entry.get("type") or "")
-                        == marker_type
-                        and normalize_attachment_identity_url(
-                            str(content_entry.get("source_url") or "")
-                        )
-                        == normalize_attachment_identity_url(url)
-                    ):
-                        content_sha256 = normalize_content_sha256(
-                            content_entry.get("content_sha256")
-                        )
-                media_index += 1
+                content_sha256 = content_hashes.get(
+                    (marker_type, normalize_attachment_identity_url(url)), ""
+                )
+                if media_content_state is not None and not content_sha256:
+                    normalized.append(block)
+                    continue
                 normalized.append(
                     build_uploaded_file_hash_block(
                         url,
