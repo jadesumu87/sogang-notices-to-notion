@@ -935,6 +935,54 @@ class SyncSafetyTests(unittest.TestCase):
             [f"본문 {index}" for index in range(166)],
         )
 
+    def test_initial_pending_before_body_creation_can_resume_same_operation(self):
+        item = {
+            "source_id": "2",
+            "notice_id": "123",
+            "title": "공지",
+            "body_blocks": [paragraph_block("새 본문")],
+            "body_status": "present",
+            "attachments": [],
+        }
+        operation = sync_engine.operation_id_for_item(item)
+        for manifest_started in (False, True):
+            with self.subTest(manifest_started=manifest_started):
+                page = managed_page("page", "2", "123")
+                page["properties"][sync.SYNC_STATUS_PROPERTY] = rich_text_property("pending")
+                page["properties"][sync.SYNC_OPERATION_PROPERTY] = rich_text_property(operation)
+                if manifest_started:
+                    manifest = {
+                        "v": 2,
+                        "g": "generation",
+                        "s": "pending",
+                        "op": operation,
+                        "t": 1,
+                        "p": [],
+                        "o": [],
+                    }
+                    page["properties"][sync.SYNC_GENERATION_PROPERTY] = (
+                        sync.body_generation_property_payload(manifest)
+                    )
+                with patch.object(sync_engine, "list_block_children", return_value=[]) as children:
+                    self.assertIsNone(sync_engine.shrink_candidate_for_item("token", item, page))
+                    children.return_value = [paragraph_block("기존 수동 본문")]
+                    self.assertIsNotNone(sync_engine.shrink_candidate_for_item("token", item, page))
+                    children.return_value = []
+                    changed = copy.deepcopy(page)
+                    changed["properties"][sync.SYNC_OPERATION_PROPERTY] = rich_text_property(
+                        "another-operation"
+                    )
+                    self.assertIsNotNone(
+                        sync_engine.shrink_candidate_for_item("token", item, changed)
+                    )
+                    corrupt = copy.deepcopy(page)
+                    corrupt["properties"][sync.SYNC_GENERATION_PROPERTY] = rich_text_property(
+                        "{broken"
+                    )
+                    self.assertIsNotNone(
+                        sync_engine.shrink_candidate_for_item("token", item, corrupt)
+                    )
+
     def test_initial_pending_body_resumes_with_stale_manifest_hash(self):
         for actual_count in (50, 100, 136):
             with self.subTest(actual_count=actual_count):

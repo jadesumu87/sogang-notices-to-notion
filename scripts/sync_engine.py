@@ -463,18 +463,29 @@ def initial_pending_body_matches(
         or extract_rich_text_value(properties, BODY_HASH_PROPERTY)
         or extract_rich_text_value(properties, SYNC_OPERATION_PROPERTY)
         != operation_id
-        or manifest is None
-        or manifest.get("v") != 2
-        or manifest.get("s") != "pending"
-        or manifest.get("op") != operation_id
-        or manifest.get("o")
-        or len(manifest.get("p", [])) != 1
-        or (should_upload_files_to_notion()
-            and has_image_blocks(item.get("body_blocks") or []))
+        or (manifest is None and extract_rich_text_value(
+            properties, SYNC_GENERATION_PROPERTY,
+        ))
+        or (manifest is not None and (
+            manifest.get("v") != 2
+            or manifest.get("s") != "pending"
+            or manifest.get("op") != operation_id
+            or manifest.get("o")
+            or len(manifest.get("p", [])) > 1
+        ))
     ):
         return False
     roots = list_block_children(token, str(page["id"]))
-    if len(roots) != 1 or roots[0].get("id") != manifest["p"][0]["i"]:
+    if not roots:
+        return manifest is None or not manifest.get("p")
+    if (
+        manifest is None
+        or len(manifest.get("p", [])) != 1
+        or len(roots) != 1
+        or roots[0].get("id") != manifest["p"][0]["i"]
+        or (should_upload_files_to_notion()
+            and has_image_blocks(item.get("body_blocks") or []))
+    ):
         return False
     rich_text, parts = split_body_container_parts(item.get("body_blocks") or [])
     prefix, reason = sync_container_prefix_validation(
