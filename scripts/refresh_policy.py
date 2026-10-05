@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -114,10 +115,20 @@ def notice_refresh_due(
     return refresh_offset == 0
 
 
+def get_detail_refresh_limit() -> int:
+    try:
+        value = int(os.environ.get("DETAIL_REFRESH_LIMIT", "20"))
+    except ValueError:
+        return 20
+    return min(100, max(1, value))
+
+
 def select_due_notice_ids(
     source_state: dict[str, Any],
     known_ids: set[str],
     now: Optional[datetime] = None,
+    *,
+    limit: Optional[int] = None,
 ) -> list[str]:
     raw_state = source_state.get("notice_refresh_state", {})
     if not isinstance(raw_state, dict):
@@ -135,4 +146,20 @@ def select_due_notice_ids(
             current_now,
         ):
             due.append(notice_id)
-    return due
+
+    def due_at(notice_id: str) -> tuple[datetime, int, str]:
+        observation = raw_state[notice_id]
+        last_detail = parse_utc_datetime(observation.get("last_detail_at"))
+        first_seen = parse_utc_datetime(observation.get("first_seen_at"))
+        scheduled = (
+            last_detail + refresh_interval_for_notice(
+                observation.get("published_at"), current_now,
+            )
+            if last_detail is not None
+            else (first_seen or datetime.min.replace(tzinfo=timezone.utc))
+            + timedelta(days=initial_archive_refresh_offset_days(notice_id))
+        )
+        return scheduled, len(notice_id), notice_id
+
+    due.sort(key=due_at)
+    return due[:get_detail_refresh_limit() if limit is None else max(0, limit)]

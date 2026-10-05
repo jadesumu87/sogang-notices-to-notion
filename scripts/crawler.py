@@ -49,7 +49,11 @@ from models import (
     SourceSpec,
     SourceStatus,
 )
-from refresh_policy import build_notice_observation, notice_refresh_due
+from refresh_policy import (
+    build_notice_observation,
+    get_detail_refresh_limit,
+    select_due_notice_ids,
+)
 from bbs_parser import (
     detect_attachment_container,
     detect_loading_shell,
@@ -2052,6 +2056,15 @@ def crawl_top_items_api_result(
         else {}
     )
     refresh_policy_enabled = source_state is not None
+    automatic_refresh_limit = max(
+        0, get_detail_refresh_limit() - len(refresh_known_ids)
+    )
+    selected_policy_refresh_ids = set(select_due_notice_ids(
+        source_state or {},
+        known_ids - refresh_known_ids,
+        crawl_now,
+        limit=automatic_refresh_limit,
+    ))
     classification = source.classification
     page_size = get_bbs_page_size()
     hard_page_limit = get_hard_page_limit()
@@ -2395,15 +2408,22 @@ def crawl_top_items_api_result(
             previous_observation = notice_refresh_state.get(pk_id, {})
             if not isinstance(previous_observation, dict):
                 previous_observation = {}
-            policy_refresh_due = bool(
+            fingerprint_changed = bool(
+                previous_observation.get("fingerprint")
+                and previous_observation["fingerprint"]
+                != observation["fingerprint"]
+            )
+            if (
                 refresh_policy_enabled
                 and pk_id in known_ids
-                and notice_refresh_due(
-                    pk_id,
-                    observation,
-                    previous_observation,
-                    crawl_now,
-                )
+                and pk_id not in refresh_known_ids
+                and fingerprint_changed
+                and len(selected_policy_refresh_ids) < automatic_refresh_limit
+            ):
+                selected_policy_refresh_ids.add(pk_id)
+            policy_refresh_due = bool(
+                refresh_policy_enabled
+                and pk_id in selected_policy_refresh_ids
             )
             if policy_refresh_due:
                 policy_refresh_ids.add(pk_id)
@@ -4304,6 +4324,15 @@ def crawl_fallback_with_fetchers(
         else {}
     )
     refresh_policy_enabled = source_state is not None
+    automatic_refresh_limit = max(
+        0, get_detail_refresh_limit() - len(refresh_known_ids)
+    )
+    selected_policy_refresh_ids = set(select_due_notice_ids(
+        source_state or {},
+        known_ids - refresh_known_ids,
+        crawl_now,
+        limit=automatic_refresh_limit,
+    ))
 
     def consume_budget(label: str) -> bool:
         nonlocal request_count, last_request_at, terminal_error
@@ -4528,15 +4557,22 @@ def crawl_fallback_with_fetchers(
             previous_observation = notice_refresh_state.get(notice_id, {})
             if not isinstance(previous_observation, dict):
                 previous_observation = {}
-            policy_refresh_due = bool(
+            fingerprint_changed = bool(
+                previous_observation.get("fingerprint")
+                and previous_observation["fingerprint"]
+                != observation["fingerprint"]
+            )
+            if (
                 refresh_policy_enabled
                 and notice_id in known_ids
-                and notice_refresh_due(
-                    notice_id,
-                    observation,
-                    previous_observation,
-                    crawl_now,
-                )
+                and notice_id not in refresh_known_ids
+                and fingerprint_changed
+                and len(selected_policy_refresh_ids) < automatic_refresh_limit
+            ):
+                selected_policy_refresh_ids.add(notice_id)
+            policy_refresh_due = bool(
+                refresh_policy_enabled
+                and notice_id in selected_policy_refresh_ids
             )
             if policy_refresh_due:
                 policy_refresh_ids.add(notice_id)

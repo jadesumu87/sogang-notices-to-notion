@@ -2630,6 +2630,154 @@ class CrawlerRegressionTests(unittest.TestCase):
             {"1005", "900"},
         )
 
+
+    def test_api_overdue_backlog_cannot_bypass_selected_refresh_limit(self):
+        ids = {str(value) for value in range(1000, 1400)}
+        observations = {
+            notice_id: {
+                **crawler.build_notice_observation(notice_id, f"공지 {notice_id}", DATE, False),
+                "last_detail_at": "2025-01-01T00:00:00+00:00",
+            }
+            for notice_id in ids
+        }
+        selected = {"1398", "1399"}
+        pages = {
+            1: api_page([api_entry(value) for value in sorted(ids, reverse=True)], total_count=400),
+            2: api_page([], terminal_verified=True, total_count=400),
+        }
+        with (
+            patch.dict(os.environ, {"DETAIL_REFRESH_LIMIT": "2"}),
+            patch.object(
+                crawler, "fetch_bbs_list_result", side_effect=lambda page, *a, **kw: pages[page]
+            ),
+            patch.object(
+                crawler, "fetch_bbs_detail", side_effect=lambda value, **kw: api_detail(value)
+            ) as details,
+            patch.object(crawler, "get_detail_html_fallback_reason", return_value=None),
+            patch.object(crawler, "extract_body_blocks_from_html", return_value=BODY),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                True,
+                0,
+                known_ids=ids,
+                incremental=True,
+                refresh_known_ids=selected,
+                source_state={"notice_refresh_state": observations},
+            )
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(len(result.notice_observations), 400)
+        self.assertEqual(set(result.detailed_notice_ids), selected)
+        self.assertEqual(details.call_count, 4)
+
+    def test_fallback_overdue_backlog_is_bounded_without_losing_index(self):
+        ids = {str(value) for value in range(1000, 1100)}
+        date = "2026-07-27T12:00:00+09:00"
+        entries = [
+            {
+                "title": f"공지 {value}",
+                "date": date,
+                "top": False,
+                "url": f"https://www.sogang.ac.kr/ko/detail/{value}?bbsConfigFk=141",
+            }
+            for value in sorted(ids, reverse=True)
+        ]
+        observations = {
+            value: {
+                **crawler.build_notice_observation(value, f"공지 {value}", date, False),
+                "last_detail_at": "2025-01-01T00:00:00+00:00",
+            }
+            for value in ids
+        }
+
+        def fetch_page(number):
+            values = entries if number == 1 else []
+            return FallbackPageResult(
+                ok=True,
+                requested_page=number,
+                effective_page=number,
+                source_config_fk="141",
+                entries=values,
+                final_url=f"{SOURCE.list_url}?page={number}",
+                contract_verified=True,
+                raw_entry_count=len(values),
+                explicit_empty=not values,
+            )
+
+        detail_calls = []
+
+        def fetch_detail(item, _number):
+            value = crawler.extract_detail_id_from_text(item["url"])
+            detail_calls.append(value)
+            return FallbackDetailResult(
+                ok=True,
+                notice_id=value,
+                url=item["url"],
+                title=item["title"],
+                date=date,
+                body_blocks=BODY,
+                body_status=crawler.BODY_STATUS_PRESENT,
+                attachments=[
+                    {
+                        "name": "file.pdf",
+                        "type": "external",
+                        "external": {"url": "https://www.sogang.ac.kr/file-fe-prd/file.pdf"},
+                    }
+                ],
+                attachments_status=crawler.ATTACHMENTS_STATUS_KNOWN,
+            )
+
+        original = SourceCrawlResult(
+            source=SOURCE, status=SourceStatus.FAILED, method="api", error="api_failed"
+        )
+        with patch.dict(os.environ, {"DETAIL_REFRESH_LIMIT": "2"}):
+            result = crawler.crawl_fallback_with_fetchers(
+                SOURCE,
+                True,
+                0,
+                ids,
+                True,
+                "fallback_http",
+                original,
+                fetch_page,
+                fetch_detail,
+                refresh_known_ids={"1098", "1099"},
+                source_state={"notice_refresh_state": observations},
+            )
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(len(result.notice_observations), 100)
+        self.assertEqual(set(detail_calls), {"1098", "1099"})
+
+    def test_item_checkpoint_survives_later_failure_without_requeuing_completed(self):
+        state = default_run_state()
+        result = crawl_result(items=[complete_notice("1001"), complete_notice("1002")])
+        result.notice_observations = {
+            value: crawler.build_notice_observation(
+                value,
+                f"공지 {value}",
+                DATE,
+                False,
+            )
+            for value in ("1001", "1002")
+        }
+        report = CrawlReport([result])
+        state["sources"]["141"] = {"pending_notice_ids": ["1001", "1002"]}
+        completed = set()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            crawler_main.checkpoint_completed_notice(
+                state, report, state_path, completed, "141", "1001"
+            )
+            crawler_main.preserve_failed_report_notice_ids(state, report, completed)
+            run_state.write_run_state_atomic(state_path, state)
+            recovered = run_state.load_run_state(state_path)
+        self.assertEqual(completed, {("141", "1001")})
+        self.assertEqual(recovered["sources"]["141"]["pending_notice_ids"], ["1002"])
+        self.assertIn("last_detail_at", recovered["sources"]["141"]["notice_refresh_state"]["1001"])
+        self.assertNotIn("1002", recovered["sources"]["141"]["notice_refresh_state"])
+
     def test_scheduled_refresh_does_not_consume_backfill_detail_limit(self):
         observation = crawler.build_notice_observation(
             "1006",
@@ -3556,6 +3704,23 @@ class CrawlerRegressionTests(unittest.TestCase):
 
 
 class SourceSchedulingRegressionTests(unittest.TestCase):
+    def test_destination_pending_notice_has_priority_over_large_retry_queue(self):
+        state = fresh_state()
+        state["sources"]["2"] = {"pending_notice_ids": [str(v) for v in range(1000, 1100)]}
+        context = sync_engine.DestinationContext(
+            "token",
+            "database",
+            pending_page_ids=("pending-page",),
+            pending_page_sources={"pending-page": "2"},
+            pending_page_notices={"pending-page": "9000"},
+        )
+        with patch.object(
+            crawler_main, "inspect_destination_pending_context", return_value=context
+        ):
+            crawler_main.refresh_destination_pending_notice_state(state, "token", "database", {"2"})
+        self.assertEqual(crawler_main.pending_notice_ids(state, "2")[0], "9000")
+        self.assertEqual(len(crawler_main.pending_notice_ids(state, "2")), 20)
+
     def test_failed_run_refreshes_pending_notice_before_next_crawl(self):
         state = fresh_state()
         state["runs"].append({"status": "failed"})

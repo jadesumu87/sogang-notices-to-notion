@@ -507,6 +507,7 @@ class SyncSafetyTests(unittest.TestCase):
         generation_id: str = "new-generation",
         blocks: list[dict] | None = None,
         allow_untracked_recovery: bool = False,
+        operation_id: str = "",
     ) -> str:
         blocks = blocks or [
             {
@@ -547,6 +548,7 @@ class SyncSafetyTests(unittest.TestCase):
                 blocks,
                 generation_id=generation_id,
                 allow_untracked_recovery=allow_untracked_recovery,
+                operation_id=operation_id,
             )
 
     def test_body_generation_failures_preserve_old_and_manual_blocks(self):
@@ -932,6 +934,110 @@ class SyncSafetyTests(unittest.TestCase):
             ],
             [f"본문 {index}" for index in range(166)],
         )
+
+    def test_initial_pending_body_resumes_with_stale_manifest_hash(self):
+        for actual_count in (50, 100, 136):
+            with self.subTest(actual_count=actual_count):
+                blocks = [
+                    paragraph_block("첫 문단"),
+                    *[paragraph_block(f"본문 {i}") for i in range(136)],
+                ]
+                item = {
+                    "source_id": "2",
+                    "notice_id": "123",
+                    "title": "공지",
+                    "body_blocks": blocks,
+                    "body_status": "present",
+                    "attachments": [],
+                }
+                operation = sync_engine.operation_id_for_item(item)
+                store = StatefulBlockStore()
+                root = {
+                    "id": "candidate",
+                    "type": "quote",
+                    "quote": {"rich_text": blocks[0]["paragraph"]["rich_text"]},
+                }
+                store.root_blocks = [root]
+                store.children = {"candidate": copy.deepcopy(blocks[1 : 1 + actual_count])}
+                manifest = {
+                    "v": 2,
+                    "g": "generation",
+                    "s": "pending",
+                    "op": operation,
+                    "t": 1,
+                    "p": [
+                        {
+                            "i": "candidate",
+                            "n": 1,
+                            "h": sync.sync_container_content_hash(
+                                "token", root["quote"]["rich_text"], blocks[1:51], False
+                            ),
+                        }
+                    ],
+                    "o": [],
+                }
+                store.properties = {
+                    sync.SYNC_GENERATION_PROPERTY: sync.body_generation_property_payload(manifest)
+                }
+                page = managed_page("page", "2", "123")
+                page["properties"].update(notion_read_properties(store.properties))
+                page["properties"][sync.SYNC_STATUS_PROPERTY] = rich_text_property("pending")
+                page["properties"][sync.SYNC_OPERATION_PROPERTY] = rich_text_property(operation)
+                with (
+                    patch.object(
+                        sync_engine, "list_block_children", side_effect=store.list_children
+                    ),
+                    patch.object(sync, "list_block_children", side_effect=store.list_children),
+                ):
+                    self.assertIsNone(sync_engine.shrink_candidate_for_item("token", item, page))
+                    changed_page = copy.deepcopy(page)
+                    changed_page["properties"][sync.BODY_HASH_PROPERTY] = rich_text_property(
+                        "old-completed-hash"
+                    )
+                    self.assertIsNotNone(
+                        sync_engine.shrink_candidate_for_item("token", item, changed_page)
+                    )
+                    altered = copy.deepcopy(item)
+                    altered["body_blocks"][1] = paragraph_block("다른 원문")
+                    self.assertIsNotNone(
+                        sync_engine.shrink_candidate_for_item("token", altered, page)
+                    )
+                    store.children["candidate"][0] = paragraph_block("다른 Notion 본문")
+                    self.assertIsNotNone(sync_engine.shrink_candidate_for_item("token", item, page))
+                    store.children["candidate"][0] = copy.deepcopy(blocks[1])
+                # The transaction already supports a verified prefix beyond its last saved hash.
+                self.run_body_sync(
+                    store, generation_id="generation", blocks=blocks, operation_id=operation
+                )
+                self.assertEqual(store.root_append_count, 0)
+                self.assertEqual(len(store.children["candidate"]), 136)
+                self.assertEqual(len(store.root_blocks), 1)
+
+    def test_low_time_reserve_prevents_first_destination_write(self):
+        context = sync_engine.DestinationContext("token", "database")
+        item = {
+            "source_id": "2",
+            "notice_id": "123",
+            "title": "공지",
+            "url": "https://www.sogang.ac.kr/ko/detail/123",
+            "body_blocks": [],
+            "body_status": "confirmed_empty",
+            "attachments": [],
+            "top": False,
+        }
+        with (
+            patch.object(
+                sync_engine,
+                "require_destination_state_reserve",
+                side_effect=RuntimeError("시간 부족"),
+            ),
+            patch.object(sync_engine, "create_page") as create,
+            patch.object(sync_engine, "update_page") as update,
+            self.assertRaisesRegex(RuntimeError, "시간 부족"),
+        ):
+            sync_engine.apply_item(context, item, SyncCounters(), existing_page_resolved=True)
+        create.assert_not_called()
+        update.assert_not_called()
 
     def test_pending_child_prefix_resumes_without_duplicate(self):
         generation_id = "pending-prefix-generation"
@@ -7275,6 +7381,7 @@ class SyncSafetyTests(unittest.TestCase):
             }
         }
 
+        completed = []
         with (
             patch.object(
                 sync_engine,
@@ -7322,8 +7429,10 @@ class SyncSafetyTests(unittest.TestCase):
                 previous_state=state,
                 run_id="100:1",
                 logical_run_id="100",
+                on_item_completed=lambda source, notice: completed.append((source, notice)),
             )
 
+        self.assertEqual(completed, [("2", "200")])
         self.assertTrue(
             apply_item.call_args.kwargs["force_commit_readback"]
         )

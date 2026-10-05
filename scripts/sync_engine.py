@@ -29,13 +29,18 @@ from notion_client import (
     ensure_destination_schema,
     external_download_run_scope,
     fetch_database,
+    list_block_children,
     prepare_attachments_for_sync,
     prepare_body_blocks_for_sync,
     retrieve_page,
     update_page,
     validate_destination_schema,
 )
-from run_control import check_run_control, sleep_with_run_control
+from run_control import (
+    check_run_control,
+    require_destination_state_reserve,
+    sleep_with_run_control,
+)
 from run_state import latest_run_identities
 from settings import (
     ATTACHMENT_PROPERTY,
@@ -81,6 +86,7 @@ from sync import (
     normalize_item_attachments,
     split_body_container_parts,
     sync_container_content_hash,
+    sync_container_prefix_validation,
     sync_page_body_blocks,
     top_level_quote_state,
     top_candidate_fingerprints,
@@ -444,6 +450,39 @@ def should_preserve_existing_top(
     return top_property.get("checkbox") is True
 
 
+def initial_pending_body_matches(
+    token: str,
+    item: dict[str, Any],
+    page: dict[str, Any],
+    operation_id: str,
+) -> bool:
+    properties = page.get("properties", {})
+    manifest = extract_body_generation_manifest(properties)
+    if (
+        extract_rich_text_value(properties, SYNC_STATUS_PROPERTY) != "pending"
+        or extract_rich_text_value(properties, BODY_HASH_PROPERTY)
+        or extract_rich_text_value(properties, SYNC_OPERATION_PROPERTY)
+        != operation_id
+        or manifest is None
+        or manifest.get("v") != 2
+        or manifest.get("s") != "pending"
+        or manifest.get("op") != operation_id
+        or manifest.get("o")
+        or len(manifest.get("p", [])) != 1
+        or (should_upload_files_to_notion()
+            and has_image_blocks(item.get("body_blocks") or []))
+    ):
+        return False
+    roots = list_block_children(token, str(page["id"]))
+    if len(roots) != 1 or roots[0].get("id") != manifest["p"][0]["i"]:
+        return False
+    rich_text, parts = split_body_container_parts(item.get("body_blocks") or [])
+    prefix, reason = sync_container_prefix_validation(
+        token, roots[0], rich_text, [child for part in parts for child in part],
+    )
+    return prefix is not None and not reason
+
+
 def shrink_candidate_for_item(
     _token: str,
     item: dict[str, Any],
@@ -451,6 +490,8 @@ def shrink_candidate_for_item(
     body_media_content_state: Optional[
         list[dict[str, Any]]
     ] = None,
+    *,
+    expected_operation_id: str = "",
 ) -> Optional[dict[str, Any]]:
     if not existing_page:
         return None
@@ -508,6 +549,14 @@ def shrink_candidate_for_item(
     ) and desired_body_hash != existing_body_hash:
         reasons.append("body_hash_changed")
     if not reasons:
+        return None
+    if (
+        reasons == ["body_hash_changed"]
+        and initial_pending_body_matches(
+            _token, item, existing_page,
+            expected_operation_id or operation_id_for_item(item),
+        )
+    ):
         return None
     candidate_payload = {
         "source_id": str(item.get("source_id") or ""),
@@ -1158,9 +1207,10 @@ def _apply_item(
         nonlocal pre_write_validated
         if pre_write_validated:
             return
-        check_run_control()
+        require_destination_state_reserve()
         if pre_write_validation is not None:
             pre_write_validation()
+        require_destination_state_reserve()
         pre_write_validated = True
 
     token = context.token
@@ -1841,6 +1891,7 @@ def resolve_destination_preflight(
                         body_media_content_state=(
                             body_media_content_state
                         ),
+                        expected_operation_id=operation_id,
                     )
                 ),
                 page_fingerprint=managed_page_fingerprint(existing_page),
@@ -2305,6 +2356,7 @@ def _apply_report(
     previous_state: Optional[dict[str, Any]] = None,
     run_id: str = "",
     logical_run_id: str = "",
+    on_item_completed: Optional[Callable[[str, str], None]] = None,
 ) -> SyncCounters:
     results = safe_source_results(report)
     if not results:
@@ -2485,6 +2537,7 @@ def _apply_report(
                     str(entry.item.get("notice_id") or ""),
                 )
                 in state_pending_identities
+                or on_item_completed is not None
             ),
             pre_write_validation=validate_before_entry_write,
         )
@@ -2511,6 +2564,8 @@ def _apply_report(
         )
         if entry_page_id in pending_page_ids:
             verified_pending_page_ids.add(entry_page_id)
+        if on_item_completed is not None:
+            on_item_completed(entry_source_id, entry_notice_id)
     LOGGER.info(
         "목적지 항목 처리 완료: 항목=%s, 외부 미디어 보류=%s",
         total_active_entries,
@@ -2730,6 +2785,7 @@ def apply_report(
     previous_state: Optional[dict[str, Any]] = None,
     run_id: str = "",
     logical_run_id: str = "",
+    on_item_completed: Optional[Callable[[str, str], None]] = None,
 ) -> SyncCounters:
     with external_download_run_scope(force_new=True) as download_run:
         counters = _apply_report(
@@ -2740,6 +2796,7 @@ def apply_report(
             previous_state=previous_state,
             run_id=run_id,
             logical_run_id=logical_run_id,
+            on_item_completed=on_item_completed,
         )
         snapshot = download_run.snapshot()
     counters.external_download_requests = int(snapshot["requests"])

@@ -1,7 +1,9 @@
 import sys
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -155,6 +157,31 @@ class RefreshPolicyTests(unittest.TestCase):
             ),
             ["4000"],
         )
+
+    def test_overdue_backlog_is_bounded_and_rotates_by_due_time(self):
+        state = {"notice_refresh_state": {}}
+        known = {str(value) for value in range(1000, 1400)}
+        for index, notice_id in enumerate(sorted(known)):
+            state["notice_refresh_state"][notice_id] = {
+                **self.observation(notice_id, timedelta(days=100)),
+                "last_detail_at": (self.now - timedelta(days=14, minutes=index)).isoformat(),
+            }
+        first = refresh_policy.select_due_notice_ids(state, known, self.now)
+        self.assertEqual(len(first), 20)
+        self.assertEqual(first[0], "1399")
+        for notice_id in first:
+            state["notice_refresh_state"][notice_id]["last_detail_at"] = self.now.isoformat()
+        second = refresh_policy.select_due_notice_ids(state, known, self.now)
+        self.assertEqual(len(second), 20)
+        self.assertTrue(set(first).isdisjoint(second))
+        self.assertEqual(second[0], "1379")
+        self.assertEqual(refresh_policy.select_due_notice_ids(state, known, self.now, limit=0), [])
+
+    def test_refresh_limit_configuration_is_bounded(self):
+        for value, expected in (("bad", 20), ("0", 1), ("9999", 100), ("7", 7)):
+            with self.subTest(value=value), patch.dict(os.environ, {"DETAIL_REFRESH_LIMIT": value}):
+                self.assertEqual(refresh_policy.get_detail_refresh_limit(), expected)
+
 
 
 if __name__ == "__main__":

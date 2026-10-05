@@ -1297,6 +1297,30 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(refresh_state["1001"]["first_seen_at"], fixed_now)
         self.assertEqual(refresh_state["1001"]["last_detail_at"], fixed_now)
 
+    def test_deferred_list_change_keeps_last_verified_fingerprint(self):
+        state = run_state.default_run_state()
+        state["sources"]["141"] = {
+            "notice_refresh_state": {
+                "1001": {"fingerprint": "a" * 64, "last_detail_at": "2026-08-01T00:00:00+00:00"},
+            }
+        }
+        result = source_result("141", SourceStatus.SUCCESS, ["1001"])
+        result.notice_observations = {"1001": {"fingerprint": "b" * 64}}
+        result.notice_index_complete = True
+        run_state.update_state_from_report(
+            state, CrawlReport([result]), False, applied_source_ids={"141"}
+        )
+        self.assertEqual(
+            state["sources"]["141"]["notice_refresh_state"]["1001"]["fingerprint"], "a" * 64
+        )
+        result.detailed_notice_ids = ["1001"]
+        run_state.update_state_from_report(
+            state, CrawlReport([result]), False, applied_source_ids={"141"}
+        )
+        self.assertEqual(
+            state["sources"]["141"]["notice_refresh_state"]["1001"]["fingerprint"], "b" * 64
+        )
+
     def test_malformed_notice_refresh_state_fails_closed(self):
         state = run_state.default_run_state()
         state["sources"]["141"] = {

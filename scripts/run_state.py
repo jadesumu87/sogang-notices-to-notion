@@ -1219,7 +1219,11 @@ def update_state_from_report(
                     previous_observation = {}
                 merged_observation = {
                     "fingerprint": str(
-                        observation.get("fingerprint") or ""
+                        (
+                            previous_observation.get("fingerprint")
+                            if notice_id not in detailed_notice_ids
+                            else observation.get("fingerprint")
+                        ) or observation.get("fingerprint") or ""
                     ),
                 }
                 published_at = str(

@@ -24,7 +24,7 @@ from models import (
     ValidationIssue,
     utc_now_iso,
 )
-from refresh_policy import select_due_notice_ids
+from refresh_policy import get_detail_refresh_limit, select_due_notice_ids
 from run_control import (
     install_run_control,
     require_destination_state_reserve,
@@ -229,9 +229,13 @@ def refresh_destination_pending_notice_state(
         raise DestinationConsistencyError(
             "실행 상태의 출처 정보를 신뢰할 수 없습니다"
         )
+    pending_by_source: dict[str, list[str]] = {}
     for page_id in sorted(pending_page_ids):
         source_id = context.pending_page_sources[page_id]
-        notice_id = context.pending_page_notices[page_id]
+        pending_by_source.setdefault(source_id, []).append(
+            context.pending_page_notices[page_id]
+        )
+    for source_id, destination_pending_ids in pending_by_source.items():
         source_state = sources.setdefault(source_id, {})
         if not isinstance(source_state, dict):
             raise DestinationConsistencyError(
@@ -242,16 +246,10 @@ def refresh_destination_pending_notice_state(
             raise DestinationConsistencyError(
                 "실행 상태의 대기 공지 ID를 신뢰할 수 없습니다"
             )
-        pending_notice_ids = sorted(
-            {
-                *(
-                    str(value)
-                    for value in existing
-                    if str(value).strip()
-                ),
-                notice_id,
-            }
-        )
+        pending_notice_ids = list(dict.fromkeys([
+            *destination_pending_ids,
+            *(str(value) for value in existing if str(value).strip()),
+        ]))
         if len(pending_notice_ids) > 1000:
             raise DestinationConsistencyError(
                 "출처별 대기 공지 상태가 보존 한도를 초과했습니다"
@@ -471,9 +469,17 @@ def collect_report(
             for config_fk in config_fks
         }
         scheduled_refresh_ids_by_source = {
-            config_fk: select_refresh_ids(
+            config_fk: select_due_notice_ids(
                 source_states.get(config_fk, {}),
-                state_known_ids_by_source[config_fk],
+                state_known_ids_by_source[config_fk]
+                - set(pending_shrink_ids(state, config_fk))
+                - manual_recovery_ids_by_source.get(config_fk, set()),
+                limit=max(
+                    0,
+                    get_detail_refresh_limit()
+                    - len(set(pending_shrink_ids(state, config_fk))
+                          | manual_recovery_ids_by_source.get(config_fk, set())),
+                ),
             )
             if (
                 state_known_ids_by_source[config_fk]
@@ -719,9 +725,10 @@ def persist_failed_run(
     report: Optional[CrawlReport],
     state_path: Path,
     incident_path: Path,
+    completed_notices: Optional[set[tuple[str, str]]] = None,
 ) -> tuple[dict[str, Any], bool]:
     if report is not None and not record.dry_run:
-        preserve_failed_report_notice_ids(state, report)
+        preserve_failed_report_notice_ids(state, report, completed_notices)
     mark_exception_failure(state, exc)
     category = classify_exception(exc)
     record.finished_at = utc_now_iso()
@@ -746,9 +753,44 @@ def persist_failed_run(
     return incident, deduplicated
 
 
+def checkpoint_completed_notice(
+    state: dict[str, Any],
+    report: CrawlReport,
+    state_path: Path,
+    completed_notices: set[tuple[str, str]],
+    source_id: str,
+    notice_id: str,
+) -> None:
+    result = next(
+        result for result in safe_source_results(report)
+        if result.source.config_fk == source_id
+    )
+    source_state = state["sources"].setdefault(source_id, {})
+    now = utc_now_iso()
+    metadata = source_state.setdefault("notice_refresh_state", {})
+    previous = metadata.get(notice_id, {})
+    observation = result.notice_observations.get(notice_id, {})
+    if observation:
+        metadata[notice_id] = {
+            **observation,
+            "first_seen_at": previous.get("first_seen_at") or now,
+            "last_detail_at": now,
+        }
+    source_state["observed_ids"] = sorted(
+        set(source_state.get("observed_ids", [])) | {notice_id}
+    )
+    source_state["pending_notice_ids"] = [
+        value for value in source_state.get("pending_notice_ids", [])
+        if value != notice_id
+    ]
+    write_run_state_atomic(state_path, state)
+    completed_notices.add((source_id, notice_id))
+
+
 def preserve_failed_report_notice_ids(
     state: dict[str, Any],
     report: CrawlReport,
+    completed_notices: Optional[set[tuple[str, str]]] = None,
 ) -> int:
     sources = state.get("sources")
     if not isinstance(sources, dict):
@@ -762,6 +804,8 @@ def preserve_failed_report_notice_ids(
             str(item.get("notice_id") or "").strip()
             for item in result.items
             if str(item.get("notice_id") or "").strip()
+            and (source_id, str(item.get("notice_id") or "").strip())
+            not in (completed_notices or set())
         }
         if not retry_ids:
             continue
@@ -889,6 +933,7 @@ def main() -> None:
         )
         record = create_run_record(full_reconcile, dry_run)
         report: Optional[CrawlReport] = None
+        completed_notices: set[tuple[str, str]] = set()
         try:
             validate_destination_write_authorization(
                 dry_run,
@@ -1071,6 +1116,14 @@ def main() -> None:
                 counters = None
                 if safe_results:
                     require_destination_state_reserve()
+
+                    def checkpoint(source_id: str, notice_id: str) -> None:
+                        assert report is not None
+                        checkpoint_completed_notice(
+                            state, report, state_path, completed_notices,
+                            source_id, notice_id,
+                        )
+
                     counters = apply_report(
                         notion_token,
                         database_id,
@@ -1079,6 +1132,7 @@ def main() -> None:
                         previous_state=state,
                         run_id=record.execution_id,
                         logical_run_id=record.run_id,
+                        on_item_completed=checkpoint,
                     )
                 elif report.write_safe:
                     raise RuntimeError("동기화할 출처가 없습니다")
@@ -1253,8 +1307,9 @@ def main() -> None:
                 write_run_state_atomic(state_path, state)
                 if counters is not None:
                     LOGGER.info(
-                        "동기화 완료: 생성=%s, 속성=%s, 본문=%s, TOP해제=%s, "
+                        "%s: 생성=%s, 속성=%s, 본문=%s, TOP해제=%s, "
                         "무변경=%s, 미디어보류=%s, 호스트보류=%s, 전체쓰기=%s",
+                        "동기화 안전 보류" if deferred_error else "동기화 완료",
                         counters.created,
                         counters.property_updates,
                         counters.body_updates,
@@ -1279,6 +1334,7 @@ def main() -> None:
                 report,
                 state_path,
                 incident_path,
+                completed_notices,
             )
             if failure_deduplicated:
                 LOGGER.warning(
