@@ -123,6 +123,14 @@ def get_detail_refresh_limit() -> int:
     return min(100, max(1, value))
 
 
+def get_detail_change_refresh_limit() -> int:
+    try:
+        value = int(os.environ.get("DETAIL_CHANGE_REFRESH_LIMIT", "5"))
+    except ValueError:
+        return 5
+    return min(20, max(1, value))
+
+
 def select_due_notice_ids(
     source_state: dict[str, Any],
     known_ids: set[str],

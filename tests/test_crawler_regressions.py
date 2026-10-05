@@ -2671,6 +2671,56 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertEqual(set(result.detailed_notice_ids), selected)
         self.assertEqual(details.call_count, 4)
 
+    def test_changed_titles_get_bounded_priority_when_scheduled_batch_is_full(self):
+        ids = {str(value) for value in range(1000, 1100)}
+        entries = [api_entry(value) for value in sorted(ids, reverse=True)]
+        observations = {
+            value: {
+                **crawler.build_notice_observation(value, f"공지 {value}", DATE, False),
+                "last_detail_at": "2025-01-01T00:00:00+00:00",
+            }
+            for value in ids
+        }
+        for entry in entries:
+            if entry["pkId"] not in {"1000", "1001"}:
+                entry["title"] += " 수정"
+        pages = {
+            1: api_page(entries, total_count=100),
+            2: api_page([], terminal_verified=True, total_count=100),
+        }
+
+        def detail(value, **kwargs):
+            item = api_detail(value)
+            if value not in {"1000", "1001"}:
+                item["title"] += " 수정"
+            return item
+
+        with (
+            patch.dict(
+                os.environ, {"DETAIL_REFRESH_LIMIT": "2", "DETAIL_CHANGE_REFRESH_LIMIT": "3"}
+            ),
+            patch.object(
+                crawler, "fetch_bbs_list_result", side_effect=lambda page, *a, **kw: pages[page]
+            ),
+            patch.object(crawler, "fetch_bbs_detail", side_effect=detail),
+            patch.object(crawler, "get_detail_html_fallback_reason", return_value=None),
+            patch.object(crawler, "extract_body_blocks_from_html", return_value=BODY),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                True,
+                0,
+                known_ids=ids,
+                incremental=True,
+                refresh_known_ids={"1000", "1001"},
+                source_state={"notice_refresh_state": observations},
+            )
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(set(result.detailed_notice_ids), {"1000", "1001", "1099", "1098", "1097"})
+        self.assertEqual(len(result.notice_observations), 100)
+        self.assertNotIn("1096", result.detailed_notice_ids)
+
     def test_fallback_overdue_backlog_is_bounded_without_losing_index(self):
         ids = {str(value) for value in range(1000, 1100)}
         date = "2026-07-27T12:00:00+09:00"
@@ -2749,6 +2799,90 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertTrue(result.notice_index_complete)
         self.assertEqual(len(result.notice_observations), 100)
         self.assertEqual(set(detail_calls), {"1098", "1099"})
+
+    def test_fallback_changed_titles_have_a_separate_bounded_priority_budget(self):
+        ids = {str(value) for value in range(1000, 1100)}
+        date = "2026-07-27T12:00:00+09:00"
+        entries = [
+            {
+                "title": f"공지 {value}",
+                "date": date,
+                "top": False,
+                "url": f"https://www.sogang.ac.kr/ko/detail/{value}?bbsConfigFk=141",
+            }
+            for value in sorted(ids, reverse=True)
+        ]
+        observations = {
+            value: {
+                **crawler.build_notice_observation(value, f"공지 {value}", date, False),
+                "last_detail_at": "2025-01-01T00:00:00+00:00",
+            }
+            for value in ids
+        }
+
+        def fetch_page(number):
+            values = entries if number == 1 else []
+            return FallbackPageResult(
+                ok=True,
+                requested_page=number,
+                effective_page=number,
+                source_config_fk="141",
+                entries=values,
+                final_url=f"{SOURCE.list_url}?page={number}",
+                contract_verified=True,
+                raw_entry_count=len(values),
+                explicit_empty=not values,
+            )
+
+        for value in entries:
+            if crawler.extract_detail_id_from_text(value["url"]) not in {"1098", "1099"}:
+                value["title"] += " 수정"
+        detail_calls = []
+
+        def fetch_detail(item, _number):
+            value = crawler.extract_detail_id_from_text(item["url"])
+            detail_calls.append(value)
+            return FallbackDetailResult(
+                ok=True,
+                notice_id=value,
+                url=item["url"],
+                title=item["title"],
+                date=date,
+                body_blocks=BODY,
+                body_status=crawler.BODY_STATUS_PRESENT,
+                attachments=[
+                    {
+                        "name": "file.pdf",
+                        "type": "external",
+                        "external": {"url": "https://www.sogang.ac.kr/file-fe-prd/file.pdf"},
+                    }
+                ],
+                attachments_status=crawler.ATTACHMENTS_STATUS_KNOWN,
+            )
+
+        original = SourceCrawlResult(
+            source=SOURCE, status=SourceStatus.FAILED, method="api", error="api_failed"
+        )
+        with patch.dict(
+            os.environ, {"DETAIL_REFRESH_LIMIT": "2", "DETAIL_CHANGE_REFRESH_LIMIT": "3"}
+        ):
+            result = crawler.crawl_fallback_with_fetchers(
+                SOURCE,
+                True,
+                0,
+                ids,
+                True,
+                "fallback_http",
+                original,
+                fetch_page,
+                fetch_detail,
+                refresh_known_ids={"1098", "1099"},
+                source_state={"notice_refresh_state": observations},
+            )
+        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
+        self.assertTrue(result.notice_index_complete)
+        self.assertEqual(len(result.notice_observations), 100)
+        self.assertEqual(set(detail_calls), {"1098", "1099", "1097", "1096", "1095"})
 
     def test_item_checkpoint_survives_later_failure_without_requeuing_completed(self):
         state = default_run_state()

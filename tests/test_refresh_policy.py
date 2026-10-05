@@ -182,6 +182,14 @@ class RefreshPolicyTests(unittest.TestCase):
             with self.subTest(value=value), patch.dict(os.environ, {"DETAIL_REFRESH_LIMIT": value}):
                 self.assertEqual(refresh_policy.get_detail_refresh_limit(), expected)
 
+    def test_changed_notice_budget_is_small_and_configurable(self):
+        for value, expected in (("bad", 5), ("0", 1), ("9999", 20), ("3", 3)):
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, {"DETAIL_CHANGE_REFRESH_LIMIT": value}),
+            ):
+                self.assertEqual(refresh_policy.get_detail_change_refresh_limit(), expected)
+
 
 
 if __name__ == "__main__":

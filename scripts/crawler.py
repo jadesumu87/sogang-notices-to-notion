@@ -52,6 +52,7 @@ from models import (
 from refresh_policy import (
     build_notice_observation,
     get_detail_refresh_limit,
+    get_detail_change_refresh_limit,
     select_due_notice_ids,
 )
 from bbs_parser import (
@@ -2056,6 +2057,8 @@ def crawl_top_items_api_result(
         else {}
     )
     refresh_policy_enabled = source_state is not None
+    changed_refresh_ids: set[str] = set()
+    change_refresh_limit = get_detail_change_refresh_limit()
     automatic_refresh_limit = max(
         0, get_detail_refresh_limit() - len(refresh_known_ids)
     )
@@ -2417,9 +2420,11 @@ def crawl_top_items_api_result(
                 refresh_policy_enabled
                 and pk_id in known_ids
                 and pk_id not in refresh_known_ids
+                and pk_id not in selected_policy_refresh_ids
                 and fingerprint_changed
-                and len(selected_policy_refresh_ids) < automatic_refresh_limit
+                and len(changed_refresh_ids) < change_refresh_limit
             ):
+                changed_refresh_ids.add(pk_id)
                 selected_policy_refresh_ids.add(pk_id)
             policy_refresh_due = bool(
                 refresh_policy_enabled
@@ -4324,6 +4329,8 @@ def crawl_fallback_with_fetchers(
         else {}
     )
     refresh_policy_enabled = source_state is not None
+    changed_refresh_ids: set[str] = set()
+    change_refresh_limit = get_detail_change_refresh_limit()
     automatic_refresh_limit = max(
         0, get_detail_refresh_limit() - len(refresh_known_ids)
     )
@@ -4566,9 +4573,11 @@ def crawl_fallback_with_fetchers(
                 refresh_policy_enabled
                 and notice_id in known_ids
                 and notice_id not in refresh_known_ids
+                and notice_id not in selected_policy_refresh_ids
                 and fingerprint_changed
-                and len(selected_policy_refresh_ids) < automatic_refresh_limit
+                and len(changed_refresh_ids) < change_refresh_limit
             ):
+                changed_refresh_ids.add(notice_id)
                 selected_policy_refresh_ids.add(notice_id)
             policy_refresh_due = bool(
                 refresh_policy_enabled
