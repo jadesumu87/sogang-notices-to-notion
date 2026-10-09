@@ -22,7 +22,10 @@ from models import (
 from run_state import default_run_state, update_state_from_report
 
 
-DATE = "2026-07-27T12:00:00+09:00"
+RECENT_NOTICE_TIME = (
+    datetime.now(timezone(timedelta(hours=9))) - timedelta(days=1)
+).replace(hour=12, minute=0, second=0, microsecond=0)
+DATE = RECENT_NOTICE_TIME.isoformat()
 BODY = [
     {
         "type": "paragraph",
@@ -335,7 +338,10 @@ class FallbackContractTests(unittest.TestCase):
                 ),
             ),
             self.detail(first, title="다른 공지"),
-            self.detail(first, date="2026-07-26T12:00:00+09:00"),
+            self.detail(
+                first,
+                date=(RECENT_NOTICE_TIME - timedelta(days=1)).isoformat(),
+            ),
         )
         for detail in cases:
             with self.subTest(detail=detail):
@@ -368,6 +374,8 @@ class FallbackContractTests(unittest.TestCase):
         known_ids = {"1004", "1003", "1002", "1001", "1000", "900"}
         changed = self.entry("900", title="수정된 과거 공지")
         changed["date"] = "2025-01-01T09:00:00+09:00"
+        old_unknown = self.entry("800")
+        old_unknown["date"] = "2024-12-31T09:00:00+09:00"
         last_detail_at = datetime.now(timezone.utc).isoformat()
         notice_refresh_state = {}
         for notice_id in known_ids - {"900"}:
@@ -404,7 +412,7 @@ class FallbackContractTests(unittest.TestCase):
                     3,
                     [self.entry("1001"), self.entry("1000")],
                 ),
-                4: self.page(4, [self.entry("800"), changed]),
+                4: self.page(4, [old_unknown, changed]),
                 5: self.page(5, [], explicit_empty=True),
             },
             {
@@ -432,7 +440,7 @@ class FallbackContractTests(unittest.TestCase):
 
     def test_refresh_policy_caps_unknown_fallback_details_inside_large_page(self):
         entries = [self.entry(str(2000 - index)) for index in range(8)]
-        with patch.dict(os.environ, {"BACKFILL_DETAIL_LIMIT": "2"}):
+        with patch.dict(os.environ, {"DETAIL_COLLECTION_LIMIT": "2"}):
             result = self.crawl(
                 {
                     1: self.page(1, entries),
@@ -445,8 +453,8 @@ class FallbackContractTests(unittest.TestCase):
 
         self.assertTrue(result.write_safe, result.to_dict(include_items=True))
         self.assertEqual(result.detailed_notice_ids, ["2000", "1999"])
-        self.assertEqual(result.termination_reason, "backfill_window")
-        self.assertEqual(result.backfill_resume_page, 1)
+        self.assertEqual(result.termination_reason, "natural_end")
+        self.assertNotIn("1998", result.observed_ids)
         self.assertTrue(result.notice_index_complete)
         self.assertEqual(len(result.notice_observations), len(entries))
         self.assertEqual(result.observed_ids, ["2000", "1999"])

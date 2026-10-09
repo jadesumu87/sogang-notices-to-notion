@@ -8,7 +8,7 @@ from common import extract_detail_id_from_text
 from crawler import (
     build_source_spec,
     crawl_sources,
-    get_backfill_detail_limit,
+    get_detail_collection_limit,
 )
 from log import LOGGER, log_environment_info, setup_logging
 from models import (
@@ -24,7 +24,11 @@ from models import (
     ValidationIssue,
     utc_now_iso,
 )
-from refresh_policy import get_detail_refresh_limit, select_due_notice_ids
+from refresh_policy import (
+    MONTH_AGE_LIMIT,
+    get_detail_refresh_limit,
+    select_due_notice_ids,
+)
 from run_control import (
     install_run_control,
     require_destination_state_reserve,
@@ -114,7 +118,7 @@ def pending_shrink_ids(
                 *shrink_ids,
             ]
         )
-    )[:get_backfill_detail_limit()]
+    )[:get_detail_collection_limit()]
 
 
 def pending_notice_ids(
@@ -133,7 +137,7 @@ def pending_notice_ids(
             for value in values
             if str(value).strip()
         )
-    )[:get_backfill_detail_limit()]
+    )[:get_detail_collection_limit()]
 
 
 def manual_recovery_notice_ids(
@@ -144,7 +148,7 @@ def manual_recovery_notice_ids(
         return {}
     configured = set(configured_source_ids)
     raw_entries = raw.split(",")
-    entry_limit = max(1, len(configured)) * get_backfill_detail_limit()
+    entry_limit = max(1, len(configured)) * get_detail_collection_limit()
     if len(raw) > 16384 or len(raw_entries) > entry_limit:
         raise LocalConfigurationError(
             "수동 복구 공지 요청이 처리 한도를 초과했습니다",
@@ -173,7 +177,7 @@ def manual_recovery_notice_ids(
             )
         source_notice_ids = recovered.setdefault(source_id, set())
         source_notice_ids.add(notice_id)
-        if len(source_notice_ids) > get_backfill_detail_limit():
+        if len(source_notice_ids) > get_detail_collection_limit():
             raise LocalConfigurationError(
                 "출처별 수동 복구 공지가 상세 수집 한도를 초과했습니다",
                 "source_contract",
@@ -261,15 +265,6 @@ def refresh_destination_pending_notice_state(
             len(pending_page_ids),
         )
     return len(pending_page_ids)
-
-
-def backfill_resume_page(source_state: object) -> int:
-    if not isinstance(source_state, dict):
-        return 1
-    try:
-        return max(1, int(source_state.get("backfill_resume_page") or 1))
-    except (TypeError, ValueError):
-        return 1
 
 
 def external_download_incident_summary(
@@ -460,10 +455,6 @@ def collect_report(
                 and (
                     not reconcile_by_source[config_fk]
                     or known_ids_by_source[config_fk]
-                    or (
-                        isinstance(source_states.get(config_fk), dict)
-                        and source_states[config_fk].get("backfill_active")
-                    )
                 )
             )
             for config_fk in config_fks
@@ -507,43 +498,20 @@ def collect_report(
             )
             for config_fk in config_fks
         }
-        resume_pages_by_source = {
-            config_fk: (
-                backfill_resume_page(
-                    source_states.get(config_fk, {})
-                )
-                if reconcile_by_source[config_fk]
-                else 1
-            )
-            for config_fk in config_fks
-        }
         for config_fk in config_fks:
             source_state = source_states.get(config_fk, {})
-            backfill_active = bool(
-                isinstance(source_state, dict)
-                and source_state.get("backfill_active")
-            )
             LOGGER.info(
-                "수집 계획: 출처=%s, 모드=%s, 상세 한도=%s, "
-                "시작 페이지=%s, 백필=%s, 최근 조정 시도=%s, "
-                "보강 판정=%s, 다음 보강 가능=%s, 재확인 대상=%s",
+                "수집 계획: 출처=%s, 모드=%s, 새 공지 범위=최근 %s일, "
+                "새 공지 한도=%s, 최근 전체 확인 시도=%s, "
+                "전체 확인 판정=%s, 다음 전체 확인 가능=%s, 재확인 대상=%s",
                 config_fk,
                 (
-                    "과거 보강"
+                    "전체 확인"
                     if reconcile_by_source[config_fk]
                     else "증분"
                 ),
-                (
-                    get_backfill_detail_limit()
-                    if reconcile_by_source[config_fk]
-                    else "-"
-                ),
-                resume_pages_by_source[config_fk],
-                (
-                    "진행"
-                    if reconcile_by_source[config_fk] and backfill_active
-                    else ("대기" if backfill_active else "-")
-                ),
+                MONTH_AGE_LIMIT.days,
+                get_detail_collection_limit(),
                 (
                     str(
                         source_state.get("last_reconcile_attempt_at")
@@ -554,7 +522,7 @@ def collect_report(
                     else "-"
                 ),
                 (
-                    "강제 전체 조정"
+                    "강제 전체 확인"
                     if force_all_reconcile
                     else reconcile_schedule_by_source[config_fk][2]
                 ),
@@ -573,34 +541,6 @@ def collect_report(
             reconcile_mode=full_reconcile,
             reconcile_mode_by_source=reconcile_by_source,
             refresh_ids_by_source=refresh_ids_by_source,
-            resume_page_by_source=resume_pages_by_source,
-            resume_anchor_ids_by_source={
-                config_fk: (
-                    {
-                        str(value)
-                        for value in source_states.get(
-                            config_fk,
-                            {},
-                        ).get("backfill_anchor_ids", [])
-                        if str(value)
-                    }
-                    if (
-                        reconcile_by_source[config_fk]
-                        and isinstance(
-                            source_states.get(config_fk),
-                            dict,
-                        )
-                        and isinstance(
-                            source_states[config_fk].get(
-                                "backfill_anchor_ids"
-                            ),
-                            list,
-                        )
-                    )
-                    else set()
-                )
-                for config_fk in config_fks
-            },
             targeted_refresh_ids_by_source=(
                 targeted_refresh_ids_by_source
             ),

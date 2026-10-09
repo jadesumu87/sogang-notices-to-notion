@@ -566,7 +566,6 @@ class RunStateTests(unittest.TestCase):
     def test_daily_reconcile_waits_for_local_window_without_drifting(self):
         state = run_state.default_run_state()
         state["sources"]["141"] = {
-            "backfill_active": True,
             "last_reconcile_local_date": "2026-08-03",
         }
 
@@ -597,33 +596,11 @@ class RunStateTests(unittest.TestCase):
         )
         self.assertFalse(due)
         self.assertEqual(next_at, "2026-08-05T07:00:00+09:00")
-        self.assertEqual(reason, "오늘 보강 완료")
-
-    def test_legacy_backfill_uses_recent_success_as_attempt_watermark(self):
-        state = run_state.default_run_state()
-        state["sources"]["141"] = {
-            "backfill_active": True,
-            "last_success_at": "2026-08-04T03:56:50+00:00",
-        }
-
-        self.assertFalse(
-            run_state.source_reconcile_due(
-                state,
-                "141",
-                7,
-                datetime(2026, 8, 4, 6, 0, tzinfo=timezone.utc),
-            )
-        )
-        run_state.materialize_reconcile_local_dates(state, ["141"])
-        self.assertEqual(
-            state["sources"]["141"]["last_reconcile_local_date"],
-            "2026-08-04",
-        )
+        self.assertEqual(reason, "오늘 전체 확인 완료")
 
     def test_legacy_failed_reconcile_does_not_advance_local_date(self):
         state = run_state.default_run_state()
         state["sources"]["141"] = {
-            "backfill_active": True,
             "last_reconcile_attempt_at": "2026-08-04T03:56:50+00:00",
             "last_success_at": "2026-08-04T04:56:50+00:00",
             "status": "success",
@@ -646,7 +623,6 @@ class RunStateTests(unittest.TestCase):
     def test_legacy_successful_reconcile_advances_local_date(self):
         state = run_state.default_run_state()
         state["sources"]["141"] = {
-            "backfill_active": True,
             "last_reconcile_attempt_at": "2026-08-04T03:56:50+00:00",
             "last_success_at": "2026-08-04T03:56:50+00:00",
             "status": "success",
@@ -671,7 +647,6 @@ class RunStateTests(unittest.TestCase):
         fixed_now = "2026-07-28T00:00:00+00:00"
         state = run_state.default_run_state()
         state["sources"]["141"] = {
-            "backfill_active": True,
             "last_reconcile_local_date": "2026-07-27",
             "observed_ids": ["old"],
         }
@@ -717,13 +692,11 @@ class RunStateTests(unittest.TestCase):
         fixed_now = "2026-07-28T03:30:00+00:00"
         state = run_state.default_run_state()
         state["sources"]["141"] = {
-            "backfill_active": True,
             "last_reconcile_local_date": "2026-07-27",
             "observed_ids": ["old"],
         }
         result = source_result("141", SourceStatus.SUCCESS, ["new"])
         result.reconcile_requested = True
-        result.termination_reason = "backfill_window"
 
         with patch.object(
             run_state,
@@ -764,33 +737,6 @@ class RunStateTests(unittest.TestCase):
                 7,
                 datetime(2026, 7, 28, 22, 0, tzinfo=timezone.utc),
             )
-        )
-
-    def test_incremental_run_materializes_legacy_backfill_watermark(self):
-        previous_success = "2026-07-27T00:00:00+00:00"
-        state = run_state.default_run_state()
-        state["sources"]["141"] = {
-            "backfill_active": True,
-            "last_success_at": previous_success,
-            "observed_ids": ["old"],
-        }
-        result = source_result(
-            "141",
-            SourceStatus.SUCCESS,
-            ["new"],
-        )
-        result.reconcile_requested = False
-
-        run_state.update_state_from_report(
-            state,
-            CrawlReport([result]),
-            full_reconcile=False,
-            applied_source_ids={"141"},
-        )
-
-        self.assertEqual(
-            state["sources"]["141"]["last_reconcile_attempt_at"],
-            previous_success,
         )
 
     def test_only_successful_source_checkpoint_advances(self):
@@ -1203,6 +1149,7 @@ class RunStateTests(unittest.TestCase):
         ] = "노출되면 안 되는 값"
         state["sources"]["141"] = {
             "backfill_active": True,
+            "backfill_resume_page": 3,
             "last_reconcile_attempt_at": "2026-07-28T00:00:00+00:00",
             "last_reconcile_local_date": "2026-07-28",
             "notice_refresh_state": {
@@ -1238,6 +1185,8 @@ class RunStateTests(unittest.TestCase):
             projected["sources"]["141"]["last_reconcile_attempt_at"],
             "2026-07-28T00:00:00+00:00",
         )
+        self.assertNotIn("backfill_active", projected["sources"]["141"])
+        self.assertNotIn("backfill_resume_page", projected["sources"]["141"])
         self.assertEqual(
             projected["sources"]["141"]["last_reconcile_local_date"],
             "2026-07-28",

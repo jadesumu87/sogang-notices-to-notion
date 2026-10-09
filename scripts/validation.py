@@ -80,7 +80,6 @@ def validate_crawl_report(
             reconcile_requested
             and result.write_safe
             and not result.coverage_complete
-            and result.termination_reason != "backfill_window"
         ):
             issues.append(
                 ValidationIssue(

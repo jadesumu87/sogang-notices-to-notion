@@ -46,7 +46,11 @@ SOURCE = SourceSpec(
     classification="장학공지",
     list_url="https://www.sogang.ac.kr/ko/scholarship-notice",
 )
-DATE = "20260727120000"
+RECENT_NOTICE_TIME = (
+    datetime.now(timezone(timedelta(hours=9))) - timedelta(days=1)
+).replace(hour=12, minute=0, second=0, microsecond=0)
+DATE = RECENT_NOTICE_TIME.strftime("%Y%m%d%H%M%S")
+ISO_DATE = RECENT_NOTICE_TIME.isoformat()
 BODY = [
     {
         "type": "paragraph",
@@ -77,7 +81,7 @@ def complete_notice(
             "https://www.sogang.ac.kr/ko/detail/"
             f"{notice_id}?bbsConfigFk={SOURCE.config_fk}"
         ),
-        "date": "2026-07-27T12:00:00+09:00",
+        "date": ISO_DATE,
         "classification": SOURCE.classification,
         "top": top,
         "completeness": "complete",
@@ -97,6 +101,10 @@ def api_entry(notice_id: str, top: bool = False) -> dict:
         "userName": "교무처",
         "viewCount": 1,
     }
+
+
+def old_api_entry(notice_id: str) -> dict:
+    return {**api_entry(notice_id), "regDate": "20240101090000"}
 
 
 def api_detail(notice_id: str) -> dict:
@@ -238,7 +246,7 @@ class CrawlerRegressionTests(unittest.TestCase):
             {
                 "API_MAX_REQUESTS": "100",
                 "API_MAX_SECONDS": "60",
-                "BACKFILL_DETAIL_LIMIT": "100",
+                "DETAIL_COLLECTION_LIMIT": "100",
                 "BBS_PAGE_SIZE": "2",
                 "CRAWLER_ACTIONS_ANNOTATIONS": "0",
                 "CRAWL_HARD_PAGE_LIMIT": "10",
@@ -284,12 +292,16 @@ class CrawlerRegressionTests(unittest.TestCase):
             crawler_main.report_deduplicated_failure(incident)
         self.assertEqual(print_mock.call_count, 2)
 
-    def test_default_backfill_detail_limit_is_bounded_for_short_runs(self):
-        with patch.dict(
-            os.environ,
-            {"BACKFILL_DETAIL_LIMIT": ""},
-        ):
-            self.assertEqual(crawler.get_backfill_detail_limit(), 20)
+    def test_default_detail_collection_limit_is_bounded_for_short_runs(self):
+        for value, expected in (("", 20), ("bad", 20), ("0", 1), ("9999", 100)):
+            with self.subTest(value=value), patch.dict(
+                os.environ,
+                {"DETAIL_COLLECTION_LIMIT": value},
+            ):
+                self.assertEqual(
+                    crawler.get_detail_collection_limit(),
+                    expected,
+                )
 
     def test_missing_configured_source_result_fails_closed(self):
         report = validate_crawl_report(
@@ -1359,13 +1371,11 @@ class CrawlerRegressionTests(unittest.TestCase):
     ):
         result = crawl_result(
             items=[complete_notice("1001")],
-            termination_reason="backfill_window",
+            coverage_complete=True,
         )
         result.reconcile_requested = True
         result.refreshed_known_ids = ["1001"]
         result.refresh_window_end_id = "1001"
-        result.backfill_resume_page = 7
-        result.backfill_anchor_ids = ["1000"]
         report = CrawlReport(sources=[result])
         counters = SyncCounters(
             observation_run_id="run-429:1",
@@ -1384,9 +1394,7 @@ class CrawlerRegressionTests(unittest.TestCase):
             "last_success_at": previous_success,
             "observed_ids": ["1000"],
             "detail_refresh_cursor_id": "1000",
-            "backfill_active": True,
-            "backfill_resume_page": 4,
-            "backfill_anchor_ids": ["999"],
+            "last_item_count": 1,
         }
         temp_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temp_directory.cleanup)
@@ -1463,8 +1471,8 @@ class CrawlerRegressionTests(unittest.TestCase):
             source_state["detail_refresh_cursor_id"],
             "1000",
         )
-        self.assertEqual(source_state["backfill_resume_page"], 4)
-        self.assertEqual(source_state["backfill_anchor_ids"], ["999"])
+        self.assertEqual(source_state["last_item_count"], 1)
+        self.assertNotIn("last_coverage_reconcile_at", source_state)
         self.assertEqual(
             incident["category"],
             FailureCategory.SECURITY_POLICY.value,
@@ -1937,16 +1945,12 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertFalse(atomic_issues[0].fatal)
         self.assertTrue(report.write_safe)
 
-    def test_backfill_window_is_write_safe_without_complete_coverage(self):
+    def crawl_new_notice_pages(self, **kwargs):
         pages = {
             1: api_page([api_entry("1002"), api_entry("1001")]),
+            2: api_page([], terminal_verified=True),
         }
-
         with (
-            patch.dict(
-                os.environ,
-                {"BACKFILL_DETAIL_LIMIT": "1"},
-            ),
             patch.object(
                 crawler,
                 "fetch_bbs_list_result",
@@ -1975,248 +1979,93 @@ class CrawlerRegressionTests(unittest.TestCase):
                 SOURCE,
                 include_non_top=True,
                 non_top_max_pages=0,
+                source_state={},
+                **kwargs,
+            )
+        return result, logs.output
+
+    def test_detail_limit_defers_new_notices_to_next_incremental_run(self):
+        with patch.dict(os.environ, {"DETAIL_COLLECTION_LIMIT": "1"}):
+            first, first_logs = self.crawl_new_notice_pages(
                 reconcile_mode=True,
             )
+            state = fresh_state()
+            report = validate_crawl_report(
+                CrawlReport([first]),
+                state,
+                full_reconcile=True,
+            )
+            update_state_from_report(state, report, True, {"141"})
+            second, _ = self.crawl_new_notice_pages(
+                known_ids=set(state["sources"]["141"]["observed_ids"]),
+                incremental=True,
+            )
 
-        state = fresh_state()
-        report = validate_crawl_report(
-            CrawlReport([result]),
-            state,
-            full_reconcile=True,
-        )
-        update_state_from_report(
-            state,
-            report,
-            True,
-            {"141"},
-        )
-
-        self.assertTrue(result.write_safe)
-        self.assertEqual(result.observed_count, 2)
-        self.assertEqual(result.termination_reason, "backfill_window")
-        self.assertFalse(result.coverage_complete)
-        self.assertFalse(result.reconcile_complete)
-        self.assertFalse(result.full_snapshot)
-        self.assertTrue(state["sources"]["141"]["backfill_active"])
-        self.assertIsNone(state["last_coverage_reconcile_at"])
+        self.assertTrue(first.write_safe)
+        self.assertEqual(first.detailed_notice_ids, ["1002"])
+        self.assertEqual(first.observed_ids, ["1002"])
+        self.assertEqual(first.termination_reason, "natural_end")
+        self.assertTrue(first.coverage_complete)
+        self.assertIsNotNone(state["last_coverage_reconcile_at"])
         self.assertTrue(
             any(
                 "상세 수집 시작(API): 출처=141, 페이지=1, "
                 "항목=1/2, 공지=1002" in message
-                for message in logs.output
+                for message in first_logs
             )
         )
-
-    def crawl_resumed_burst(self, total_count: int | None):
-        known_ids = {
-            "106",
-            "105",
-            "104",
-            "103",
-            "102",
-            "101",
-            "100",
-            "99",
-        }
-        pages = {
-            1: api_page(
-                [api_entry("110"), api_entry("109")],
-                total_count=total_count,
-            ),
-            2: api_page(
-                [api_entry("108"), api_entry("107")],
-                total_count=total_count,
-            ),
-            3: api_page(
-                [api_entry("106"), api_entry("105")],
-                total_count=total_count,
-            ),
-            4: api_page(
-                [api_entry("104"), api_entry("103")],
-                total_count=total_count,
-            ),
-            5: api_page(
-                [api_entry("102"), api_entry("101")],
-                total_count=total_count,
-            ),
-            6: api_page(
-                [api_entry("100"), api_entry("99")],
-                total_count=total_count,
-            ),
-            7: api_page(
-                [],
-                terminal_verified=True,
-                total_count=total_count,
-            ),
-        }
-        page_calls = []
-
-        def fetch_page(page, *args, **kwargs):
-            page_calls.append(page)
-            return pages[page]
-
-        with (
-            patch.object(
-                crawler,
-                "fetch_bbs_list_result",
-                side_effect=fetch_page,
-            ),
-            patch.object(
-                crawler,
-                "fetch_bbs_detail",
-                side_effect=lambda notice_id, **kwargs: api_detail(
-                    notice_id
-                ),
-            ),
-            patch.object(
-                crawler,
-                "get_detail_html_fallback_reason",
-                return_value=None,
-            ),
-            patch.object(
-                crawler,
-                "extract_body_blocks_from_html",
-                return_value=BODY,
-            ),
-        ):
-            result = crawler.crawl_top_items_api_result(
-                SOURCE,
-                include_non_top=True,
-                non_top_max_pages=0,
-                known_ids=known_ids,
-                incremental=True,
-                reconcile_mode=True,
-                resume_page=6,
-                resume_anchor_ids={"102", "101"},
-            )
-        return result, page_calls
-
-    def test_resume_scans_new_burst_beyond_first_page_before_jump(self):
-        result, page_calls = self.crawl_resumed_burst(None)
-
-        self.assertTrue(result.write_safe)
-        self.assertIn(2, page_calls)
-        self.assertEqual(
-            [
-                crawler.extract_detail_id_from_text(item["url"])
-                for item in result.items
-            ],
-            ["110", "109", "108", "107"],
-        )
-
-    def test_resume_with_total_count_reaches_natural_end(self):
-        result, page_calls = self.crawl_resumed_burst(12)
-
-        self.assertTrue(result.write_safe)
-        self.assertIn(2, page_calls)
-        self.assertEqual(result.error, "")
-        self.assertEqual(result.termination_reason, "natural_end")
-        self.assertEqual(result.observed_count, 12)
-
-    def test_resume_search_window_tracks_large_new_prefix_shift(self):
-        new_ids = [str(2000 - index) for index in range(81)]
-        prefix_known_ids = [str(1500 - index) for index in range(19)]
-        deep_known_ids = [
-            str(10000 + page * 100 + offset)
-            for page in range(98, 105)
-            for offset in range(20)
-        ]
-        anchor_ids = {
-            str(10000 + 104 * 100),
-            str(10000 + 104 * 100 + 1),
-        }
-        known_ids = set(prefix_known_ids) | set(deep_known_ids)
-        pages = {
-            page: api_page(
-                [
-                    api_entry(notice_id)
-                    for notice_id in new_ids[
-                        (page - 1) * 20 : page * 20
-                    ]
-                ]
-            )
-            for page in range(1, 5)
-        }
-        pages[5] = api_page(
-            [
-                api_entry(new_ids[80]),
-                *[
-                    api_entry(notice_id)
-                    for notice_id in prefix_known_ids
-                ],
-            ]
-        )
-        for page in range(98, 105):
-            pages[page] = api_page(
-                [
-                    api_entry(
-                        str(10000 + page * 100 + offset)
-                    )
-                    for offset in range(20)
-                ]
-            )
-        pages[105] = api_page([], terminal_verified=True)
-        page_calls = []
-
-        def fetch_page(page, *args, **kwargs):
-            page_calls.append(page)
-            return pages[page]
-
-        with (
-            patch.dict(
-                os.environ,
-                {
-                    "API_MAX_REQUESTS": "500",
-                    "BBS_PAGE_SIZE": "20",
-                    "CRAWL_HARD_PAGE_LIMIT": "100",
-                },
-            ),
-            patch.object(
-                crawler,
-                "fetch_bbs_list_result",
-                side_effect=fetch_page,
-            ),
-            patch.object(
-                crawler,
-                "fetch_bbs_detail",
-                side_effect=lambda notice_id, **kwargs: api_detail(
-                    notice_id
-                ),
-            ),
-            patch.object(
-                crawler,
-                "get_detail_html_fallback_reason",
-                return_value=None,
-            ),
-            patch.object(
-                crawler,
-                "extract_body_blocks_from_html",
-                return_value=BODY,
-            ),
-        ):
-            result = crawler.crawl_top_items_api_result(
-                SOURCE,
-                include_non_top=True,
-                non_top_max_pages=0,
-                known_ids=known_ids,
-                incremental=True,
-                reconcile_mode=True,
-                resume_page=100,
-                resume_anchor_ids=anchor_ids,
-            )
-
         self.assertTrue(
-            result.write_safe,
-            (
-                result.status,
-                result.error,
-                result.termination_reason,
-                page_calls,
-            ),
+            any(
+                "새 공지=1, 한도 초과 대기=1" in message
+                for message in first_logs
+            )
         )
-        self.assertEqual(result.termination_reason, "natural_end")
-        self.assertIn(104, page_calls)
-        self.assertEqual(len(result.items), 81)
+        self.assertTrue(second.write_safe)
+        self.assertEqual(second.detailed_notice_ids, ["1001"])
+
+    def test_old_unknown_notices_are_not_collected(self):
+        old_entry = {**api_entry("900"), "regDate": "20240101090000"}
+        pages = {
+            1: api_page([api_entry("1001"), old_entry]),
+            2: api_page([], terminal_verified=True),
+        }
+        with (
+            patch.object(
+                crawler,
+                "fetch_bbs_list_result",
+                side_effect=lambda page, *args, **kwargs: pages[page],
+            ),
+            patch.object(
+                crawler,
+                "fetch_bbs_detail",
+                side_effect=lambda notice_id, **kwargs: api_detail(
+                    notice_id
+                ),
+            ),
+            patch.object(
+                crawler,
+                "get_detail_html_fallback_reason",
+                return_value=None,
+            ),
+            patch.object(
+                crawler,
+                "extract_body_blocks_from_html",
+                return_value=BODY,
+            ),
+        ):
+            result = crawler.crawl_top_items_api_result(
+                SOURCE,
+                include_non_top=True,
+                non_top_max_pages=0,
+                reconcile_mode=True,
+                source_state={},
+            )
+
+        self.assertTrue(result.write_safe)
+        self.assertEqual(result.detailed_notice_ids, ["1001"])
+        self.assertNotIn("900", result.observed_ids)
+        self.assertIn("900", result.notice_observations)
+        self.assertTrue(result.coverage_complete)
 
     def test_offset_shift_without_total_never_becomes_atomic_snapshot(self):
         shifted_pages = {
@@ -2333,7 +2182,7 @@ class CrawlerRegressionTests(unittest.TestCase):
             ["3"],
         )
 
-    def test_targeted_refresh_skips_incomplete_backfill_history(self):
+    def test_targeted_refresh_skips_old_unknown_history(self):
         known_ids = {"1009", "1008", "1007", "1006", "1003"}
         pages = {
             1: api_page(
@@ -2345,14 +2194,14 @@ class CrawlerRegressionTests(unittest.TestCase):
                 total_count=10,
             ),
             3: api_page(
-                [api_entry("1006"), api_entry("1005")],
+                [api_entry("1006"), old_api_entry("1005")],
                 total_count=10,
             ),
             4: api_page(
                 [
-                    api_entry("1004"),
+                    old_api_entry("1004"),
                     api_entry("1003"),
-                    api_entry("1002"),
+                    old_api_entry("1002"),
                 ],
                 total_count=10,
             ),
@@ -2545,7 +2394,7 @@ class CrawlerRegressionTests(unittest.TestCase):
             1: api_page([api_entry("1005"), api_entry("1004")]),
             2: api_page([api_entry("1003"), api_entry("1002")]),
             3: api_page([api_entry("1001"), api_entry("1000")]),
-            4: api_page([api_entry("800"), changed_entry]),
+            4: api_page([old_api_entry("800"), changed_entry]),
             5: api_page([], terminal_verified=True),
         }
         last_detail_at = datetime.now(timezone.utc).isoformat()
@@ -2723,7 +2572,7 @@ class CrawlerRegressionTests(unittest.TestCase):
 
     def test_fallback_overdue_backlog_is_bounded_without_losing_index(self):
         ids = {str(value) for value in range(1000, 1100)}
-        date = "2026-07-27T12:00:00+09:00"
+        date = ISO_DATE
         entries = [
             {
                 "title": f"공지 {value}",
@@ -2802,7 +2651,7 @@ class CrawlerRegressionTests(unittest.TestCase):
 
     def test_fallback_changed_titles_have_a_separate_bounded_priority_budget(self):
         ids = {str(value) for value in range(1000, 1100)}
-        date = "2026-07-27T12:00:00+09:00"
+        date = ISO_DATE
         entries = [
             {
                 "title": f"공지 {value}",
@@ -2912,7 +2761,7 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertIn("last_detail_at", recovered["sources"]["141"]["notice_refresh_state"]["1001"])
         self.assertNotIn("1002", recovered["sources"]["141"]["notice_refresh_state"])
 
-    def test_scheduled_refresh_does_not_consume_backfill_detail_limit(self):
+    def test_scheduled_refresh_does_not_consume_detail_collection_limit(self):
         observation = crawler.build_notice_observation(
             "1006",
             "공지 1006",
@@ -2931,7 +2780,7 @@ class CrawlerRegressionTests(unittest.TestCase):
             return api_detail(notice_id)
 
         with (
-            patch.dict(os.environ, {"BACKFILL_DETAIL_LIMIT": "1"}),
+            patch.dict(os.environ, {"DETAIL_COLLECTION_LIMIT": "1"}),
             patch.object(
                 crawler,
                 "fetch_bbs_list_result",
@@ -2973,7 +2822,7 @@ class CrawlerRegressionTests(unittest.TestCase):
             )
 
         self.assertTrue(result.write_safe, result.to_dict(include_items=True))
-        self.assertEqual(result.termination_reason, "backfill_window")
+        self.assertEqual(result.termination_reason, "natural_end")
         self.assertTrue(result.notice_index_complete)
         self.assertEqual(set(detail_calls), {"1006", "1005"})
         self.assertNotIn("1004", result.observed_ids)
@@ -2992,7 +2841,7 @@ class CrawlerRegressionTests(unittest.TestCase):
             return api_detail(notice_id)
 
         with (
-            patch.dict(os.environ, {"BACKFILL_DETAIL_LIMIT": "2"}),
+            patch.dict(os.environ, {"DETAIL_COLLECTION_LIMIT": "2"}),
             patch.object(
                 crawler,
                 "fetch_bbs_list_result",
@@ -3027,18 +2876,19 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertEqual(set(detail_calls), {"2000", "1999"})
         self.assertEqual(detail_calls.count("2000"), 2)
         self.assertEqual(detail_calls.count("1999"), 2)
-        self.assertEqual(result.termination_reason, "backfill_window")
-        self.assertEqual(result.backfill_resume_page, 1)
+        self.assertEqual(result.termination_reason, "natural_end")
         self.assertTrue(result.notice_index_complete)
         self.assertEqual(len(result.notice_observations), len(entries))
         self.assertEqual(result.observed_ids, ["2000", "1999"])
 
-    def test_refresh_policy_closes_incremental_detail_window_at_checkpoint(self):
+    def test_refresh_policy_collects_recent_unknown_notices_below_checkpoint(
+        self,
+    ):
         entries = [
             api_entry("2000"),
             api_entry("1000"),
             api_entry("1999"),
-            api_entry("1998"),
+            old_api_entry("1998"),
         ]
         pages = {
             1: api_page(entries),
@@ -3097,11 +2947,10 @@ class CrawlerRegressionTests(unittest.TestCase):
             )
 
         self.assertTrue(result.write_safe, result.to_dict(include_items=True))
-        self.assertEqual(set(detail_calls), {"2000"})
-        self.assertEqual(result.detailed_notice_ids, ["2000"])
-        self.assertNotIn("1999", result.observed_ids)
+        self.assertEqual(set(detail_calls), {"2000", "1999"})
+        self.assertEqual(result.detailed_notice_ids, ["2000", "1999"])
+        self.assertIn("1999", result.observed_ids)
         self.assertNotIn("1998", result.observed_ids)
-        self.assertIn("1999", result.notice_observations)
         self.assertIn("1998", result.notice_observations)
 
     def test_refresh_policy_accepts_total_that_includes_first_page_top(self):
@@ -3169,82 +3018,6 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertFalse(mismatch.write_safe)
         self.assertEqual(mismatch.error, "pagination_total_mismatch")
         self.assertEqual(page_calls, [1, 2, 1, 2, 1, 2])
-
-    def test_refresh_policy_finds_shifted_resume_anchor_during_full_sweep(self):
-        known_ids = {"1000", "900"}
-        last_detail_at = datetime.now(timezone.utc).isoformat()
-        notice_refresh_state = {
-            notice_id: {
-                **crawler.build_notice_observation(
-                    notice_id,
-                    f"공지 {notice_id}",
-                    DATE,
-                    False,
-                ),
-                "last_detail_at": last_detail_at,
-            }
-            for notice_id in known_ids
-        }
-        pages = {
-            1: api_page([api_entry("1000")]),
-            2: api_page([api_entry("999")]),
-            3: api_page([api_entry("998")]),
-            4: api_page([api_entry("997")]),
-            5: api_page([api_entry("996")]),
-            6: api_page([api_entry("900"), api_entry("895")]),
-            7: api_page([], terminal_verified=True),
-        }
-
-        with (
-            patch.object(
-                crawler,
-                "fetch_bbs_list_result",
-                side_effect=lambda page, *args, **kwargs: pages[page],
-            ),
-            patch.object(
-                crawler,
-                "fetch_bbs_detail",
-                side_effect=lambda notice_id, **kwargs: api_detail(notice_id),
-            ),
-            patch.object(
-                crawler,
-                "get_detail_html_fallback_reason",
-                return_value=None,
-            ),
-            patch.object(
-                crawler,
-                "extract_body_blocks_from_html",
-                return_value=BODY,
-            ),
-        ):
-            result = crawler.crawl_top_items_api_result(
-                SOURCE,
-                include_non_top=True,
-                non_top_max_pages=0,
-                known_ids=known_ids,
-                incremental=True,
-                reconcile_mode=True,
-                resume_page=3,
-                resume_anchor_ids={"900"},
-                source_state={
-                    "notice_refresh_state": notice_refresh_state,
-                },
-            )
-
-        self.assertTrue(result.write_safe, result.to_dict(include_items=True))
-        self.assertTrue(result.notice_index_complete)
-        self.assertEqual(
-            [
-                crawler.extract_detail_id_from_text(item["url"])
-                for item in result.items
-            ],
-            ["895"],
-        )
-        self.assertTrue(
-            {"999", "998", "997", "996"}.isdisjoint(
-                result.observed_ids
-            )
-        )
 
     def test_repeated_new_pinned_top_does_not_dirty_api_overlap(self):
         pinned = api_entry("9000", top=True)
@@ -3415,7 +3188,7 @@ class CrawlerRegressionTests(unittest.TestCase):
         self,
     ):
         known_ids = {"1004", "1003", "1002", "1001", "1000"}
-        date = "2026-07-27T12:00:00+09:00"
+        date = ISO_DATE
 
         def entry(notice_id):
             return {
@@ -3519,14 +3292,19 @@ class CrawlerRegressionTests(unittest.TestCase):
             ["1005"],
         )
 
-    def test_fallback_targeted_refresh_skips_backfill_history(self):
+    def test_fallback_targeted_refresh_skips_old_unknown_history(self):
         known_ids = {"1009", "1008", "1007", "1006", "1003"}
-        date = "2026-07-27T12:00:00+09:00"
+        date = ISO_DATE
+        old_unknown_ids = {"1005", "1004", "1002"}
 
         def entry(notice_id):
             return {
                 "title": f"공지 {notice_id}",
-                "date": date,
+                "date": (
+                    "2024-01-01T09:00:00+09:00"
+                    if notice_id in old_unknown_ids
+                    else date
+                ),
                 "top": False,
                 "url": (
                     "https://www.sogang.ac.kr/ko/detail/"
@@ -3634,7 +3412,7 @@ class CrawlerRegressionTests(unittest.TestCase):
         )
 
     def test_fallback_targeted_refresh_missing_is_not_write_safe(self):
-        date = "2026-07-27T12:00:00+09:00"
+        date = ISO_DATE
 
         def entry(notice_id):
             return {
@@ -3726,7 +3504,7 @@ class CrawlerRegressionTests(unittest.TestCase):
         self,
     ):
         known_ids = {"1004", "1003", "1002", "1001", "1000"}
-        date = "2026-07-27T12:00:00+09:00"
+        date = ISO_DATE
 
         def entry(notice_id, top=False):
             return {
@@ -4045,7 +3823,7 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
             ),
             patch.object(
                 crawler_main,
-                "get_backfill_detail_limit",
+                "get_detail_collection_limit",
                 return_value=1,
             ),
             self.assertRaisesRegex(
@@ -4057,19 +3835,32 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
 
     def test_collect_report_schedules_due_refresh_during_incremental_run(self):
         state = fresh_state()
-        observation = crawler.build_notice_observation(
+        now = datetime.now(timezone.utc)
+        recent_observation = crawler.build_notice_observation(
             "550000",
+            "최근 공지",
+            (now - timedelta(days=10)).isoformat(),
+            False,
+        )
+        old_observation = crawler.build_notice_observation(
+            "540000",
             "오래된 공지",
             "2020-01-01T00:00:00+09:00",
             False,
         )
         state["sources"]["2"] = {
-            "observed_ids": ["550000"],
+            "observed_ids": ["550000", "540000"],
             "notice_refresh_state": {
                 "550000": {
-                    **observation,
+                    **recent_observation,
+                    "last_detail_at": (
+                        now - timedelta(days=2)
+                    ).isoformat(),
+                },
+                "540000": {
+                    **old_observation,
                     "last_detail_at": "2020-01-01T00:00:00+00:00",
-                }
+                },
             },
         }
         captured = {}
@@ -4109,7 +3900,7 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
             set(),
         )
 
-    def test_backfill_source_runs_first_with_fair_budget(self):
+    def test_reconcile_source_runs_first_with_fair_budget(self):
         sources = {
             "141": SOURCE,
             "2": SourceSpec(
@@ -4175,7 +3966,7 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
             report = crawler.crawl_sources(
                 source_state_by_source={
                     "141": {},
-                    "2": {"backfill_active": True},
+                    "2": {},
                 },
                 reconcile_mode_by_source={
                     "141": False,
@@ -4268,9 +4059,6 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
             },
             "2": {
                 "observed_ids": ["200"],
-                "backfill_active": True,
-                "backfill_resume_page": 5,
-                "backfill_anchor_ids": ["190"],
             },
         }
         captured = {}
@@ -4322,14 +4110,7 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
             captured["reconcile_mode_by_source"],
             {"141": False, "2": True},
         )
-        self.assertEqual(
-            captured["resume_page_by_source"],
-            {"141": 1, "2": 5},
-        )
-        self.assertEqual(
-            captured["resume_anchor_ids_by_source"],
-            {"141": set(), "2": {"190"}},
-        )
+        self.assertNotIn("resume_page_by_source", captured)
         self.assertNotIn(
             "last_reconcile_attempt_at",
             state["sources"]["141"],
@@ -4340,27 +4121,24 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "수집 계획: 출처=2, 모드=과거 보강, "
-                "상세 한도=20, 시작 페이지=5" in message
+                "수집 계획: 출처=2, 모드=전체 확인, "
+                "새 공지 범위=최근 31일, 새 공지 한도=20" in message
                 for message in logs.output
             )
         )
         self.assertTrue(
             any(
-                "보강 판정=보강 이력 없음, 다음 보강 가능=즉시"
-                in message
+                "전체 확인 판정=전체 확인 이력 없음, "
+                "다음 전체 확인 가능=즉시" in message
                 for message in logs.output
             )
         )
 
-    def test_recent_backfill_attempt_stays_incremental(self):
+    def test_recent_reconcile_attempt_stays_incremental(self):
         now = datetime.now(timezone.utc).isoformat()
         state = fresh_state()
         state["sources"]["141"] = {
             "observed_ids": ["300"],
-            "backfill_active": True,
-            "backfill_resume_page": 5,
-            "backfill_anchor_ids": ["290"],
             "last_reconcile_attempt_at": now,
             "last_success_at": now,
         }
@@ -4401,23 +4179,19 @@ class SourceSchedulingRegressionTests(unittest.TestCase):
             captured["incremental_by_source"]["141"]
         )
         self.assertEqual(
-            captured["resume_page_by_source"]["141"],
-            1,
-        )
-        self.assertEqual(
             state["sources"]["141"]["last_reconcile_attempt_at"],
             now,
         )
         self.assertTrue(
             any(
                 "수집 계획: 출처=141, 모드=증분, "
-                "상세 한도=-, 시작 페이지=1, 백필=대기" in message
+                "새 공지 범위=최근 31일, 새 공지 한도=20" in message
                 for message in logs.output
             )
         )
         self.assertTrue(
             any(
-                "보강 판정=오늘 보강 완료" in message
+                "전체 확인 판정=오늘 전체 확인 완료" in message
                 for message in logs.output
             )
         )
@@ -4468,7 +4242,7 @@ class DestructiveMutationRegressionTests(unittest.TestCase):
             "https://www.sogang.ac.kr/ko/detail/"
             "2001?bbsConfigFk=141"
         ),
-        "date": "2026-07-27T12:00:00+09:00",
+        "date": ISO_DATE,
         "top": False,
         "completeness": "complete",
         "body_status": "present",
@@ -4890,59 +4664,11 @@ class DestructiveMutationRegressionTests(unittest.TestCase):
             {"2001"},
         )
 
-    def test_full_reconcile_passes_backfill_resume_state_to_crawler(self):
-        state = fresh_state()
-        state["sources"]["141"] = {
-            "observed_ids": ["106", "105"],
-            "backfill_active": True,
-            "backfill_resume_page": 6,
-            "backfill_anchor_ids": ["102", "101"],
-        }
-        captured = {}
-
-        def crawl_sources(**kwargs):
-            captured.update(kwargs)
-            return CrawlReport([crawl_result()])
-
-        with (
-            patch.object(
-                crawler_main,
-                "resolve_html_path",
-                return_value=None,
-            ),
-            patch.object(
-                crawler_main,
-                "get_bbs_config_fks",
-                return_value=["141"],
-            ),
-            patch.object(
-                crawler_main,
-                "crawl_sources",
-                side_effect=crawl_sources,
-            ),
-        ):
-            crawler_main.collect_report(
-                state,
-                full_reconcile=True,
-            )
-
-        self.assertEqual(
-            captured["resume_page_by_source"]["141"],
-            6,
-        )
-        self.assertEqual(
-            captured["resume_anchor_ids_by_source"]["141"],
-            {"102", "101"},
-        )
-
     def test_force_all_reconcile_disables_all_incremental_paths(self):
         known_ids = [str(1000 + index) for index in range(300)]
         state = fresh_state()
         state["sources"]["141"] = {
             "observed_ids": known_ids,
-            "backfill_active": True,
-            "backfill_resume_page": 6,
-            "backfill_anchor_ids": ["999"],
         }
         captured_runs = []
 
@@ -4972,8 +4698,6 @@ class DestructiveMutationRegressionTests(unittest.TestCase):
                 full_reconcile=True,
                 force_all_reconcile=True,
             )
-            state["sources"]["141"]["backfill_resume_page"] = 11
-            state["sources"]["141"]["backfill_anchor_ids"] = ["1999"]
             crawler_main.collect_report(
                 state,
                 full_reconcile=True,
@@ -4992,24 +4716,11 @@ class DestructiveMutationRegressionTests(unittest.TestCase):
             first["known_ids_by_source"]["141"],
             set(known_ids),
         )
-        self.assertEqual(
-            first["resume_page_by_source"]["141"],
-            6,
-        )
-        self.assertEqual(
-            first["resume_anchor_ids_by_source"]["141"],
-            {"999"},
-        )
         self.assertFalse(
             second["incremental_by_source"]["141"]
         )
-        self.assertEqual(
-            second["resume_page_by_source"]["141"],
-            11,
-        )
-        self.assertEqual(
-            second["resume_anchor_ids_by_source"]["141"],
-            {"1999"},
+        self.assertTrue(
+            second["reconcile_mode_by_source"]["141"]
         )
 
 

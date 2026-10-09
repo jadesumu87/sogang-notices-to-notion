@@ -12,7 +12,7 @@
 
 ### 2. 공지 수집과 검증
 
-`crawler.py`가 게시판별 목록과 상세 공지를 수집한다. 서강대학교 API를 우선 사용하고 필요한 경우 HTML/HTTP 조회나 Playwright 브라우저 수집으로 보완한다. `certificates/`의 공개 중간 인증서는 출처 서버가 해당 체인을 누락했을 때만 기본 운영체제 TLS 신뢰 저장소를 보완하며, 고정된 DER 해시와 호스트 범위를 통과해야 한다.
+`crawler.py`가 게시판별 목록과 상세 공지를 수집한다. 목록은 매 실행 끝까지 확인하고, 상세는 Notion에 없는 최근 31일 공지와 다시 확인할 시점이 된 공지만 가져온다. 재확인 주기와 최근 공지 범위는 `refresh_policy.py`가 정한다. 서강대학교 API를 우선 사용하고 필요한 경우 HTML/HTTP 조회나 Playwright 브라우저 수집으로 보완한다. `certificates/`의 공개 중간 인증서는 출처 서버가 해당 체인을 누락했을 때만 기본 운영체제 TLS 신뢰 저장소를 보완하며, 고정된 DER 해시와 호스트 범위를 통과해야 한다.
 
 `bbs_parser.py`는 목록 행, 상세 본문, 작성일과 첨부파일을 해석한다. `common.py`와 `utils.py`는 URL, 공지 ID, 날짜, 파일명과 본문 블록을 공통 형식으로 변환한다.
 
@@ -49,6 +49,7 @@
 | `models.py` | 수집·검증·동기화 공통 자료형 |
 | `settings.py` | 환경 변수, 게시판과 Notion 설정 |
 | `crawler.py` | API·HTTP·Playwright 수집과 첨부파일 점검 |
+| `refresh_policy.py` | 최근 공지 범위와 공지별 재확인 주기 |
 | `bbs_parser.py` | HTML 목록·본문·첨부파일 파싱 |
 | `validation.py` | 출처 완전성과 항목 식별자 검증 |
 | `sync_engine.py` | 변경 계획 생성과 적용 순서 관리 |

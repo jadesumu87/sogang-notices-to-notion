@@ -27,10 +27,6 @@ STATE_SCHEMA_VERSION = 2
 RECONCILE_TIMEZONE = ZoneInfo("Asia/Seoul")
 PUBLIC_CACHE_SOURCE_FIELDS = frozenset(
     {
-        "backfill_active",
-        "backfill_anchor_ids",
-        "backfill_resume_page",
-        "backfill_started_at",
         "classification",
         "detail_refresh_cursor_id",
         "empty_confirmation_pending",
@@ -493,24 +489,6 @@ def validate_run_state_payload(payload: Any) -> dict[str, Any]:
             raise RunStateIntegrityError(
                 "실행 상태 관측 ID 형식 또는 보존 한도가 올바르지 않습니다"
             )
-        resume_page = source_state.get("backfill_resume_page", 1)
-        if (
-            isinstance(resume_page, bool)
-            or not isinstance(resume_page, int)
-            or not 1 <= resume_page <= 1000000
-        ):
-            raise RunStateIntegrityError(
-                "실행 상태 백필 재개 페이지가 올바르지 않습니다"
-            )
-        anchor_ids = source_state.get("backfill_anchor_ids", [])
-        if (
-            not isinstance(anchor_ids, list)
-            or len(anchor_ids) > 100
-            or any(not isinstance(value, str) for value in anchor_ids)
-        ):
-            raise RunStateIntegrityError(
-                "실행 상태 백필 기준 ID가 올바르지 않습니다"
-            )
         pending_notice_ids = source_state.get("pending_notice_ids", [])
         if (
             not isinstance(pending_notice_ids, list)
@@ -569,17 +547,16 @@ def validate_run_state_payload(payload: Any) -> dict[str, Any]:
                     raise RunStateIntegrityError(
                         "실행 상태 공지 재검사 시각이 올바르지 않습니다"
                     )
-        for flag_name in (
-            "backfill_active",
-            "empty_confirmation_pending",
+        if (
+            "empty_confirmation_pending" in source_state
+            and not isinstance(
+                source_state["empty_confirmation_pending"],
+                bool,
+            )
         ):
-            if (
-                flag_name in source_state
-                and not isinstance(source_state[flag_name], bool)
-            ):
-                raise RunStateIntegrityError(
-                    "실행 상태 출처 플래그가 올바르지 않습니다"
-                )
+            raise RunStateIntegrityError(
+                "실행 상태 출처 플래그가 올바르지 않습니다"
+            )
         for timestamp_name in (
             "last_coverage_reconcile_at",
             "last_full_reconcile_at",
@@ -846,15 +823,6 @@ def legacy_source_reconcile_reference(
         if last_attempt is not None and last_attempt == last_success
         else None
     )
-    if last_attempt is None and source_state.get("backfill_active"):
-        successful_attempt = parse_iso_datetime(
-            str(
-                source_state.get("last_success_at")
-                or source_state.get("last_attempt_at")
-                or source_state.get("backfill_started_at")
-                or ""
-            )
-        )
     references = [
         value
         for value in (
@@ -928,7 +896,7 @@ def source_reconcile_schedule(
             else None
         )
     if last_local_date is None:
-        return True, "즉시", "보강 이력 없음"
+        return True, "즉시", "전체 확인 이력 없음"
     eligible_date = last_local_date + timedelta(days=1)
     if eligible_date < local_now.date():
         eligible_date = local_now.date()
@@ -942,11 +910,11 @@ def source_reconcile_schedule(
         microsecond=0,
     )
     if local_now >= eligible_at:
-        return True, "즉시", "일일 보강 창 도래"
+        return True, "즉시", "일일 전체 확인 시각 도래"
     reason = (
-        "오늘 보강 완료"
+        "오늘 전체 확인 완료"
         if last_local_date >= local_now.date()
-        else "일일 보강 창 대기"
+        else "일일 전체 확인 시각 대기"
     )
     return False, eligible_at.isoformat(timespec="seconds"), reason
 
@@ -1098,30 +1066,11 @@ def update_state_from_report(
             else result.reconcile_requested
         )
         source_state = state["sources"].setdefault(result.source.config_fk, {})
-        previous_last_attempt_at = source_state.get("last_attempt_at")
-        previous_last_success_at = source_state.get("last_success_at")
         source_state["last_attempt_at"] = now
         source_state["status"] = result.status.value
         source_state["method"] = result.method
         if reconcile_requested:
             source_state["last_reconcile_attempt_at"] = now
-        elif (
-            source_state.get("backfill_active")
-            and not source_state.get("last_reconcile_attempt_at")
-        ):
-            legacy_reference = parse_iso_datetime(
-                str(
-                    previous_last_success_at
-                    or previous_last_attempt_at
-                    or source_state.get("backfill_started_at")
-                    or ""
-                )
-            )
-            source_state["last_reconcile_attempt_at"] = (
-                legacy_reference.isoformat()
-                if legacy_reference is not None
-                else now
-            )
         if result.write_safe:
             source_state["fallback_consecutive_failures"] = 0
             source_state.pop("fallback_circuit_open_until", None)
@@ -1306,19 +1255,6 @@ def update_state_from_report(
                     source_state["last_coverage_reconcile_at"] = now
                     if result.reconcile_complete:
                         source_state["last_full_reconcile_at"] = now
-                source_state["backfill_active"] = False
-                source_state.pop("backfill_started_at", None)
-                source_state.pop("backfill_resume_page", None)
-                source_state.pop("backfill_anchor_ids", None)
-            elif result.termination_reason == "backfill_window":
-                source_state["backfill_active"] = True
-                source_state.setdefault("backfill_started_at", now)
-                source_state["backfill_resume_page"] = (
-                    result.backfill_resume_page
-                )
-                source_state["backfill_anchor_ids"] = (
-                    result.backfill_anchor_ids[:100]
-                )
             if reconcile_requested and result.refreshed_known_ids:
                 source_state["detail_refresh_cursor_id"] = (
                     result.refreshed_known_ids[-1]
@@ -1334,9 +1270,6 @@ def update_state_from_report(
             safe_count += 1
         else:
             source_state["error"] = sanitize_incident_text(result.error)
-            if result.termination_reason == "resume_error":
-                source_state.pop("backfill_resume_page", None)
-                source_state.pop("backfill_anchor_ids", None)
             if (
                 not result.write_safe
                 and result.method in {

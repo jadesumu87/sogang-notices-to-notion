@@ -53,6 +53,7 @@ from refresh_policy import (
     build_notice_observation,
     get_detail_refresh_limit,
     get_detail_change_refresh_limit,
+    is_recent_notice,
     select_due_notice_ids,
 )
 from bbs_parser import (
@@ -1872,13 +1873,13 @@ def get_api_time_budget_seconds() -> float:
     return min(3600.0, max(10.0, value))
 
 
-def get_backfill_detail_limit() -> int:
-    raw = os.environ.get("BACKFILL_DETAIL_LIMIT", "20").strip()
+def get_detail_collection_limit() -> int:
+    raw = os.environ.get("DETAIL_COLLECTION_LIMIT", "20").strip()
     try:
         value = int(raw)
     except ValueError:
         return 20
-    return min(1000, max(1, value))
+    return min(100, max(1, value))
 
 
 def log_detail_collection_progress(
@@ -1983,8 +1984,6 @@ def crawl_top_items_api_result(
     incremental: bool = False,
     reconcile_mode: bool = False,
     refresh_known_ids: Optional[set[str]] = None,
-    resume_page: int = 1,
-    resume_anchor_ids: Optional[set[str]] = None,
     targeted_refresh_ids: Optional[set[str]] = None,
     source_state: Optional[dict[str, Any]] = None,
 ) -> SourceCrawlResult:
@@ -2020,23 +2019,12 @@ def crawl_top_items_api_result(
     page_number = 1
     previous_page_count: Optional[int] = None
     expected_total_count: Optional[int] = None
-    fetched_detail_count = 0
-    backfill_new_detail_count = 0
-    backfill_window_reached = False
+    new_notice_detail_count = 0
+    deferred_new_notice_count = 0
     notice_index_complete = False
-    incremental_detail_window_closed = False
     crawl_now = datetime.now(timezone.utc)
     first_page_top_verified = False
-    backfill_detail_limit = get_backfill_detail_limit()
-    resume_page = max(1, resume_page)
-    resume_anchor_ids = resume_anchor_ids or set()
-    resume_active = bool(resume_page > 2 and resume_anchor_ids)
-    resume_search_start = max(2, resume_page - 2)
-    resume_search_end = resume_page + 2
-    resume_anchor_found = not resume_active
-    resume_jump_done = not resume_active
-    next_resume_page = 1
-    next_anchor_ids: list[str] = []
+    new_notice_detail_limit = get_detail_collection_limit()
     checkpoint_page_number: Optional[int] = None
     checkpoint_overlap_pages = 0
     checkpoint_overlap_required = (
@@ -2171,36 +2159,7 @@ def crawl_top_items_api_result(
                 termination_reason = "page_error"
                 break
         LOGGER.info("페이지 %s 항목 수(API): %s", page_number, len(page_entries))
-        page_non_top_ids = {
-            str(entry.get("pkId") or "").strip()
-            for entry in page_entries
-            if (
-                str(entry.get("pkId") or "").strip()
-                and str(entry.get("isTop") or "").upper() != "Y"
-            )
-        }
-        if (
-            resume_active
-            and page_number >= resume_search_start
-            and page_non_top_ids & resume_anchor_ids
-        ):
-            resume_anchor_found = True
-        if (
-            resume_active
-            and not resume_anchor_found
-            and page_number > resume_search_end
-            and not refresh_policy_enabled
-        ):
-            terminal_error = "backfill_resume_anchor_missing"
-            terminal_category = FailureCategory.SOURCE_PARTIAL
-            termination_reason = "resume_error"
-            break
         if not page_entries:
-            if resume_active and not resume_anchor_found:
-                terminal_error = "backfill_resume_anchor_missing"
-                terminal_category = FailureCategory.SOURCE_PARTIAL
-                termination_reason = "resume_error"
-                break
             terminal_confirmed = page_result.terminal_verified
             if not consume_api_budget():
                 break
@@ -2293,11 +2252,7 @@ def crawl_top_items_api_result(
                 checkpoint_found = True
                 terminal_reached = True
                 notice_index_complete = True
-                termination_reason = (
-                    "backfill_window"
-                    if backfill_window_reached
-                    else "natural_end"
-                )
+                termination_reason = "natural_end"
                 break
         raw_observed_ids.update(
             str(entry.get("pkId") or "").strip()
@@ -2368,9 +2323,6 @@ def crawl_top_items_api_result(
         page_has_checkpoint = False
         page_has_unknown_notice = False
         page_contract_failed = False
-        targeted_history_active = bool(
-            targeted_refresh_ids and checkpoint_found
-        )
 
         for entry_index, entry in enumerate(entries_to_process, start=1):
             check_run_control()
@@ -2452,40 +2404,15 @@ def crawl_top_items_api_result(
                 continue
             if incremental and pk_id in known_ids and not top:
                 page_has_checkpoint = True
-                if refresh_policy_enabled and not reconcile_mode:
-                    incremental_detail_window_closed = True
-                if targeted_refresh_ids:
-                    targeted_history_active = True
-            if (
-                refresh_policy_enabled
-                and not top
-                and pk_id not in known_ids
-                and backfill_new_detail_count >= backfill_detail_limit
-            ):
-                incremental_detail_window_closed = True
-                if not backfill_window_reached:
-                    backfill_window_reached = True
-                    next_resume_page = page_number
-                    next_anchor_ids = sorted(page_non_top_ids)
-            if (
-                (
-                    targeted_history_active
-                    or incremental_detail_window_closed
-                    or backfill_window_reached
-                    or (
-                        refresh_policy_enabled
-                        and resume_active
-                        and checkpoint_found
-                        and (
-                            not resume_anchor_found
-                            or page_number < resume_page
-                        )
-                    )
-                )
-                and not top
-                and pk_id not in known_ids
-            ):
-                continue
+            if not top and pk_id not in known_ids:
+                if not is_recent_notice(
+                    observation.get("published_at"),
+                    crawl_now,
+                ):
+                    continue
+                if new_notice_detail_count >= new_notice_detail_limit:
+                    deferred_new_notice_count += 1
+                    continue
             if pk_id not in observed_id_set:
                 observed_id_set.add(pk_id)
                 observed_ids.append(pk_id)
@@ -2706,12 +2633,11 @@ def crawl_top_items_api_result(
             seen.add(key)
             items.append(item)
             new_count += 1
-            fetched_detail_count += 1
             detailed_notice_ids.append(pk_id)
             if pk_id in known_ids:
                 refreshed_known_ids.append(pk_id)
             else:
-                backfill_new_detail_count += 1
+                new_notice_detail_count += 1
             log_detail_collection_progress(
                 "API",
                 "완료",
@@ -2730,7 +2656,8 @@ def crawl_top_items_api_result(
             if checkpoint_page_number is None:
                 checkpoint_page_number = page_number
         if (
-            incremental
+            not refresh_policy_enabled
+            and incremental
             and not reconcile_mode
             and targeted_refresh_ids
             and checkpoint_found
@@ -2738,12 +2665,9 @@ def crawl_top_items_api_result(
                 set(refreshed_known_ids)
             )
         ):
-            if refresh_policy_enabled:
-                incremental_detail_window_closed = True
-            else:
-                terminal_reached = True
-                termination_reason = "incremental_checkpoint"
-                break
+            terminal_reached = True
+            termination_reason = "incremental_checkpoint"
+            break
         if page_result.terminal_verified:
             if (
                 include_non_top
@@ -2763,11 +2687,7 @@ def crawl_top_items_api_result(
             checkpoint_found = True
             terminal_reached = True
             notice_index_complete = True
-            termination_reason = (
-                "backfill_window"
-                if backfill_window_reached
-                else "natural_end"
-            )
+            termination_reason = "natural_end"
             break
         if not include_non_top:
             has_non_top = any(
@@ -2780,41 +2700,8 @@ def crawl_top_items_api_result(
                 LOGGER.info("페이지 %s에서 비TOP 발견, 다음 페이지 탐색 중단(API)", page_number)
                 break
         if (
-            reconcile_mode
-            and include_non_top
-            and (
-                backfill_new_detail_count
-                if refresh_policy_enabled
-                else fetched_detail_count
-            )
-            >= backfill_detail_limit
-            and not backfill_window_reached
-        ):
-            checkpoint_found = True
-            next_resume_page = page_number + 1
-            next_anchor_ids = sorted(page_non_top_ids)
-            if refresh_policy_enabled:
-                backfill_window_reached = True
-            else:
-                terminal_reached = True
-                termination_reason = "backfill_window"
-                break
-        if (
             not refresh_policy_enabled
-            and resume_active
-            and not resume_jump_done
-            and checkpoint_found
-        ):
-            resume_search_end += max(0, page_number - 1)
-            page_number = max(
-                page_number + 1,
-                resume_search_start,
-            )
-            resume_jump_done = True
-            previous_page_count = None
-            continue
-        if (
-            incremental
+            and incremental
             and not reconcile_mode
             and checkpoint_page_number is not None
             and page_number > checkpoint_page_number
@@ -2828,15 +2715,11 @@ def crawl_top_items_api_result(
             if (
                 checkpoint_overlap_pages
                 >= checkpoint_overlap_required
-                and (
-                    refresh_policy_enabled
-                    or required_refresh_ids.issubset(
-                        set(refreshed_known_ids)
-                    )
+                and required_refresh_ids.issubset(
+                    set(refreshed_known_ids)
                 )
                 and (
-                    refresh_policy_enabled
-                    or expected_total_count is None
+                    expected_total_count is None
                     or len(
                         raw_observed_ids
                         | (known_ids - observed_top_ids)
@@ -2844,12 +2727,9 @@ def crawl_top_items_api_result(
                     >= expected_total_count
                 )
             ):
-                if refresh_policy_enabled and not reconcile_mode:
-                    incremental_detail_window_closed = True
-                else:
-                    terminal_reached = True
-                    termination_reason = "incremental_checkpoint"
-                    break
+                terminal_reached = True
+                termination_reason = "incremental_checkpoint"
+                break
         previous_page_count = len(page_entries)
         page_number += 1
 
@@ -2916,10 +2796,13 @@ def crawl_top_items_api_result(
                 error = f"rejected_entries:{rejected_count}"
     LOGGER.info(
         "공지 최신성 감시 결과(API): 출처=%s, 목록=%s, 상세=%s, "
+        "새 공지=%s, 한도 초과 대기=%s, "
         "정기 재검사=%s, 지문 변경=%s, 목록 완결=%s",
         config_fk,
         len(notice_observations),
         len(detailed_notice_ids),
+        new_notice_detail_count,
+        deferred_new_notice_count,
         len(policy_refresh_ids - fingerprint_changed_ids),
         len(fingerprint_changed_ids),
         notice_index_complete,
@@ -2930,11 +2813,7 @@ def crawl_top_items_api_result(
         items=items,
         method="api",
         pages_scanned=pages_scanned,
-        observed_count=(
-            len(set(observed_ids) | known_ids)
-            if resume_active and termination_reason == "natural_end"
-            else len(observed_ids)
-        ),
+        observed_count=len(observed_ids),
         observed_ids=observed_ids,
         notice_observations=notice_observations,
         detailed_notice_ids=detailed_notice_ids,
@@ -2972,12 +2851,9 @@ def crawl_top_items_api_result(
         top_snapshot_verified=(
             first_page_top_verified
             and status == SourceStatus.SUCCESS
-            and not resume_active
             and termination_reason == "natural_end"
         ),
         retry_after_seconds=retry_after_seconds,
-        backfill_resume_page=next_resume_page,
-        backfill_anchor_ids=next_anchor_ids,
     )
 
 
@@ -3072,8 +2948,6 @@ class SogangSourceAdapter:
         source_state: Optional[dict[str, Any]] = None,
         reconcile_mode: bool = False,
         refresh_known_ids: Optional[set[str]] = None,
-        resume_page: int = 1,
-        resume_anchor_ids: Optional[set[str]] = None,
         targeted_refresh_ids: Optional[set[str]] = None,
     ) -> SourceCrawlResult:
         source_cooldown_until = str(
@@ -3111,8 +2985,6 @@ class SogangSourceAdapter:
                     source_state,
                     reconcile_mode,
                     refresh_known_ids,
-                    resume_page,
-                    resume_anchor_ids,
                     targeted_refresh_ids,
                 )
         return self._crawl_active(
@@ -3122,8 +2994,6 @@ class SogangSourceAdapter:
             source_state,
             reconcile_mode,
             refresh_known_ids,
-            resume_page,
-            resume_anchor_ids,
             targeted_refresh_ids,
         )
 
@@ -3135,8 +3005,6 @@ class SogangSourceAdapter:
         source_state: Optional[dict[str, Any]],
         reconcile_mode: bool,
         refresh_known_ids: Optional[set[str]],
-        resume_page: int,
-        resume_anchor_ids: Optional[set[str]],
         targeted_refresh_ids: Optional[set[str]],
     ) -> SourceCrawlResult:
         include_non_top = should_include_non_top()
@@ -3149,8 +3017,6 @@ class SogangSourceAdapter:
             incremental=incremental,
             reconcile_mode=reconcile_mode,
             refresh_known_ids=refresh_known_ids,
-            resume_page=resume_page,
-            resume_anchor_ids=resume_anchor_ids,
             targeted_refresh_ids=targeted_refresh_ids,
             source_state=source_state,
         )
@@ -3194,8 +3060,6 @@ class SogangSourceAdapter:
             api_result,
             reconcile_mode,
             refresh_known_ids,
-            resume_page,
-            resume_anchor_ids,
             targeted_refresh_ids,
             source_state,
         )
@@ -3209,8 +3073,6 @@ def crawl_sources(
     reconcile_mode: bool = False,
     reconcile_mode_by_source: Optional[dict[str, bool]] = None,
     refresh_ids_by_source: Optional[dict[str, set[str]]] = None,
-    resume_page_by_source: Optional[dict[str, int]] = None,
-    resume_anchor_ids_by_source: Optional[dict[str, set[str]]] = None,
     targeted_refresh_ids_by_source: Optional[
         dict[str, set[str]]
     ] = None,
@@ -3236,11 +3098,6 @@ def crawl_sources(
     execution_sources = sorted(
         sources,
         key=lambda source: (
-            not bool(
-                (source_state_by_source or {})
-                .get(source.config_fk, {})
-                .get("backfill_active")
-            ),
             not bool(
                 (reconcile_mode_by_source or {}).get(
                     source.config_fk,
@@ -3349,12 +3206,6 @@ def crawl_sources(
                     reconcile_mode=source_reconcile_mode,
                     refresh_known_ids=(
                         refresh_ids_by_source or {}
-                    ).get(config_fk, set()),
-                    resume_page=(
-                        resume_page_by_source or {}
-                    ).get(config_fk, 1),
-                    resume_anchor_ids=(
-                        resume_anchor_ids_by_source or {}
                     ).get(config_fk, set()),
                     targeted_refresh_ids=(
                         targeted_refresh_ids_by_source or {}
@@ -4254,8 +4105,6 @@ def crawl_fallback_with_fetchers(
     fetch_detail: Callable[[JsonObject, int], FallbackDetailResult],
     reconcile_mode: bool = False,
     refresh_known_ids: Optional[set[str]] = None,
-    resume_page: int = 1,
-    resume_anchor_ids: Optional[set[str]] = None,
     targeted_refresh_ids: Optional[set[str]] = None,
     source_state: Optional[dict[str, Any]] = None,
 ) -> SourceCrawlResult:
@@ -4290,25 +4139,14 @@ def crawl_fallback_with_fetchers(
     time_budget = get_fallback_time_budget_seconds()
     min_interval = get_fallback_min_interval_seconds()
     jitter_max = get_fallback_jitter_seconds()
-    backfill_detail_limit = get_backfill_detail_limit()
-    fetched_detail_count = 0
-    backfill_new_detail_count = 0
-    backfill_window_reached = False
+    new_notice_detail_limit = get_detail_collection_limit()
+    new_notice_detail_count = 0
+    deferred_new_notice_count = 0
     notice_index_complete = False
-    incremental_detail_window_closed = False
     crawl_now = datetime.now(timezone.utc)
     first_page_top_verified = False
     refresh_known_ids = refresh_known_ids or set()
     refreshed_known_ids: list[str] = []
-    resume_page = max(1, resume_page)
-    resume_anchor_ids = resume_anchor_ids or set()
-    resume_active = bool(resume_page > 2 and resume_anchor_ids)
-    resume_search_start = max(2, resume_page - 2)
-    resume_search_end = resume_page + 2
-    resume_anchor_found = not resume_active
-    resume_jump_done = not resume_active
-    next_resume_page = 1
-    next_anchor_ids: list[str] = []
     checkpoint_page_number: Optional[int] = None
     checkpoint_overlap_pages = 0
     checkpoint_overlap_required = (
@@ -4428,42 +4266,7 @@ def crawl_fallback_with_fetchers(
             termination_reason = "page_error"
             break
         pages_scanned += 1
-        page_non_top_ids = {
-            notice_id
-            for entry in page.entries
-            if not bool(entry.get("top"))
-            and (
-                notice_id := extract_detail_id_from_text(
-                    str(
-                        entry.get("url")
-                        or entry.get("detail_url")
-                        or ""
-                    )
-                )
-            )
-        }
-        if (
-            resume_active
-            and page_number >= resume_search_start
-            and page_non_top_ids & resume_anchor_ids
-        ):
-            resume_anchor_found = True
-        if (
-            resume_active
-            and not resume_anchor_found
-            and page_number > resume_search_end
-            and not refresh_policy_enabled
-        ):
-            terminal_error = "backfill_resume_anchor_missing"
-            terminal_category = FailureCategory.SOURCE_PARTIAL
-            termination_reason = "resume_error"
-            break
         if not page.entries:
-            if resume_active and not resume_anchor_found:
-                terminal_error = "backfill_resume_anchor_missing"
-                terminal_category = FailureCategory.SOURCE_PARTIAL
-                termination_reason = "resume_error"
-                break
             if not page.explicit_empty:
                 terminal_error = f"fallback_empty_unverified:{page_number}"
                 terminal_category = FailureCategory.SOURCE_CONTRACT
@@ -4499,20 +4302,13 @@ def crawl_fallback_with_fetchers(
                 first_page_top_verified = True
             terminal_reached = True
             notice_index_complete = True
-            termination_reason = (
-                "backfill_window"
-                if backfill_window_reached
-                else "natural_end"
-            )
+            termination_reason = "natural_end"
             checkpoint_found = True
             break
         id_sequence: list[tuple[str, bool]] = []
         page_contract_failed = False
         page_has_checkpoint = False
         page_has_unknown_notice = False
-        targeted_history_active = bool(
-            targeted_refresh_ids and checkpoint_found
-        )
         for entry_index, entry in enumerate(page.entries, start=1):
             top = bool(entry.get("top"))
             raw_url = str(
@@ -4601,40 +4397,15 @@ def crawl_fallback_with_fetchers(
                 )
             if incremental and notice_id in known_ids and not top:
                 page_has_checkpoint = True
-                if refresh_policy_enabled and not reconcile_mode:
-                    incremental_detail_window_closed = True
-                if targeted_refresh_ids:
-                    targeted_history_active = True
-            if (
-                refresh_policy_enabled
-                and not top
-                and notice_id not in known_ids
-                and backfill_new_detail_count >= backfill_detail_limit
-            ):
-                incremental_detail_window_closed = True
-                if not backfill_window_reached:
-                    backfill_window_reached = True
-                    next_resume_page = page_number
-                    next_anchor_ids = sorted(page_non_top_ids)
-            if (
-                (
-                    targeted_history_active
-                    or incremental_detail_window_closed
-                    or backfill_window_reached
-                    or (
-                        refresh_policy_enabled
-                        and resume_active
-                        and checkpoint_found
-                        and (
-                            not resume_anchor_found
-                            or page_number < resume_page
-                        )
-                    )
-                )
-                and not top
-                and notice_id not in known_ids
-            ):
-                continue
+            if not top and notice_id not in known_ids:
+                if not is_recent_notice(
+                    observation.get("published_at"),
+                    crawl_now,
+                ):
+                    continue
+                if new_notice_detail_count >= new_notice_detail_limit:
+                    deferred_new_notice_count += 1
+                    continue
             if notice_id not in observed_id_set:
                 observed_id_set.add(notice_id)
                 observed_ids.append(notice_id)
@@ -4770,12 +4541,11 @@ def crawl_fallback_with_fetchers(
                 termination_reason = "detail_error"
                 break
             items.append(item)
-            fetched_detail_count += 1
             detailed_notice_ids.append(notice_id)
             if notice_id in known_ids:
                 refreshed_known_ids.append(notice_id)
             else:
-                backfill_new_detail_count += 1
+                new_notice_detail_count += 1
             log_detail_collection_progress(
                 "폴백",
                 "완료",
@@ -4800,7 +4570,8 @@ def crawl_fallback_with_fetchers(
             if checkpoint_page_number is None:
                 checkpoint_page_number = page_number
         if (
-            incremental
+            not refresh_policy_enabled
+            and incremental
             and not reconcile_mode
             and targeted_refresh_ids
             and checkpoint_found
@@ -4808,32 +4579,9 @@ def crawl_fallback_with_fetchers(
                 set(refreshed_known_ids)
             )
         ):
-            if refresh_policy_enabled:
-                incremental_detail_window_closed = True
-            else:
-                terminal_reached = True
-                termination_reason = "incremental_checkpoint"
-                break
-        if (
-            reconcile_mode
-            and include_non_top
-            and (
-                backfill_new_detail_count
-                if refresh_policy_enabled
-                else fetched_detail_count
-            )
-            >= backfill_detail_limit
-            and not backfill_window_reached
-        ):
-            checkpoint_found = True
-            next_resume_page = page_number + 1
-            next_anchor_ids = sorted(page_non_top_ids)
-            if refresh_policy_enabled:
-                backfill_window_reached = True
-            else:
-                terminal_reached = True
-                termination_reason = "backfill_window"
-                break
+            terminal_reached = True
+            termination_reason = "incremental_checkpoint"
+            break
         if not include_non_top and any(
             not bool(entry.get("top")) for entry in page.entries
         ):
@@ -4843,19 +4591,7 @@ def crawl_fallback_with_fetchers(
             break
         if (
             not refresh_policy_enabled
-            and resume_active
-            and not resume_jump_done
-            and checkpoint_found
-        ):
-            resume_search_end += max(0, page_number - 1)
-            page_number = max(
-                page_number + 1,
-                resume_search_start,
-            )
-            resume_jump_done = True
-            continue
-        if (
-            incremental
+            and incremental
             and not reconcile_mode
             and checkpoint_page_number is not None
             and page_number > checkpoint_page_number
@@ -4869,19 +4605,13 @@ def crawl_fallback_with_fetchers(
             if (
                 checkpoint_overlap_pages
                 >= checkpoint_overlap_required
-                and (
-                    refresh_policy_enabled
-                    or required_refresh_ids.issubset(
-                        set(refreshed_known_ids)
-                    )
+                and required_refresh_ids.issubset(
+                    set(refreshed_known_ids)
                 )
             ):
-                if refresh_policy_enabled:
-                    incremental_detail_window_closed = True
-                else:
-                    terminal_reached = True
-                    termination_reason = "incremental_checkpoint"
-                    break
+                terminal_reached = True
+                termination_reason = "incremental_checkpoint"
+                break
         page_number += 1
 
     if terminal_reached and not terminal_error:
@@ -4947,10 +4677,13 @@ def crawl_fallback_with_fetchers(
             terminal_error = "fallback_scope_unverified"
     LOGGER.info(
         "공지 최신성 감시 결과(폴백): 출처=%s, 목록=%s, 상세=%s, "
+        "새 공지=%s, 한도 초과 대기=%s, "
         "정기 재검사=%s, 지문 변경=%s, 목록 완결=%s",
         source.config_fk,
         len(notice_observations),
         len(detailed_notice_ids),
+        new_notice_detail_count,
+        deferred_new_notice_count,
         len(policy_refresh_ids - fingerprint_changed_ids),
         len(fingerprint_changed_ids),
         notice_index_complete,
@@ -4961,11 +4694,7 @@ def crawl_fallback_with_fetchers(
         items=items,
         method=method,
         pages_scanned=pages_scanned,
-        observed_count=(
-            len(set(observed_ids) | known_ids)
-            if resume_active and termination_reason == "natural_end"
-            else len(observed_ids)
-        ),
+        observed_count=len(observed_ids),
         observed_ids=observed_ids,
         notice_observations=notice_observations,
         detailed_notice_ids=detailed_notice_ids,
@@ -5016,12 +4745,9 @@ def crawl_fallback_with_fetchers(
             first_page_top_verified
             and terminal_reached
             and not terminal_error
-            and not resume_active
             and termination_reason == "natural_end"
         ),
         retry_after_seconds=retry_after_seconds,
-        backfill_resume_page=next_resume_page,
-        backfill_anchor_ids=next_anchor_ids,
     )
 
 
@@ -5034,8 +4760,6 @@ def crawl_top_items_http_result(
     original: SourceCrawlResult,
     reconcile_mode: bool = False,
     refresh_known_ids: Optional[set[str]] = None,
-    resume_page: int = 1,
-    resume_anchor_ids: Optional[set[str]] = None,
     targeted_refresh_ids: Optional[set[str]] = None,
     source_state: Optional[dict[str, Any]] = None,
 ) -> SourceCrawlResult:
@@ -5058,8 +4782,6 @@ def crawl_top_items_http_result(
         ),
         reconcile_mode,
         refresh_known_ids,
-        resume_page,
-        resume_anchor_ids,
         targeted_refresh_ids,
         source_state,
     )
@@ -5074,8 +4796,6 @@ def crawl_top_items_playwright_result(
     original: SourceCrawlResult,
     reconcile_mode: bool = False,
     refresh_known_ids: Optional[set[str]] = None,
-    resume_page: int = 1,
-    resume_anchor_ids: Optional[set[str]] = None,
     targeted_refresh_ids: Optional[set[str]] = None,
     source_state: Optional[dict[str, Any]] = None,
 ) -> SourceCrawlResult:
@@ -5090,8 +4810,6 @@ def crawl_top_items_playwright_result(
                 original,
                 reconcile_mode,
                 refresh_known_ids,
-                resume_page,
-                resume_anchor_ids,
                 targeted_refresh_ids,
                 source_state,
             )
@@ -5116,8 +4834,6 @@ def crawl_top_items_playwright_result(
             original,
             reconcile_mode,
             refresh_known_ids,
-            resume_page,
-            resume_anchor_ids,
             targeted_refresh_ids,
             source_state,
         )
@@ -5133,8 +4849,6 @@ def crawl_top_items_playwright_result(
             original,
             reconcile_mode,
             refresh_known_ids,
-            resume_page,
-            resume_anchor_ids,
             targeted_refresh_ids,
             source_state,
         )
@@ -5231,8 +4945,6 @@ def crawl_top_items_playwright_result(
                 original,
                 reconcile_mode,
                 refresh_known_ids,
-                resume_page,
-                resume_anchor_ids,
                 targeted_refresh_ids,
                 source_state,
             )
@@ -5733,8 +5445,6 @@ def crawl_top_items_playwright_result(
                 browser_detail,
                 reconcile_mode,
                 refresh_known_ids,
-                resume_page,
-                resume_anchor_ids,
                 targeted_refresh_ids,
                 source_state,
             )
@@ -5763,8 +5473,6 @@ def crawl_top_items_playwright_result(
             original,
             reconcile_mode,
             refresh_known_ids,
-            resume_page,
-            resume_anchor_ids,
             targeted_refresh_ids,
             source_state,
         )

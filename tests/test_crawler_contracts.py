@@ -3,6 +3,7 @@ import os
 import sys
 import unittest
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
@@ -23,17 +24,21 @@ from models import (
 from validation import validate_crawl_report
 
 
+RECENT_NOTICE_TIME = (
+    datetime.now(timezone(timedelta(hours=9))) - timedelta(days=1)
+).replace(hour=12, minute=0, second=0, microsecond=0)
+RECENT_REG_DATE = RECENT_NOTICE_TIME.strftime("%Y%m%d%H%M%S")
 NORMAL_ENTRY = {
     "pkId": "1001",
     "title": "정상 공지",
-    "regDate": "20260727120000",
+    "regDate": RECENT_REG_DATE,
     "isTop": "N",
     "userName": "교무처",
     "viewCount": 12,
 }
 NORMAL_DETAIL = {
     "title": "정상 공지",
-    "regDate": "20260727120000",
+    "regDate": RECENT_REG_DATE,
     "userName": "교무처",
     "viewCount": 12,
     "content": "<p>본문</p>",
@@ -150,6 +155,7 @@ class CrawlerContractTests(unittest.TestCase):
                 "SITE_MIN_REQUEST_INTERVAL_SECONDS": "0",
                 "CRAWL_HARD_PAGE_LIMIT": "10",
                 "BBS_PAGE_SIZE": "20",
+                "DETAIL_COLLECTION_LIMIT": "100",
             },
         )
         self.env.start()

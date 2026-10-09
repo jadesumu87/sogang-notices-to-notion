@@ -306,8 +306,6 @@ class SourceCrawlResult:
     notice_index_complete: bool = False
     refreshed_known_ids: list[str] = field(default_factory=list)
     refresh_window_end_id: str = ""
-    backfill_resume_page: int = 1
-    backfill_anchor_ids: list[str] = field(default_factory=list)
     top_urls: list[str] = field(default_factory=list)
     top_dates: dict[str, list[str]] = field(default_factory=dict)
     category: FailureCategory = FailureCategory.NONE
@@ -344,7 +342,6 @@ class SourceCrawlResult:
             not in {
                 "natural_end",
                 "non_top_boundary",
-                "backfill_window",
                 "incremental_checkpoint",
             }
         ):

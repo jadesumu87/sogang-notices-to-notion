@@ -9,7 +9,6 @@ from utils import normalize_title_key, parse_compact_datetime
 
 RECENT_REFRESH_INTERVAL = timedelta(hours=1)
 MONTH_REFRESH_INTERVAL = timedelta(days=1)
-ARCHIVE_REFRESH_INTERVAL = timedelta(days=7)
 RECENT_AGE_LIMIT = timedelta(days=8)
 MONTH_AGE_LIMIT = timedelta(days=31)
 
@@ -57,30 +56,34 @@ def build_notice_observation(
     return observation
 
 
+def notice_age(
+    published_at: object,
+    now: datetime,
+) -> Optional[timedelta]:
+    published = parse_utc_datetime(published_at)
+    if published is None:
+        return None
+    return max(timedelta(0), now.astimezone(timezone.utc) - published)
+
+
+def is_recent_notice(published_at: object, now: datetime) -> bool:
+    age = notice_age(published_at, now)
+    return age is not None and age < MONTH_AGE_LIMIT
+
+
 def refresh_interval_for_notice(
     published_at: object,
     now: datetime,
-) -> timedelta:
-    published = parse_utc_datetime(published_at)
-    if published is None:
-        return ARCHIVE_REFRESH_INTERVAL
-    age = max(timedelta(0), now.astimezone(timezone.utc) - published)
+) -> Optional[timedelta]:
+    age = notice_age(published_at, now)
+    if age is None or age >= MONTH_AGE_LIMIT:
+        return None
     if age < RECENT_AGE_LIMIT:
         return RECENT_REFRESH_INTERVAL
-    if age < MONTH_AGE_LIMIT:
-        return MONTH_REFRESH_INTERVAL
-    return ARCHIVE_REFRESH_INTERVAL
-
-
-def initial_archive_refresh_offset_days(notice_id: str) -> int:
-    return int(
-        hashlib.sha256(str(notice_id).encode("utf-8")).hexdigest()[:8],
-        16,
-    ) % 7
+    return MONTH_REFRESH_INTERVAL
 
 
 def notice_refresh_due(
-    notice_id: str,
     current: dict[str, Any],
     previous: Optional[dict[str, Any]] = None,
     now: Optional[datetime] = None,
@@ -101,18 +104,12 @@ def notice_refresh_due(
         current.get("published_at") or previous.get("published_at"),
         current_now,
     )
+    if interval is None:
+        return False
     last_detail_at = parse_utc_datetime(previous.get("last_detail_at"))
     if last_detail_at is not None:
         return current_now - last_detail_at >= interval
-    if interval < ARCHIVE_REFRESH_INTERVAL:
-        return True
-    refresh_offset = initial_archive_refresh_offset_days(notice_id)
-    first_seen_at = parse_utc_datetime(previous.get("first_seen_at"))
-    if first_seen_at is not None:
-        return current_now >= first_seen_at + timedelta(
-            days=refresh_offset
-        )
-    return refresh_offset == 0
+    return True
 
 
 def get_detail_refresh_limit() -> int:
@@ -148,7 +145,6 @@ def select_due_notice_ids(
         if not isinstance(observation, dict):
             continue
         if notice_refresh_due(
-            notice_id,
             observation,
             observation,
             current_now,
@@ -159,13 +155,14 @@ def select_due_notice_ids(
         observation = raw_state[notice_id]
         last_detail = parse_utc_datetime(observation.get("last_detail_at"))
         first_seen = parse_utc_datetime(observation.get("first_seen_at"))
+        interval = refresh_interval_for_notice(
+            observation.get("published_at"),
+            current_now,
+        )
         scheduled = (
-            last_detail + refresh_interval_for_notice(
-                observation.get("published_at"), current_now,
-            )
-            if last_detail is not None
-            else (first_seen or datetime.min.replace(tzinfo=timezone.utc))
-            + timedelta(days=initial_archive_refresh_offset_days(notice_id))
+            last_detail + interval
+            if last_detail is not None and interval is not None
+            else first_seen or datetime.min.replace(tzinfo=timezone.utc)
         )
         return scheduled, len(notice_id), notice_id
 

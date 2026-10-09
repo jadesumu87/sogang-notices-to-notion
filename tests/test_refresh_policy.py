@@ -23,7 +23,7 @@ class RefreshPolicyTests(unittest.TestCase):
             False,
         )
 
-    def test_age_tiers_use_hourly_daily_and_weekly_intervals(self):
+    def test_age_tiers_use_hourly_daily_and_no_interval_after_month(self):
         self.assertEqual(
             refresh_policy.refresh_interval_for_notice(
                 (self.now - timedelta(days=7, hours=23)).isoformat(),
@@ -40,11 +40,41 @@ class RefreshPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             refresh_policy.refresh_interval_for_notice(
-                (self.now - timedelta(days=31)).isoformat(),
+                (self.now - timedelta(days=30, hours=23)).isoformat(),
                 self.now,
             ),
-            timedelta(days=7),
+            timedelta(days=1),
         )
+        self.assertIsNone(
+            refresh_policy.refresh_interval_for_notice(
+                (self.now - timedelta(days=31)).isoformat(),
+                self.now,
+            )
+        )
+        self.assertIsNone(
+            refresh_policy.refresh_interval_for_notice("", self.now)
+        )
+
+    def test_recent_notice_range_ends_after_month(self):
+        self.assertTrue(
+            refresh_policy.is_recent_notice(
+                (self.now - timedelta(days=30, hours=23)).isoformat(),
+                self.now,
+            )
+        )
+        self.assertTrue(
+            refresh_policy.is_recent_notice(
+                (self.now + timedelta(hours=1)).isoformat(),
+                self.now,
+            )
+        )
+        self.assertFalse(
+            refresh_policy.is_recent_notice(
+                (self.now - timedelta(days=31)).isoformat(),
+                self.now,
+            )
+        )
+        self.assertFalse(refresh_policy.is_recent_notice("", self.now))
 
     def test_refresh_is_due_only_after_each_age_interval(self):
         cases = (
@@ -52,8 +82,8 @@ class RefreshPolicyTests(unittest.TestCase):
             (timedelta(days=2), timedelta(hours=1), True),
             (timedelta(days=10), timedelta(hours=23), False),
             (timedelta(days=10), timedelta(days=1), True),
-            (timedelta(days=40), timedelta(days=6), False),
-            (timedelta(days=40), timedelta(days=7), True),
+            (timedelta(days=40), timedelta(days=7), False),
+            (timedelta(days=400), timedelta(days=400), False),
         )
         for index, (age, elapsed, expected) in enumerate(cases):
             with self.subTest(index=index):
@@ -64,7 +94,6 @@ class RefreshPolicyTests(unittest.TestCase):
                 }
                 self.assertEqual(
                     refresh_policy.notice_refresh_due(
-                        str(1000 + index),
                         current,
                         previous,
                         self.now,
@@ -84,53 +113,34 @@ class RefreshPolicyTests(unittest.TestCase):
 
         self.assertTrue(
             refresh_policy.notice_refresh_due(
-                "2000",
                 current,
                 previous,
                 self.now,
             )
         )
 
-    def test_old_notice_initialization_is_spread_and_overdue_work_retries(self):
-        notice_ids_by_offset = {}
-        for value in range(3000, 3100):
-            notice_id = str(value)
-            offset = refresh_policy.initial_archive_refresh_offset_days(
-                notice_id
+    def test_old_notice_without_detail_history_is_not_scheduled(self):
+        current = self.observation("3000", timedelta(days=100))
+        previous = {
+            **current,
+            "first_seen_at": self.now.isoformat(),
+        }
+
+        self.assertFalse(
+            refresh_policy.notice_refresh_due(
+                current,
+                previous,
+                self.now + timedelta(days=30),
             )
-            notice_ids_by_offset.setdefault(offset, notice_id)
-        self.assertEqual(set(notice_ids_by_offset), set(range(7)))
-        for offset, notice_id in notice_ids_by_offset.items():
-            current = self.observation(notice_id, timedelta(days=100))
-            previous = {
-                **current,
-                "first_seen_at": self.now.isoformat(),
-            }
-            if offset:
-                self.assertFalse(
-                    refresh_policy.notice_refresh_due(
-                        notice_id,
-                        current,
-                        previous,
-                        self.now + timedelta(days=offset - 1),
-                    )
-                )
-            self.assertTrue(
-                refresh_policy.notice_refresh_due(
-                    notice_id,
-                    current,
-                    previous,
-                    self.now + timedelta(days=offset),
-                )
-            )
-            self.assertTrue(
-                refresh_policy.notice_refresh_due(
-                    notice_id,
-                    current,
-                    previous,
-                    self.now + timedelta(days=offset + 1),
-                )
-            )
+        )
+        self.assertEqual(
+            refresh_policy.select_due_notice_ids(
+                {"notice_refresh_state": {"3000": previous}},
+                {"3000"},
+                self.now + timedelta(days=30),
+            ),
+            [],
+        )
 
     def test_due_selection_ignores_unknown_and_not_yet_due_notices(self):
         due = self.observation("4000", timedelta(days=10))
@@ -163,8 +173,8 @@ class RefreshPolicyTests(unittest.TestCase):
         known = {str(value) for value in range(1000, 1400)}
         for index, notice_id in enumerate(sorted(known)):
             state["notice_refresh_state"][notice_id] = {
-                **self.observation(notice_id, timedelta(days=100)),
-                "last_detail_at": (self.now - timedelta(days=14, minutes=index)).isoformat(),
+                **self.observation(notice_id, timedelta(days=10)),
+                "last_detail_at": (self.now - timedelta(days=2, minutes=index)).isoformat(),
             }
         first = refresh_policy.select_due_notice_ids(state, known, self.now)
         self.assertEqual(len(first), 20)
