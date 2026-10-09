@@ -2490,17 +2490,25 @@ def validate_notion_payload_value(value: Any, path: str = "$") -> None:
         validate_notion_payload_value(item, item_path)
 
 
+def serialize_notion_payload(payload: JsonObject) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def notion_payload_within_size_limit(payload: JsonObject) -> bool:
+    return len(serialize_notion_payload(payload)) <= NOTION_MAX_REQUEST_BYTES
+
+
 def encode_notion_payload(
     payload: Optional[JsonObject],
 ) -> Optional[bytes]:
     if payload is None:
         return None
     validate_notion_payload_value(payload)
-    data = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    data = serialize_notion_payload(payload)
     if len(data) > NOTION_MAX_REQUEST_BYTES:
         raise NotionPayloadError(
             f"Notion 요청 크기 한도 초과: {len(data)} > {NOTION_MAX_REQUEST_BYTES}"

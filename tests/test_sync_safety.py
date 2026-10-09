@@ -570,6 +570,67 @@ class SyncSafetyTests(unittest.TestCase):
                 self.assertNotIn(store.old_id, store.deleted_ids)
                 self.assertNotIn(store.manual_id, store.deleted_ids)
 
+    def large_paragraphs(self, count: int) -> list[dict]:
+        return [
+            {
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {"content": f"{index}" + "가" * 1990},
+                        }
+                        for _ in range(5)
+                    ]
+                },
+            }
+            for index in range(count)
+        ]
+
+    def test_child_batches_keep_default_boundaries_when_small(self):
+        children = [paragraph_block(str(index)) for index in range(120)]
+
+        self.assertEqual(sync.body_child_batch_end(children, 0), 50)
+        self.assertEqual(sync.body_child_batch_end(children, 50), 100)
+        self.assertEqual(sync.body_child_batch_end(children, 100), 120)
+        self.assertEqual(
+            sync.body_container_first_batch_end([], children),
+            50,
+        )
+
+    def test_large_body_requests_are_split_under_size_limit(self):
+        blocks = self.large_paragraphs(60)
+        sync.validate_body_write_payloads(blocks)
+        store = StatefulBlockStore()
+        request_sizes: list[int] = []
+        append_children = store.append_children
+
+        def recording_append(token, parent_id, child_blocks):
+            request_sizes.append(
+                len(
+                    notion_client.serialize_notion_payload(
+                        {"children": child_blocks}
+                    )
+                )
+            )
+            return append_children(token, parent_id, child_blocks)
+
+        store.append_children = recording_append
+
+        self.assertEqual(
+            self.run_body_sync(store, blocks=blocks),
+            "new-generation",
+        )
+        self.assertGreater(len(request_sizes), 3)
+        self.assertTrue(
+            all(
+                size <= notion_client.NOTION_MAX_REQUEST_BYTES
+                for size in request_sizes
+            )
+        )
+        candidate_id = store.root_ids()[-1]
+        self.assertEqual(len(store.children[candidate_id]), 59)
+
     def test_body_verification_failure_reports_first_difference(self):
         store = StatefulBlockStore("verification_failure")
         with self.assertRaises(BodyVerificationError) as raised:

@@ -66,6 +66,7 @@ URL_TEXT_PATTERN = re.compile(
 )
 TRAILING_URL_PUNCTUATION = ").,;]"
 MAX_NORMALIZED_URL_LENGTH = 8192
+MAX_NOTION_URL_LENGTH = 2000
 MAX_INTEGER_TEXT_LENGTH = 128
 MAX_INTEGER_DIGITS = 18
 MAX_TABLE_ROWS = 200
@@ -829,7 +830,7 @@ def encode_url(raw_url: str) -> str:
 def is_valid_notion_url(url: Optional[str], allow_mailto: bool = True) -> bool:
     if (
         not url
-        or len(url) > MAX_NORMALIZED_URL_LENGTH
+        or len(url) > MAX_NOTION_URL_LENGTH
         or any(ch.isspace() for ch in url)
     ):
         return False
@@ -1147,6 +1148,38 @@ def build_table_blocks(
         }
         for group in row_groups
     ]
+
+
+def build_table_text_blocks(
+    rows: list[list[list[dict[str, Any]]]],
+) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for row in rows:
+        if not any(
+            rich_text_item_content(item).strip()
+            for cell in row
+            for item in cell
+        ):
+            continue
+        rich_text: list[dict[str, Any]] = []
+        for index, cell in enumerate(row):
+            if index:
+                rich_text.append(
+                    {
+                        "type": "text",
+                        "text": {"content": " | "},
+                        "annotations": dict(DEFAULT_ANNOTATIONS),
+                    }
+                )
+            rich_text.extend(copy.deepcopy(cell))
+        blocks.append(
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": fit_rich_text_items(rich_text)},
+            }
+        )
+    return blocks
 def chunks(
     items: list[dict[str, Any]],
     size: int,

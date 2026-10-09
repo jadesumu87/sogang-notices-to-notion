@@ -453,6 +453,76 @@ class NotionLimitContractTests(unittest.TestCase):
         sync.validate_body_write_payloads(blocks)
 
 
+class OversizedContentContractTests(unittest.TestCase):
+    def test_table_over_row_limit_is_kept_as_paragraphs(self) -> None:
+        body_rows = "".join(
+            f"<tr><td>행{index}</td><td>{index}</td></tr>"
+            for index in range(utils.MAX_TABLE_ROWS + 1)
+        )
+        html = (
+            '<div class="tiptap"><table>'
+            "<tr><th>구분</th><th>값</th></tr>"
+            f"{body_rows}</table></div>"
+        )
+
+        blocks = bbs_parser.extract_body_blocks_from_html(html)
+
+        self.assertTrue(all(block["type"] == "paragraph" for block in blocks))
+        self.assertEqual(rich_text_content(blocks[0]), "구분 | 값")
+        self.assertEqual(
+            [rich_text_content(block) for block in blocks[1:]],
+            [
+                f"행{index} | {index}"
+                for index in range(utils.MAX_TABLE_ROWS + 1)
+            ],
+        )
+        sync.validate_body_write_payloads(blocks)
+
+    def test_sparse_table_fallback_uses_only_source_cells(self) -> None:
+        rows = [[[text_item(f"{index}")]] for index in range(100)]
+        rows.append([[text_item(f"칸{index}")] for index in range(100)])
+        rows.append([[], []])
+
+        self.assertEqual(utils.build_table_blocks(rows, False, False), [])
+        blocks = utils.build_table_text_blocks(rows)
+
+        self.assertEqual(len(blocks), 101)
+        self.assertEqual(
+            rich_text_content(blocks[-1]),
+            " | ".join(f"칸{index}" for index in range(100)),
+        )
+        self.assertTrue(
+            all(
+                len(block["paragraph"]["rich_text"])
+                <= utils.MAX_RICH_TEXT_ITEMS
+                for block in blocks
+            )
+        )
+
+    def test_link_longer_than_notion_limit_keeps_text_only(self) -> None:
+        long_link = "https://www.sogang.ac.kr/apply?" + "q=1&" * 600
+        short_link = "https://www.sogang.ac.kr/apply?q=1"
+        html = (
+            '<div class="tiptap"><p>'
+            f'<a href="{long_link}">긴 신청 링크</a> '
+            f'<a href="{short_link}">짧은 신청 링크</a>'
+            f'</p><iframe src="https://www.youtube.com/embed/abc?'
+            f'{"t=1&" * 600}"></iframe></div>'
+        )
+
+        blocks = bbs_parser.extract_body_blocks_from_html(html)
+
+        self.assertEqual([block["type"] for block in blocks], ["paragraph"])
+        rich_text = blocks[0]["paragraph"]["rich_text"]
+        self.assertEqual(
+            rich_text_content(blocks[0]),
+            "긴 신청 링크 짧은 신청 링크",
+        )
+        self.assertNotIn("link", rich_text[0]["text"])
+        self.assertEqual(rich_text[-1]["text"]["link"]["url"], short_link)
+        sync.validate_body_write_payloads(blocks)
+
+
 class DetailSignalContractTests(unittest.TestCase):
     def test_loading_shell_is_distinct_from_error_and_hidden_shells(self) -> None:
         loading = '<main><div class="notice-loading skeleton"></div></main>'

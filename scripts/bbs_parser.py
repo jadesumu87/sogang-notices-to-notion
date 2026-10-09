@@ -26,6 +26,7 @@ from utils import (
     build_embed_block,
     build_image_block,
     build_table_blocks,
+    build_table_text_blocks,
     fit_rich_text_items,
     is_attachment_candidate,
     is_valid_notion_url,
@@ -686,6 +687,7 @@ class TiptapBlockParser(HTMLParser):
                 self.table_has_column_header,
                 self.table_has_row_header,
             )
+            or build_table_text_blocks(self.table_rows)
         )
         self.in_table = False
         self.table_depth = 0

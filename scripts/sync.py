@@ -32,6 +32,7 @@ from notion_client import (
     delete_block,
     encode_notion_payload,
     list_block_children,
+    notion_payload_within_size_limit,
     notion_request,
     query_database,
     query_database_page,
@@ -86,6 +87,7 @@ JsonObject = dict[str, Any]
 BODY_GENERATION_MANIFEST_VERSION = 2
 BODY_GENERATION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 BODY_GENERATION_HASH_RE = re.compile(r"[0-9a-f]{64}")
+BODY_CHILD_BATCH_SIZE = 50
 SIGNATURE_DIFFERENCE_VALUE_LIMIT = 120
 PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
 URL_UNRESERVED_CHARACTERS = frozenset(
@@ -2195,10 +2197,55 @@ def split_body_container_parts(
             container_rich_text = build_space_rich_text()
     if not container_rich_text:
         container_rich_text = build_space_rich_text()
-    body_chunks = chunks(remaining_blocks, 50) or [[]]
+    body_chunks = chunks(remaining_blocks, BODY_CHILD_BATCH_SIZE) or [[]]
     if len(body_chunks) > 100:
         raise RuntimeError("본문 블록 세대가 100개 파트를 초과합니다")
     return container_rich_text, body_chunks
+
+
+def build_body_container_payload(
+    container_rich_text: list[JsonObject],
+    first_children: list[JsonObject],
+) -> JsonObject:
+    container_payload = build_container_block(
+        copy.deepcopy(container_rich_text)
+    )
+    if first_children:
+        container_payload["quote"]["children"] = copy.deepcopy(
+            first_children
+        )
+    return container_payload
+
+
+def body_container_first_batch_end(
+    container_rich_text: list[JsonObject],
+    children: list[JsonObject],
+) -> int:
+    end = min(len(children), BODY_CHILD_BATCH_SIZE)
+    while end > 0 and not notion_payload_within_size_limit(
+        {
+            "children": [
+                build_body_container_payload(
+                    container_rich_text,
+                    children[:end],
+                )
+            ]
+        }
+    ):
+        end -= 1
+    return end
+
+
+def body_child_batch_end(children: list[JsonObject], start: int) -> int:
+    end = min(
+        len(children),
+        ((start // BODY_CHILD_BATCH_SIZE) + 1) * BODY_CHILD_BATCH_SIZE,
+    )
+    while end > start + 1 and not notion_payload_within_size_limit(
+        {"children": children[start:end]}
+    ):
+        end -= 1
+    return end
 
 
 def validate_body_write_payloads(blocks: list[JsonObject]) -> None:
@@ -2210,27 +2257,30 @@ def validate_body_write_payloads(blocks: list[JsonObject]) -> None:
         for child_chunk in body_chunks
         for child in child_chunk
     ]
-    first_chunk = body_chunks[0]
-    container_payload = build_container_block(
-        copy.deepcopy(container_rich_text)
+    offset = body_container_first_batch_end(
+        container_rich_text,
+        expected_children,
     )
-    if first_chunk:
-        container_payload["quote"]["children"] = copy.deepcopy(
-            first_chunk
-        )
-    encode_notion_payload({"children": [container_payload]})
-    for offset in range(
-        len(first_chunk),
-        len(expected_children),
-        50,
-    ):
+    encode_notion_payload(
+        {
+            "children": [
+                build_body_container_payload(
+                    container_rich_text,
+                    expected_children[:offset],
+                )
+            ]
+        }
+    )
+    while offset < len(expected_children):
+        batch_end = body_child_batch_end(expected_children, offset)
         encode_notion_payload(
             {
                 "children": copy.deepcopy(
-                    expected_children[offset : offset + 50]
+                    expected_children[offset:batch_end]
                 )
             }
         )
+        offset = batch_end
 
 
 def sync_container_actual_hash(
@@ -2608,14 +2658,15 @@ def sync_page_body_blocks(
             raise RuntimeError("본문 세대 후보가 중복되었습니다")
         candidate = recovered[0] if recovered else None
     if candidate is None:
-        first_chunk = body_chunks[0]
-        container_payload = build_container_block(
-            copy.deepcopy(container_rich_text)
+        container_payload = build_body_container_payload(
+            container_rich_text,
+            expected_children[
+                :body_container_first_batch_end(
+                    container_rich_text,
+                    expected_children,
+                )
+            ],
         )
-        if first_chunk:
-            container_payload["quote"]["children"] = copy.deepcopy(
-                first_chunk
-            )
         response: object = None
         append_error: Optional[Exception] = None
         try:
@@ -2720,10 +2771,7 @@ def sync_page_body_blocks(
 
     prefix_length = persist_candidate()
     while prefix_length < len(expected_children):
-        batch_end = min(
-            len(expected_children),
-            ((prefix_length // 50) + 1) * 50,
-        )
+        batch_end = body_child_batch_end(expected_children, prefix_length)
         child_batch = copy.deepcopy(
             expected_children[prefix_length:batch_end]
         )
