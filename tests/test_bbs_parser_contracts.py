@@ -7,6 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bbs_parser
+import sync
+import utils
 
 
 def rich_text_content(block: dict[str, Any]) -> str:
@@ -253,6 +255,202 @@ class BodyBlockContractTests(unittest.TestCase):
 
         self.assertEqual(bbs_parser.extract_body_blocks_from_html(html), [])
         self.assertEqual(bbs_parser.inspect_body_content(html), (True, False))
+
+
+def text_item(
+    content: str,
+    *,
+    bold: bool = False,
+    color: str = "default",
+    link: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"content": content}
+    if link:
+        payload["link"] = {"url": link}
+    return {
+        "type": "text",
+        "text": payload,
+        "annotations": {
+            **utils.DEFAULT_ANNOTATIONS,
+            "bold": bold,
+            "color": color,
+        },
+    }
+
+
+def visible_formats(rich_text: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
+    return [
+        (
+            character,
+            tuple(sorted(item["annotations"].items())),
+            (item["text"].get("link") or {}).get("url"),
+        )
+        for item in rich_text
+        for character in item["text"]["content"]
+        if not character.isspace()
+    ]
+
+
+class NotionLimitContractTests(unittest.TestCase):
+    def test_rich_text_within_limit_is_unchanged(self) -> None:
+        rich_text = [
+            text_item(f"{index}", bold=index % 2 == 0)
+            for index in range(utils.MAX_RICH_TEXT_ITEMS)
+        ]
+
+        self.assertIs(utils.fit_rich_text_items(rich_text), rich_text)
+
+    def test_whitespace_runs_merge_without_changing_visible_format(
+        self,
+    ) -> None:
+        rich_text = []
+        for index in range(60):
+            rich_text.append(
+                text_item(f"항목{index}", bold=index % 2 == 0)
+            )
+            rich_text.append(text_item("\n", color="blue"))
+
+        fitted = utils.fit_rich_text_items(rich_text)
+
+        self.assertLessEqual(len(fitted), utils.MAX_RICH_TEXT_ITEMS)
+        self.assertEqual(
+            "".join(item["text"]["content"] for item in fitted),
+            "".join(item["text"]["content"] for item in rich_text),
+        )
+        self.assertEqual(visible_formats(fitted), visible_formats(rich_text))
+
+    def test_dense_formatting_keeps_text_and_links(self) -> None:
+        rich_text = [
+            text_item(
+                f"조각{index}",
+                bold=index % 2 == 0,
+                link=(
+                    f"https://www.sogang.ac.kr/link/{index}"
+                    if index % 10 == 0
+                    else None
+                ),
+            )
+            for index in range(150)
+        ]
+
+        fitted = utils.fit_rich_text_items(rich_text)
+
+        self.assertLessEqual(len(fitted), utils.MAX_RICH_TEXT_ITEMS)
+        self.assertEqual(
+            "".join(item["text"]["content"] for item in fitted),
+            "".join(item["text"]["content"] for item in rich_text),
+        )
+        self.assertEqual(
+            [
+                item["text"]["link"]["url"]
+                for item in fitted
+                if item["text"].get("link")
+            ],
+            [
+                f"https://www.sogang.ac.kr/link/{index}"
+                for index in range(0, 150, 10)
+            ],
+        )
+        self.assertEqual(utils.fit_rich_text_items(rich_text), fitted)
+
+    def test_content_length_limit_is_never_exceeded(self) -> None:
+        rich_text = [
+            text_item("가" * 1500, bold=index % 2 == 0)
+            for index in range(150)
+        ]
+
+        fitted = utils.fit_rich_text_items(rich_text)
+
+        self.assertEqual(len(fitted), 150)
+        self.assertTrue(
+            all(
+                len(item["text"]["content"])
+                <= utils.MAX_RICH_TEXT_CONTENT_LENGTH
+                for item in fitted
+            )
+        )
+
+    def test_dense_table_cell_fits_notion_payload_limits(self) -> None:
+        spans = "".join(
+            f'<span style="color: {"red" if index % 2 else "blue"}">'
+            f"{index}</span><br>"
+            for index in range(120)
+        )
+        html = (
+            '<div class="tiptap"><table><tr><td>구분</td>'
+            f"<td>{spans}</td></tr></table></div>"
+        )
+
+        blocks = bbs_parser.extract_body_blocks_from_html(html)
+
+        cell = blocks[0]["table"]["children"][0]["table_row"]["cells"][1]
+        self.assertLessEqual(len(cell), utils.MAX_RICH_TEXT_ITEMS)
+        self.assertEqual(
+            "".join(item["text"]["content"] for item in cell).split(),
+            [str(index) for index in range(120)],
+        )
+        sync.validate_body_write_payloads(blocks)
+
+    def test_long_table_splits_into_blocks_with_repeated_header(
+        self,
+    ) -> None:
+        header = [[text_item("구분")], [text_item("값")]]
+        rows = [header] + [
+            [[text_item(f"행{index}")], [text_item(str(index))]]
+            for index in range(149)
+        ]
+
+        tables = utils.build_table_blocks(rows, True, False)
+
+        self.assertEqual(
+            [len(table["table"]["children"]) for table in tables],
+            [100, 51],
+        )
+        self.assertTrue(
+            all(
+                table["table"]["children"][0]["table_row"]["cells"]
+                == header
+                for table in tables
+            )
+        )
+        self.assertEqual(
+            [
+                row["table_row"]["cells"][0][0]["text"]["content"]
+                for table in tables
+                for row in table["table"]["children"][1:]
+            ],
+            [f"행{index}" for index in range(149)],
+        )
+        self.assertEqual(
+            [
+                len(table["table"]["children"])
+                for table in utils.build_table_blocks(rows[1:], False, False)
+            ],
+            [100, 49],
+        )
+        self.assertEqual(
+            len(utils.build_table_blocks(rows[:100], True, False)),
+            1,
+        )
+
+    def test_long_html_table_fits_notion_payload_limits(self) -> None:
+        body_rows = "".join(
+            f"<tr><td>행{index}</td><td>{index}</td></tr>"
+            for index in range(150)
+        )
+        html = (
+            '<div class="tiptap"><table>'
+            "<tr><th>구분</th><th>값</th></tr>"
+            f"{body_rows}</table></div>"
+        )
+
+        blocks = bbs_parser.extract_body_blocks_from_html(html)
+
+        self.assertEqual(
+            [block["type"] for block in blocks],
+            ["table", "table"],
+        )
+        sync.validate_body_write_payloads(blocks)
 
 
 class DetailSignalContractTests(unittest.TestCase):

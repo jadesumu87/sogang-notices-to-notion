@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import ipaddress
 import json
@@ -5,6 +6,7 @@ import mimetypes
 import os
 import re
 import socket
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -69,6 +71,9 @@ MAX_INTEGER_DIGITS = 18
 MAX_TABLE_ROWS = 200
 MAX_TABLE_COLUMNS = 100
 MAX_TABLE_CELLS = 5000
+MAX_TABLE_ROWS_PER_BLOCK = 100
+MAX_RICH_TEXT_ITEMS = 100
+MAX_RICH_TEXT_CONTENT_LENGTH = 2000
 
 
 def normalize_notion_text_identity(text: str) -> str:
@@ -952,6 +957,141 @@ def build_container_block(
     }
 
 
+def rich_text_item_content(item: dict[str, Any]) -> str:
+    text_payload = item.get("text")
+    if not isinstance(text_payload, dict):
+        return ""
+    return str(text_payload.get("content") or "")
+
+
+def rich_text_item_link(item: dict[str, Any]) -> object:
+    text_payload = item.get("text")
+    if not isinstance(text_payload, dict):
+        return None
+    return text_payload.get("link")
+
+
+def visible_character_count(text: str) -> int:
+    return sum(1 for character in text if not character.isspace())
+
+
+def rich_text_pair_mergeable(
+    first: dict[str, Any],
+    second: dict[str, Any],
+) -> bool:
+    return (
+        first.get("type") == "text"
+        and second.get("type") == "text"
+        and isinstance(first.get("text"), dict)
+        and isinstance(second.get("text"), dict)
+        and len(rich_text_item_content(first))
+        + len(rich_text_item_content(second))
+        <= MAX_RICH_TEXT_CONTENT_LENGTH
+    )
+
+
+def merge_rich_text_pair(
+    first: dict[str, Any],
+    second: dict[str, Any],
+) -> dict[str, Any]:
+    first_content = rich_text_item_content(first)
+    second_content = rich_text_item_content(second)
+    base = (
+        first
+        if visible_character_count(first_content)
+        >= visible_character_count(second_content)
+        else second
+    )
+    merged = copy.deepcopy(base)
+    merged["text"]["content"] = first_content + second_content
+    return merged
+
+
+def merge_matching_rich_text(
+    items: list[dict[str, Any]],
+    matches: Callable[[dict[str, Any], dict[str, Any]], bool],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for item in items:
+        if (
+            merged
+            and rich_text_pair_mergeable(merged[-1], item)
+            and matches(merged[-1], item)
+        ):
+            merged[-1] = merge_rich_text_pair(merged[-1], item)
+        else:
+            merged.append(item)
+    return merged
+
+
+def merge_smallest_rich_text_pairs(
+    items: list[dict[str, Any]],
+    matches: Callable[[dict[str, Any], dict[str, Any]], bool],
+) -> list[dict[str, Any]]:
+    merged = list(items)
+    counts = [
+        visible_character_count(rich_text_item_content(item))
+        for item in merged
+    ]
+    while len(merged) > MAX_RICH_TEXT_ITEMS:
+        best: Optional[tuple[int, int]] = None
+        for index in range(len(merged) - 1):
+            if not (
+                rich_text_pair_mergeable(merged[index], merged[index + 1])
+                and matches(merged[index], merged[index + 1])
+            ):
+                continue
+            candidate = (min(counts[index], counts[index + 1]), index)
+            if best is None or candidate < best:
+                best = candidate
+        if best is None:
+            break
+        index = best[1]
+        merged[index:index + 2] = [
+            merge_rich_text_pair(merged[index], merged[index + 1])
+        ]
+        counts[index:index + 2] = [counts[index] + counts[index + 1]]
+    return merged
+
+
+def fit_rich_text_items(
+    rich_text: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if len(rich_text) <= MAX_RICH_TEXT_ITEMS:
+        return rich_text
+    items = merge_matching_rich_text(
+        rich_text,
+        lambda first, second: (
+            first.get("annotations") == second.get("annotations")
+            and rich_text_item_link(first) == rich_text_item_link(second)
+        ),
+    )
+    if len(items) > MAX_RICH_TEXT_ITEMS:
+        items = merge_matching_rich_text(
+            items,
+            lambda first, second: (
+                rich_text_item_link(first) == rich_text_item_link(second)
+                and (
+                    not rich_text_item_content(first).strip()
+                    or not rich_text_item_content(second).strip()
+                )
+            ),
+        )
+    if len(items) > MAX_RICH_TEXT_ITEMS:
+        items = merge_smallest_rich_text_pairs(
+            items,
+            lambda first, second: (
+                rich_text_item_link(first) == rich_text_item_link(second)
+            ),
+        )
+    if len(items) > MAX_RICH_TEXT_ITEMS:
+        items = merge_smallest_rich_text_pairs(
+            items,
+            lambda first, second: True,
+        )
+    return items
+
+
 def build_table_row_block(
     cells: list[list[dict[str, Any]]],
 ) -> dict[str, Any]:
@@ -962,13 +1102,13 @@ def build_table_row_block(
     }
 
 
-def build_table_block(
+def build_table_blocks(
     rows: list[list[list[dict[str, Any]]]],
     has_column_header: bool,
     has_row_header: bool,
-) -> Optional[dict[str, Any]]:
+) -> list[dict[str, Any]]:
     if not rows or len(rows) > MAX_TABLE_ROWS:
-        return None
+        return []
     table_width = max((len(row) for row in rows), default=0)
     source_cell_count = sum(len(row) for row in rows)
     normalized_cell_count = len(rows) * table_width
@@ -978,22 +1118,35 @@ def build_table_block(
         or source_cell_count > MAX_TABLE_CELLS
         or normalized_cell_count > MAX_TABLE_CELLS
     ):
-        return None
+        return []
     normalized_rows: list[dict[str, Any]] = []
     for row in rows:
         if len(row) < table_width:
             row = row + [[] for _ in range(table_width - len(row))]
         normalized_rows.append(build_table_row_block(row))
-    return {
-        "object": "block",
-        "type": "table",
-        "table": {
-            "table_width": table_width,
-            "has_column_header": has_column_header,
-            "has_row_header": has_row_header,
-            "children": normalized_rows,
-        },
-    }
+    if len(normalized_rows) <= MAX_TABLE_ROWS_PER_BLOCK:
+        row_groups = [normalized_rows]
+    else:
+        header_rows = normalized_rows[:1] if has_column_header else []
+        body_rows = normalized_rows[len(header_rows):]
+        group_size = MAX_TABLE_ROWS_PER_BLOCK - len(header_rows)
+        row_groups = [
+            copy.deepcopy(header_rows) + body_rows[start:start + group_size]
+            for start in range(0, len(body_rows), group_size)
+        ]
+    return [
+        {
+            "object": "block",
+            "type": "table",
+            "table": {
+                "table_width": table_width,
+                "has_column_header": has_column_header,
+                "has_row_header": has_row_header,
+                "children": group,
+            },
+        }
+        for group in row_groups
+    ]
 def chunks(
     items: list[dict[str, Any]],
     size: int,

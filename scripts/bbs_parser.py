@@ -22,9 +22,11 @@ from settings import (
 from utils import (
     CSS_COLOR_MAP,
     DEFAULT_ANNOTATIONS,
+    MAX_RICH_TEXT_CONTENT_LENGTH,
     build_embed_block,
     build_image_block,
-    build_table_block,
+    build_table_blocks,
+    fit_rich_text_items,
     is_attachment_candidate,
     is_valid_notion_url,
     normalize_content_url,
@@ -206,8 +208,8 @@ def build_rich_text_from_segments(
             link = None
         remaining = text
         while remaining:
-            chunk = remaining[:2000]
-            remaining = remaining[2000:]
+            chunk = remaining[:MAX_RICH_TEXT_CONTENT_LENGTH]
+            remaining = remaining[MAX_RICH_TEXT_CONTENT_LENGTH:]
             text_payload: dict[str, Any] = {"content": chunk}
             if link:
                 text_payload["link"] = {"url": link}
@@ -219,7 +221,7 @@ def build_rich_text_from_segments(
                 }
             )
             has_content = True
-    return rich_text
+    return fit_rich_text_items(rich_text)
 
 
 def build_paragraph_block_from_rich_text(
@@ -678,11 +680,13 @@ class TiptapBlockParser(HTMLParser):
             self.flush_table_cell()
         if self.in_table_row:
             self.flush_table_row()
-        table_block = build_table_block(
-            self.table_rows, self.table_has_column_header, self.table_has_row_header
+        self.blocks.extend(
+            build_table_blocks(
+                self.table_rows,
+                self.table_has_column_header,
+                self.table_has_row_header,
+            )
         )
-        if table_block:
-            self.blocks.append(table_block)
         self.in_table = False
         self.table_depth = 0
         self.in_table_row = False

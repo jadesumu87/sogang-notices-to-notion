@@ -289,18 +289,22 @@ class SecurityReportRegressionTests(unittest.TestCase):
         sparse_rows = [[[{}]] for _ in range(100)]
         sparse_rows.append([[{}] for _ in range(100)])
 
-        self.assertIsNone(
-            utils.build_table_block(sparse_rows, False, False)
+        self.assertEqual(
+            utils.build_table_blocks(sparse_rows, False, False),
+            [],
         )
-        self.assertIsNotNone(
-            utils.build_table_block(
-                [
-                    [[{}], [{}]],
-                    [[{}], [{}]],
-                ],
-                True,
-                False,
-            )
+        self.assertEqual(
+            len(
+                utils.build_table_blocks(
+                    [
+                        [[{}], [{}]],
+                        [[{}], [{}]],
+                    ],
+                    True,
+                    False,
+                )
+            ),
+            1,
         )
 
     def test_csf_c28d4465b08ec91e6e7dc1d7_list_bytes_are_bounded(self) -> None:
