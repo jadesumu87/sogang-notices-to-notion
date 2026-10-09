@@ -301,11 +301,19 @@ def destination_contract_summary(
     ):
         return ""
     sources = ",".join(counters.quarantined_source_ids) or "-"
-    return (
+    summary = (
         "복구되지 않은 Notion 대기 페이지를 출처별로 격리했습니다: "
         f"출처={sources}, "
         f"대기 페이지={len(counters.unresolved_pending_page_ids)}"
     )
+    held = ",".join(
+        f"{source_id}:{notice_id}"
+        for source_id, notice_ids in sorted(counters.held_notices.items())
+        for notice_id in notice_ids
+    )
+    if held:
+        summary += f", 본문 검증 보류={held}"
+    return summary
 
 
 def validate_destination_hold_counters(
@@ -1248,7 +1256,8 @@ def main() -> None:
                 if counters is not None:
                     LOGGER.info(
                         "%s: 생성=%s, 속성=%s, 본문=%s, TOP해제=%s, "
-                        "무변경=%s, 미디어보류=%s, 호스트보류=%s, 전체쓰기=%s",
+                        "무변경=%s, 미디어보류=%s, 호스트보류=%s, "
+                        "본문검증보류=%s, 전체쓰기=%s",
                         "동기화 안전 보류" if deferred_error else "동기화 완료",
                         counters.created,
                         counters.property_updates,
@@ -1257,6 +1266,10 @@ def main() -> None:
                         counters.unchanged,
                         counters.media_deferred,
                         len(counters.external_download_host_circuits),
+                        sum(
+                            len(notice_ids)
+                            for notice_ids in counters.held_notices.values()
+                        ),
                         counters.writes,
                     )
             if deferred_error is not None and deferred_incident is not None:

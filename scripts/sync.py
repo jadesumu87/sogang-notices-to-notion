@@ -24,8 +24,8 @@ from common import (
     is_empty_paragraph_block,
     rich_text_plain_text,
 )
-from log import LOGGER
-from models import DestinationConsistencyError
+from log import LOGGER, redact_sensitive_urls
+from models import BodyVerificationError, DestinationConsistencyError
 from notion_client import (
     NotionRequestError,
     append_block_children,
@@ -86,6 +86,7 @@ JsonObject = dict[str, Any]
 BODY_GENERATION_MANIFEST_VERSION = 2
 BODY_GENERATION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 BODY_GENERATION_HASH_RE = re.compile(r"[0-9a-f]{64}")
+SIGNATURE_DIFFERENCE_VALUE_LIMIT = 120
 PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
 URL_UNRESERVED_CHARACTERS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
@@ -1913,6 +1914,122 @@ def verify_sync_container_part(
     )
 
 
+def signature_value_summary(value: object) -> str:
+    summary = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if len(summary) > SIGNATURE_DIFFERENCE_VALUE_LIMIT:
+        summary = summary[:SIGNATURE_DIFFERENCE_VALUE_LIMIT] + "…"
+    return redact_sensitive_urls(summary)
+
+
+def link_difference_parts(expected: str, actual: str) -> list[str]:
+    if not all(
+        "://" in value or value.lower().startswith("mailto:")
+        for value in (expected, actual)
+    ):
+        return []
+    try:
+        expected_parts = urlsplit(expected)
+        actual_parts = urlsplit(actual)
+    except ValueError:
+        return []
+    return [
+        name
+        for name in ("scheme", "netloc", "path", "query", "fragment")
+        if getattr(expected_parts, name) != getattr(actual_parts, name)
+    ]
+
+
+def first_signature_difference(
+    expected: object,
+    actual: object,
+    path: str,
+) -> str:
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        for key in sorted(set(expected) | set(actual)):
+            if expected.get(key) != actual.get(key):
+                return first_signature_difference(
+                    expected.get(key),
+                    actual.get(key),
+                    f"{path}.{key}",
+                )
+        return ""
+    if isinstance(expected, list) and isinstance(actual, list):
+        for index, (expected_item, actual_item) in enumerate(
+            zip(expected, actual, strict=False)
+        ):
+            if expected_item != actual_item:
+                return first_signature_difference(
+                    expected_item,
+                    actual_item,
+                    f"{path}[{index}]",
+                )
+        if len(expected) != len(actual):
+            return (
+                f"{path} 개수: 기대={len(expected)}, 실제={len(actual)}"
+            )
+        return ""
+    if expected == actual:
+        return ""
+    difference = (
+        f"{path}: 기대={signature_value_summary(expected)}, "
+        f"실제={signature_value_summary(actual)}"
+    )
+    if isinstance(expected, str) and isinstance(actual, str):
+        parts = link_difference_parts(expected, actual)
+        if parts:
+            difference += f", 다른 부분={','.join(parts)}"
+    return difference
+
+
+def sync_container_difference(
+    token: str,
+    block: Optional[JsonObject],
+    expected_rich_text: list[JsonObject],
+    expected_children: list[JsonObject],
+    *,
+    prefix_only: bool = False,
+) -> str:
+    if block is None:
+        return "본문 인용 블록 없음"
+    block_id = str(block.get("id") or "").strip()
+    body_rich_text = sync_container_body_rich_text(block)
+    if not block_id or body_rich_text is None:
+        return "본문 인용 블록을 읽을 수 없음"
+    difference = first_signature_difference(
+        rich_text_signature(expected_rich_text, normalize_links=True),
+        rich_text_signature(body_rich_text, normalize_links=True),
+        "인용문",
+    )
+    if difference:
+        return difference
+    try:
+        actual_children = list_block_children(token, block_id)
+        compared_children = (
+            expected_children[:len(actual_children)]
+            if prefix_only
+            and len(actual_children) <= len(expected_children)
+            else expected_children
+        )
+        difference = first_signature_difference(
+            sync_child_signature(
+                token,
+                compared_children,
+                False,
+                normalize_links=True,
+            ),
+            sync_child_signature(
+                token,
+                actual_children,
+                True,
+                normalize_links=True,
+            ),
+            "자식",
+        )
+    except NotionRequestError as exc:
+        return f"차이 확인 실패: {type(exc).__name__}"
+    return difference or "표기 차이 없음, 내용 해시 불일치"
+
+
 def sync_container_prefix_validation(
     token: str,
     block: JsonObject,
@@ -2293,18 +2410,25 @@ def sync_page_body_blocks(
         )
     ]
     if legacy_untracked_recovery and untracked_root_blocks:
-        if (
-            len(untracked_root_blocks) != 1
-            or not verify_sync_container_part(
-                token,
-                untracked_root_blocks[0],
-                expected_children,
-                container_rich_text,
-                expected_hash,
-            )
-        ):
+        if len(untracked_root_blocks) != 1:
             raise RuntimeError(
                 "기존 미완료 본문이 현재 작업과 정확히 일치하지 않습니다"
+            )
+        if not verify_sync_container_part(
+            token,
+            untracked_root_blocks[0],
+            expected_children,
+            container_rich_text,
+            expected_hash,
+        ):
+            raise BodyVerificationError(
+                "기존 미완료 본문이 현재 작업과 정확히 일치하지 않습니다: "
+                + sync_container_difference(
+                    token,
+                    untracked_root_blocks[0],
+                    container_rich_text,
+                    expected_children,
+                )
             )
         recovered_id = str(
             untracked_root_blocks[0].get("id") or ""
@@ -2365,10 +2489,17 @@ def sync_page_body_blocks(
             expected_children,
         )
         if prefix_length is None:
-            raise RuntimeError(
+            raise BodyVerificationError(
                 "기존 본문 세대 검증 실패: "
                 f"generation={generation_id}; "
-                f"reason={verification_reason}"
+                f"reason={verification_reason}; "
+                + sync_container_difference(
+                    token,
+                    candidate,
+                    container_rich_text,
+                    expected_children,
+                    prefix_only=True,
+                )
             )
         return candidate
 
@@ -2529,10 +2660,17 @@ def sync_page_body_blocks(
                 page_id,
                 pending_manifest,
             )
-            raise RuntimeError(
+            raise BodyVerificationError(
                 "본문 세대 검증 실패: "
                 f"generation={generation_id}; "
-                f"reason={verification_reason}"
+                f"reason={verification_reason}; "
+                + sync_container_difference(
+                    token,
+                    candidate,
+                    container_rich_text,
+                    expected_children,
+                    prefix_only=True,
+                )
             )
     candidate_id = str(candidate.get("id") or "").strip()
     if not candidate_id:
@@ -2554,7 +2692,16 @@ def sync_page_body_blocks(
             expected_children,
         )
         if prefix_length is None:
-            raise RuntimeError("본문 세대 자식 접두부가 변경되었습니다")
+            raise BodyVerificationError(
+                "본문 세대 자식 접두부가 변경되었습니다: "
+                + sync_container_difference(
+                    token,
+                    current_candidate,
+                    container_rich_text,
+                    expected_children,
+                    prefix_only=True,
+                )
+            )
         actual_hash = sync_container_actual_hash(
             token,
             current_candidate,
@@ -2594,8 +2741,9 @@ def sync_page_body_blocks(
         if updated_prefix < target_length:
             if append_error is not None:
                 raise append_error
-            raise RuntimeError(
-                "본문 세대 자식 배치 추가를 검증하지 못했습니다"
+            raise BodyVerificationError(
+                "본문 세대 자식 배치 추가를 검증하지 못했습니다: "
+                f"기대={target_length}, 실제={updated_prefix}"
             )
         prefix_length = updated_prefix
 
@@ -2615,7 +2763,15 @@ def sync_page_body_blocks(
             expected_hash,
         )
     ):
-        raise RuntimeError("본문 세대 최종 검증 실패")
+        raise BodyVerificationError(
+            "본문 세대 최종 검증 실패: "
+            + sync_container_difference(
+                token,
+                completed,
+                container_rich_text,
+                expected_children,
+            )
+        )
     completed_hash = sync_container_actual_hash(token, completed)
     if not BODY_GENERATION_HASH_RE.fullmatch(completed_hash):
         raise RuntimeError("본문 세대 최종 해시를 확인할 수 없습니다")

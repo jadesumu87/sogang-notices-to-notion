@@ -1366,6 +1366,27 @@ class CrawlerRegressionTests(unittest.TestCase):
         self.assertIn("수집 검증:", incident["summary"])
         self.assertIn("Notion 안전 보류:", incident["summary"])
 
+    def test_destination_hold_summary_names_held_notices(self):
+        counters = SyncCounters(
+            quarantined_source_ids=["2"],
+            unresolved_pending_page_ids=["pending-2"],
+            held_notices={"2": ["551012"]},
+        )
+
+        summary = crawler_main.destination_contract_summary(counters)
+
+        self.assertIn("출처=2, 대기 페이지=1", summary)
+        self.assertTrue(summary.endswith("본문 검증 보류=2:551012"))
+        self.assertNotIn(
+            "본문 검증 보류",
+            crawler_main.destination_contract_summary(
+                SyncCounters(
+                    quarantined_source_ids=["2"],
+                    unresolved_pending_page_ids=["pending-2"],
+                )
+            ),
+        )
+
     def test_main_external_download_circuit_blocks_success_state_advancement(
         self,
     ):

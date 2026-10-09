@@ -1648,6 +1648,7 @@ def append_run_record(
                 "observation_logical_run_id",
                 "unresolved_pending_notices",
                 "recovered_pending_notices",
+                "held_notices",
             }
         }
     runs = state.setdefault("runs", [])

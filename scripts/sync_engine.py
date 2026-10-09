@@ -13,6 +13,7 @@ from common import (
 )
 from log import LOGGER
 from models import (
+    BodyVerificationError,
     CrawlReport,
     DestinationConsistencyError,
     ItemCompleteness,
@@ -2532,32 +2533,43 @@ def _apply_report(
                 entry_to_validate,
             )
 
-        apply_item(
-            context,
-            entry.item,
-            counters,
-            existing_page=current_page,
-            existing_page_resolved=True,
-            expected_operation_id=entry.operation_id,
-            expected_body_media_reuse_status=(
-                entry.body_media_reuse_status
-            ),
-            force_commit_readback=(
-                (
-                    str(entry.item.get("source_id") or ""),
-                    str(entry.item.get("notice_id") or ""),
-                )
-                in state_pending_identities
-                or on_item_completed is not None
-            ),
-            pre_write_validation=validate_before_entry_write,
-        )
         entry_source_id = str(
             entry.item.get("source_id") or ""
         )
         entry_notice_id = str(
             entry.item.get("notice_id") or ""
         )
+        try:
+            apply_item(
+                context,
+                entry.item,
+                counters,
+                existing_page=current_page,
+                existing_page_resolved=True,
+                expected_operation_id=entry.operation_id,
+                expected_body_media_reuse_status=(
+                    entry.body_media_reuse_status
+                ),
+                force_commit_readback=(
+                    (entry_source_id, entry_notice_id)
+                    in state_pending_identities
+                    or on_item_completed is not None
+                ),
+                pre_write_validation=validate_before_entry_write,
+            )
+        except BodyVerificationError as exc:
+            counters.held_notices.setdefault(
+                entry_source_id,
+                [],
+            ).append(entry_notice_id)
+            LOGGER.warning(
+                "본문 검증 불일치로 공지 반영을 보류합니다: "
+                "출처=%s, 공지 ID=%s, 사유=%s",
+                entry_source_id,
+                entry_notice_id,
+                exc,
+            )
+            continue
         if (
             entry_source_id,
             entry_notice_id,
@@ -2603,6 +2615,19 @@ def _apply_report(
         )
     counters.pending_recovered = len(recovered_page_ids)
     counters.unresolved_pending_page_ids = sorted(remaining_id_set)
+    held_identities = {
+        (source_id, notice_id)
+        for source_id, notice_ids in counters.held_notices.items()
+        for notice_id in notice_ids
+    }
+    remaining_identities = {
+        (remaining_sources[page_id], remaining_notices[page_id])
+        for page_id in remaining_id_set
+    }
+    if not held_identities.issubset(remaining_identities):
+        raise DestinationConsistencyError(
+            "보류한 공지의 Notion 대기 상태를 확인할 수 없습니다"
+        )
     for page_id in sorted(recovered_page_ids):
         source_id = context.pending_page_sources[page_id]
         notice_id = context.pending_page_notices[page_id]

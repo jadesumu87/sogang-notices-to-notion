@@ -41,6 +41,10 @@ class DestinationConsistencyError(RuntimeError):
     pass
 
 
+class BodyVerificationError(DestinationConsistencyError):
+    pass
+
+
 class LocalConfigurationError(RuntimeError):
     failure_origin = "local_config"
 
@@ -213,6 +217,7 @@ class SyncCounters:
     )
     destination_hold_count: int = 0
     repeated_destination_hold_count: int = 0
+    held_notices: dict[str, list[str]] = field(default_factory=dict)
     observation_run_id: str = ""
     observation_logical_run_id: str = ""
 

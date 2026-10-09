@@ -18,6 +18,7 @@ import notion_client
 import settings
 import utils
 from models import (
+    BodyVerificationError,
     CrawlReport,
     DestinationConsistencyError,
     MutationKind,
@@ -569,6 +570,62 @@ class SyncSafetyTests(unittest.TestCase):
                 self.assertNotIn(store.old_id, store.deleted_ids)
                 self.assertNotIn(store.manual_id, store.deleted_ids)
 
+    def test_body_verification_failure_reports_first_difference(self):
+        store = StatefulBlockStore("verification_failure")
+        with self.assertRaises(BodyVerificationError) as raised:
+            self.run_body_sync(store)
+
+        message = str(raised.exception)
+        self.assertIn("reason=child_prefix_mismatch", message)
+        self.assertIn("자식[0]", message)
+        self.assertIn("기대=", message)
+        self.assertIn("실제=", message)
+
+    def test_signature_difference_names_first_changed_field(self):
+        expected = [
+            {
+                "type": "text",
+                "content": "신청 안내",
+                "link": "https://example.com/apply?lang=ko",
+            }
+        ]
+        actual = [
+            {
+                "type": "text",
+                "content": "신청 안내",
+                "link": "https://example.com/apply?lang=en",
+            }
+        ]
+
+        difference = sync.first_signature_difference(
+            expected,
+            actual,
+            "인용문",
+        )
+
+        self.assertTrue(difference.startswith("인용문[0].link: 기대="))
+        self.assertTrue(difference.endswith("다른 부분=query"))
+        self.assertEqual(
+            sync.first_signature_difference(
+                [{"content": "가"}],
+                [{"content": "가"}, {"content": "나"}],
+                "자식",
+            ),
+            "자식 개수: 기대=1, 실제=2",
+        )
+        self.assertEqual(
+            sync.first_signature_difference(
+                {"content": "가\u200b"},
+                {"content": "가"},
+                "인용문",
+            ),
+            '인용문.content: 기대="가\u200b", 실제="가"',
+        )
+        self.assertEqual(
+            sync.first_signature_difference(expected, expected, "인용문"),
+            "",
+        )
+
     def test_verified_failure_retry_reuses_generation_without_duplicate(self):
         store = StatefulBlockStore("verification_failure")
         with self.assertRaisesRegex(RuntimeError, "세대 검증 실패"):
@@ -578,7 +635,10 @@ class SyncSafetyTests(unittest.TestCase):
 
         store.creation_mode = "success"
         for _ in range(3):
-            with self.assertRaisesRegex(RuntimeError, "기존 본문 세대 검증 실패"):
+            with self.assertRaisesRegex(
+                BodyVerificationError,
+                "기존 본문 세대 검증 실패.*자식\\[0\\]",
+            ):
                 self.run_body_sync(store)
 
         self.assertEqual(store.root_append_count, 1)
@@ -6096,6 +6156,156 @@ class SyncSafetyTests(unittest.TestCase):
             disable_top.call_args.args[2],
             "141",
         )
+
+    def run_report_with_body_verification_failure(self, pending_pages):
+        held_item = {
+            "notice_id": "2",
+            "title": "공지 2",
+            "url": "https://www.sogang.ac.kr/ko/detail/2",
+            "top": False,
+            "body_blocks": [],
+        }
+        healthy_item = {
+            "notice_id": "141",
+            "title": "공지 141",
+            "url": "https://www.sogang.ac.kr/ko/detail/141",
+            "top": False,
+            "body_blocks": [],
+        }
+        held_result = source_result("2", SourceStatus.SUCCESS, [held_item])
+        healthy_result = source_result(
+            "141",
+            SourceStatus.SUCCESS,
+            [healthy_item],
+        )
+        held_result.top_snapshot_verified = True
+        healthy_result.top_snapshot_verified = True
+        report = CrawlReport(sources=[held_result, healthy_result])
+        preflight = [
+            sync_engine.DestinationPreflight(
+                item=sync_engine.prepare_source_items(held_result)[0],
+                existing_page=None,
+                operation_id="operation-2",
+                shrink_key="2:2",
+                shrink_candidate=None,
+            ),
+            sync_engine.DestinationPreflight(
+                item=sync_engine.prepare_source_items(healthy_result)[0],
+                existing_page=None,
+                operation_id="operation-141",
+                shrink_key="141:141",
+                shrink_candidate=None,
+            ),
+        ]
+        applied: list[str] = []
+        completed: list[tuple[str, str]] = []
+        top_inspected_sources: list[str] = []
+
+        def apply_item(_context, item, *_args, **_kwargs):
+            if str(item["source_id"]) == "2":
+                raise BodyVerificationError(
+                    "본문 세대 최종 검증 실패: "
+                    '자식[0].rich_text[0].content: 기대="가", 실제="나"'
+                )
+            applied.append(str(item["source_id"]))
+
+        with (
+            patch.object(
+                sync_engine,
+                "prepare_destination",
+                return_value=sync_engine.DestinationContext(
+                    "token",
+                    "database",
+                ),
+            ),
+            patch.object(
+                sync_engine,
+                "resolve_destination_preflight",
+                return_value=preflight,
+            ),
+            patch.object(
+                sync_engine,
+                "validate_destination_preflight_entries",
+            ),
+            patch.object(
+                sync_engine,
+                "validate_destination_preflight_entry",
+                return_value=None,
+            ),
+            patch.object(
+                sync_engine,
+                "apply_item",
+                side_effect=apply_item,
+            ),
+            patch.object(
+                sync_engine,
+                "inspect_pending_pages",
+                return_value=pending_pages,
+            ),
+            patch.object(
+                sync_engine,
+                "inspect_missing_top",
+                side_effect=lambda _token, _database, source_id, _ids: (
+                    top_inspected_sources.append(source_id)
+                    or ([], [])
+                ),
+            ),
+            patch.object(
+                sync_engine,
+                "disable_missing_top",
+                return_value=0,
+            ),
+            self.assertLogs(sync_engine.LOGGER, level="WARNING") as logs,
+        ):
+            counters = sync_engine.apply_report(
+                "token",
+                "database",
+                report,
+                False,
+                run_id="run-held",
+                on_item_completed=lambda source_id, notice_id: (
+                    completed.append((source_id, notice_id))
+                ),
+            )
+        return counters, applied, completed, top_inspected_sources, logs
+
+    def test_body_verification_failure_holds_only_that_notice(self):
+        (
+            counters,
+            applied,
+            completed,
+            top_inspected_sources,
+            logs,
+        ) = self.run_report_with_body_verification_failure(
+            [managed_page("pending-2", "2", "2")]
+        )
+
+        self.assertEqual(applied, ["141"])
+        self.assertEqual(completed, [("141", "141")])
+        self.assertEqual(counters.held_notices, {"2": ["2"]})
+        self.assertEqual(counters.quarantined_source_ids, ["2"])
+        self.assertEqual(
+            counters.unresolved_pending_page_ids,
+            ["pending-2"],
+        )
+        self.assertEqual(counters.unresolved_pending_notices, {"2": ["2"]})
+        self.assertEqual(counters.destination_hold_count, 1)
+        self.assertEqual(set(top_inspected_sources), {"141"})
+        self.assertTrue(
+            any(
+                "본문 검증 불일치로 공지 반영을 보류합니다: "
+                "출처=2, 공지 ID=2" in message
+                and "자식[0].rich_text[0].content" in message
+                for message in logs.output
+            )
+        )
+
+    def test_held_notice_without_pending_page_fails_closed(self):
+        with self.assertRaisesRegex(
+            DestinationConsistencyError,
+            "보류한 공지의 Notion 대기 상태",
+        ):
+            self.run_report_with_body_verification_failure([])
 
     def test_pending_without_source_metadata_remains_global_fail_closed(self):
         result = source_result("2", SourceStatus.SUCCESS, [])
