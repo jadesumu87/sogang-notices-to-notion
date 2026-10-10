@@ -3556,22 +3556,28 @@ def inspect_missing_top(
     return pages, candidates
 
 
+def top_disable_ratio(total_top_count: int, candidate_count: int) -> float:
+    return candidate_count / total_top_count if total_top_count else 0.0
+
+
+def top_disable_limit_exceeded(
+    total_top_count: int,
+    candidate_count: int,
+) -> bool:
+    return candidate_count > get_top_disable_max_count() or (
+        total_top_count >= 5
+        and top_disable_ratio(total_top_count, candidate_count)
+        > get_top_disable_max_ratio()
+    )
+
+
 def validate_top_disable_candidates(
     source_id: str,
     total_top_count: int,
     candidates: list[dict[str, Any]],
 ) -> None:
-    max_count = get_top_disable_max_count()
-    max_ratio = get_top_disable_max_ratio()
-    ratio = (
-        len(candidates) / total_top_count
-        if total_top_count
-        else 0.0
-    )
-    if (
-        len(candidates) > max_count
-        or (total_top_count >= 5 and ratio > max_ratio)
-    ):
+    ratio = top_disable_ratio(total_top_count, len(candidates))
+    if top_disable_limit_exceeded(total_top_count, len(candidates)):
         raise RuntimeError(
             f"TOP 해제 안전 한도 초과: 출처={source_id}, "
             f"해제={len(candidates)}, 전체={total_top_count}, 비율={ratio:.3f}"

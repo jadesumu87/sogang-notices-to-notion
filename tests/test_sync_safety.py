@@ -7112,6 +7112,106 @@ class SyncSafetyTests(unittest.TestCase):
             set(),
         )
 
+    def run_listed_top_report(
+        self,
+        method: str,
+        candidates: list[dict],
+        listed_ids: list[str],
+    ):
+        result = source_result("2", SourceStatus.SUCCESS, [])
+        result.method = method
+        result.top_snapshot_verified = True
+        result.top_urls = [
+            "https://www.sogang.ac.kr/ko/detail/1001?bbsConfigFk=2"
+        ]
+        result.notice_observations = {
+            notice_id: {"fingerprint": notice_id}
+            for notice_id in ["1001", *listed_ids]
+        }
+        report = CrawlReport(sources=[result])
+        context = sync_engine.DestinationContext("token", "database")
+
+        with (
+            patch.object(
+                sync_engine,
+                "prepare_destination",
+                return_value=context,
+            ),
+            patch.object(
+                sync_engine,
+                "inspect_missing_top",
+                return_value=(candidates, candidates),
+            ),
+            patch.object(
+                sync_engine,
+                "disable_missing_top",
+                side_effect=lambda *args, **kwargs: len(
+                    kwargs["eligible_notice_ids"]
+                ),
+            ) as disable,
+            patch.object(
+                sync_engine,
+                "inspect_pending_pages",
+                return_value=[],
+            ),
+        ):
+            counters = sync_engine.apply_report(
+                "token",
+                "database",
+                report,
+                False,
+                run_id="run-first-listing",
+            )
+        return counters, disable.call_args.kwargs["eligible_notice_ids"]
+
+    def test_top_listed_as_regular_notice_is_disabled_on_first_run(self):
+        listed = managed_page("page-999", "2", "999")
+        absent = managed_page("page-998", "2", "998")
+
+        counters, eligible = self.run_listed_top_report(
+            "api",
+            [listed, absent],
+            ["999"],
+        )
+
+        self.assertEqual(eligible, {"999"})
+        self.assertEqual(counters.top_disabled, 1)
+        self.assertEqual(
+            counters.top_absence_observations["2"],
+            ["998", "999"],
+        )
+
+    def test_top_listed_by_fallback_waits_for_next_run(self):
+        candidate = managed_page("page-999", "2", "999")
+
+        counters, eligible = self.run_listed_top_report(
+            "fallback_playwright",
+            [candidate],
+            ["999"],
+        )
+
+        self.assertEqual(eligible, set())
+        self.assertEqual(counters.top_disabled, 0)
+
+    def test_mass_regular_listing_waits_without_failing_run(self):
+        candidates = [
+            managed_page(f"page-{value}", "2", str(value))
+            for value in range(1, 6)
+        ]
+
+        counters, eligible = self.run_listed_top_report(
+            "api",
+            candidates,
+            [str(value) for value in range(1, 6)],
+        )
+
+        self.assertEqual(eligible, set())
+        self.assertEqual(counters.top_disabled, 0)
+        self.assertEqual(
+            counters.top_absence_observations["2"],
+            ["1", "2", "3", "4", "5"],
+        )
+
     def test_shrink_candidate_requires_next_consecutive_run(self):
         attachment = {
             "name": "keep.pdf",
@@ -8121,6 +8221,51 @@ class SyncSafetyTests(unittest.TestCase):
                 "database",
                 logical_run_id="100",
             )
+
+    def test_dry_run_plans_regular_listing_disable_immediately(self):
+        result = source_result("2", SourceStatus.SUCCESS, [])
+        result.method = "api"
+        result.top_snapshot_verified = True
+        result.notice_observations = {"1": {"fingerprint": "1"}}
+        report = CrawlReport(sources=[result])
+        listed = managed_page("page-1", "2", "1")
+        absent = managed_page("page-2", "2", "2")
+
+        with (
+            patch.object(
+                sync_engine,
+                "fetch_database",
+                return_value={
+                    "properties": complete_destination_schema()
+                },
+            ),
+            patch.object(
+                sync_engine,
+                "inspect_pending_pages",
+                return_value=[],
+            ),
+            patch.object(
+                sync_engine,
+                "inspect_missing_top",
+                return_value=([listed, absent], [listed, absent]),
+            ),
+        ):
+            plan = sync_engine.build_dry_run_plan(
+                "100:1",
+                report,
+                "token",
+                "database",
+                logical_run_id="100",
+            )
+
+        self.assertEqual(
+            [
+                (action.notice_id, action.reason)
+                for action in plan.actions
+                if action.kind == MutationKind.DISABLE_TOP
+            ],
+            [("1", "listed_as_regular_notice")],
+        )
 
     def test_dry_run_detects_stale_attachment_state_generation(self):
         item = {

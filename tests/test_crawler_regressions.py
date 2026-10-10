@@ -4281,11 +4281,17 @@ class DestructiveMutationRegressionTests(unittest.TestCase):
         *,
         present: bool = False,
         verified: bool = True,
+        listed: bool = False,
     ):
         result = crawl_result(
             top_present=present,
             top_verified=verified,
         )
+        if listed:
+            result.method = "api"
+            result.notice_observations = {
+                "1001": {"fingerprint": "regular"}
+            }
         report = CrawlReport([result])
         disable_calls = []
 
@@ -4494,6 +4500,36 @@ class DestructiveMutationRegressionTests(unittest.TestCase):
         self.assertEqual(after_gap_calls, [(set(), set())])
         self.assertEqual(after_present.top_disabled, 0)
         self.assertEqual(after_present_calls, [(set(), set())])
+
+    def test_pinned_top_listed_as_regular_notice_is_disabled_immediately(
+        self,
+    ):
+        state = fresh_state()
+
+        first, first_calls = self.run_top_observation(
+            state,
+            "R1",
+            listed=True,
+        )
+
+        self.assertEqual(first.top_disabled, 1)
+        self.assertEqual(first_calls, [(set(), {"1001"})])
+
+    def test_pinned_top_absence_confirmation_window_is_twelve_hours(self):
+        outcomes = []
+        for hours in (11, 13):
+            state = fresh_state()
+            self.run_top_observation(state, "R1")
+            state["sources"]["141"]["top_absence_last_observed_at"] = (
+                datetime.now(timezone.utc) - timedelta(hours=hours)
+            ).isoformat()
+            outcomes.append(self.run_top_observation(state, "R2"))
+
+        (within, within_calls), (expired, expired_calls) = outcomes
+        self.assertEqual(within.top_disabled, 1)
+        self.assertEqual(within_calls, [(set(), {"1001"})])
+        self.assertEqual(expired.top_disabled, 0)
+        self.assertEqual(expired_calls, [(set(), set())])
 
     def test_shrink_requires_same_candidate_on_next_successful_run(self):
         state = fresh_state()

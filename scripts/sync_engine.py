@@ -91,6 +91,7 @@ from sync import (
     sync_page_body_blocks,
     top_level_quote_state,
     top_candidate_fingerprints,
+    top_disable_limit_exceeded,
     validate_body_write_payloads,
     validate_top_disable_candidates,
 )
@@ -2133,12 +2134,12 @@ def nonnegative_count(value: object) -> int:
 def destructive_candidate_ttl_seconds() -> float:
     raw = os.environ.get(
         "DESTRUCTIVE_CANDIDATE_TTL_SECONDS",
-        "10800",
+        "43200",
     ).strip()
     try:
         value = float(raw)
     except ValueError:
-        return 10800.0
+        return 43200.0
     return min(86400.0, max(300.0, value))
 
 
@@ -2251,6 +2252,62 @@ def recent_consecutive_observation(
         - observed_at.astimezone(timezone.utc)
     ).total_seconds()
     return 0 <= age <= destructive_candidate_ttl_seconds()
+
+
+def top_disable_eligible_ids(
+    result: SourceCrawlResult,
+    missing_ids: set[str],
+    total_top_count: int,
+    state: dict[str, Any],
+    source_state: object,
+    logical_run_id: str,
+) -> tuple[set[str], set[str]]:
+    prior_absences = (
+        source_state.get("top_absence_counts", {})
+        if isinstance(source_state, dict)
+        else {}
+    )
+    if not isinstance(prior_absences, dict):
+        prior_absences = {}
+    consecutive = recent_consecutive_observation(
+        state,
+        source_state,
+        "top_absence_last_run_id",
+        "top_absence_last_observed_at",
+        current_logical_run_id=logical_run_id,
+        logical_run_id_key="top_absence_last_logical_run_id",
+    )
+    confirmed = {
+        notice_id
+        for notice_id in missing_ids
+        if consecutive
+        and nonnegative_count(prior_absences.get(notice_id)) >= 1
+    }
+    listed = (
+        missing_ids.intersection(result.notice_observations)
+        if result.method == "api"
+        else set()
+    )
+    immediate = listed - confirmed
+    mass_held = 0
+    if immediate and top_disable_limit_exceeded(
+        total_top_count,
+        len(confirmed | immediate),
+    ):
+        mass_held = len(immediate)
+        immediate = set()
+    eligible = confirmed | immediate
+    if missing_ids:
+        LOGGER.info(
+            "TOP 해제 판단: 출처=%s, 일반 공지 확인=%s, 연속 부재 확인=%s, "
+            "다음 실행 확인=%s, 대량 보류=%s",
+            result.source.config_fk,
+            len(immediate),
+            len(confirmed),
+            len(missing_ids - eligible),
+            mass_held,
+        )
+    return eligible, immediate
 
 
 def validated_pending_context(
@@ -2728,30 +2785,14 @@ def _apply_report(
             if isinstance(source_states, dict)
             else {}
         )
-        prior_absences = (
-            source_state.get("top_absence_counts", {})
-            if isinstance(source_state, dict)
-            else {}
+        eligible, _immediate = top_disable_eligible_ids(
+            result,
+            missing_ids,
+            len(first_top_pages),
+            state,
+            source_state,
+            logical_run_id,
         )
-        if not isinstance(prior_absences, dict):
-            prior_absences = {}
-        eligible = {
-            notice_id
-            for notice_id in missing_ids
-            if (
-                nonnegative_count(prior_absences.get(notice_id)) >= 1
-                and recent_consecutive_observation(
-                    state,
-                    source_state,
-                    "top_absence_last_run_id",
-                    "top_absence_last_observed_at",
-                    current_logical_run_id=logical_run_id,
-                    logical_run_id_key=(
-                        "top_absence_last_logical_run_id"
-                    ),
-                )
-            )
-        }
         counters.top_present_ids[source_id] = sorted(current_ids)
         counters.top_absence_observations[source_id] = sorted(
             missing_ids
@@ -3368,33 +3409,23 @@ def build_dry_run_plan(
                 f"TOP 연속 검증 중 대상이 변경되었습니다: {source_id}"
             )
         source_state = source_states.get(source_id, {})
-        prior_absences = (
-            source_state.get("top_absence_counts", {})
-            if isinstance(source_state, dict)
-            else {}
+        eligible, immediate = top_disable_eligible_ids(
+            result,
+            top_candidate_ids(second_candidates),
+            len(second_top_pages),
+            state,
+            source_state,
+            logical_run_id,
         )
-        if not isinstance(prior_absences, dict):
-            prior_absences = {}
-        eligible_candidates: list[dict[str, Any]] = []
-        for page in second_candidates:
-            notice_id = extract_rich_text_value(
+        eligible_candidates = [
+            page
+            for page in second_candidates
+            if extract_rich_text_value(
                 page.get("properties", {}),
                 NOTICE_ID_PROPERTY,
             )
-            if nonnegative_count(
-                prior_absences.get(notice_id)
-            ) < 1 or not recent_consecutive_observation(
-                state,
-                source_state,
-                "top_absence_last_run_id",
-                "top_absence_last_observed_at",
-                current_logical_run_id=logical_run_id,
-                logical_run_id_key=(
-                    "top_absence_last_logical_run_id"
-                ),
-            ):
-                continue
-            eligible_candidates.append(page)
+            in eligible
+        ]
         validate_top_disable_candidates(
             source_id,
             len(second_top_pages),
@@ -3411,7 +3442,11 @@ def build_dry_run_plan(
                     source_id=source_id,
                     notice_id=notice_id,
                     page_id=str(page.get("id") or ""),
-                    reason="missing_from_confirmed_snapshot",
+                    reason=(
+                        "listed_as_regular_notice"
+                        if notice_id in immediate
+                        else "missing_from_confirmed_snapshot"
+                    ),
                 )
             )
     return plan
