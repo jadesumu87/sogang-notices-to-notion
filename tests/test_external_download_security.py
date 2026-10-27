@@ -1700,6 +1700,42 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
                 )
             )
 
+    def test_image_parsing_is_limited_to_upload_formats(self):
+        from PIL import Image, TiffImagePlugin
+
+        png = BytesIO()
+        Image.new("RGB", (4, 4), (255, 255, 255)).save(png, format="PNG")
+        tiff = BytesIO()
+        Image.new("RGB", (4, 4), (255, 255, 255)).save(tiff, format="TIFF")
+        opened = []
+        original_open = TiffImagePlugin.TiffImageFile._open
+
+        def record_tiff_open(image):
+            opened.append(image)
+            return original_open(image)
+
+        with patch.object(
+            TiffImagePlugin.TiffImageFile,
+            "_open",
+            record_tiff_open,
+        ):
+            self.assertEqual(
+                notion_client.inspect_image_payload(png.getvalue()),
+                "png",
+            )
+            self.assertIsNone(
+                notion_client.inspect_image_payload(tiff.getvalue())
+            )
+            self.assertIsNone(
+                notion_client.compress_image_to_limit(
+                    tiff.getvalue(),
+                    "image/tiff",
+                    1024,
+                )
+            )
+
+        self.assertEqual(opened, [])
+
 
 if __name__ == "__main__":
     unittest.main()

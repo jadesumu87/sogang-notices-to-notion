@@ -260,6 +260,13 @@ GENERIC_UPLOAD_CONTENT_TYPES = frozenset(
     }
 )
 IMAGE_UPLOAD_FORMATS = frozenset({"jpeg", "png", "gif", "bmp", "webp"})
+PILLOW_IMAGE_FORMATS = {
+    "JPEG": "jpeg",
+    "PNG": "png",
+    "GIF": "gif",
+    "BMP": "bmp",
+    "WEBP": "webp",
+}
 
 
 class NotionRequestError(RuntimeError):
@@ -1631,19 +1638,17 @@ def inspect_image_payload(payload: bytes) -> Optional[str]:
     except ImportError:
         LOGGER.info("이미지 형식 검증 실패: Pillow 미설치")
         return None
-    pillow_formats = {
-        "JPEG": "jpeg",
-        "PNG": "png",
-        "GIF": "gif",
-        "BMP": "bmp",
-        "WEBP": "webp",
-    }
     max_pixels, max_dimension = get_image_validation_limits()
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(BytesIO(payload)) as image:
-                image_format = pillow_formats.get(str(image.format or "").upper())
+            with Image.open(
+                BytesIO(payload),
+                formats=tuple(PILLOW_IMAGE_FORMATS),
+            ) as image:
+                image_format = PILLOW_IMAGE_FORMATS.get(
+                    str(image.format or "").upper()
+                )
                 width, height = image.size
                 if (
                     image_format is None
@@ -1655,8 +1660,14 @@ def inspect_image_payload(payload: bytes) -> Optional[str]:
                 ):
                     return None
                 image.verify()
-            with Image.open(BytesIO(payload)) as decoded:
-                if pillow_formats.get(str(decoded.format or "").upper()) != image_format:
+            with Image.open(
+                BytesIO(payload),
+                formats=tuple(PILLOW_IMAGE_FORMATS),
+            ) as decoded:
+                if (
+                    PILLOW_IMAGE_FORMATS.get(str(decoded.format or "").upper())
+                    != image_format
+                ):
                     return None
                 decoded.load()
     except Exception as exc:
@@ -2356,7 +2367,10 @@ def compress_image_to_limit(
         max_pixels, max_dimension = get_image_validation_limits()
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(BytesIO(payload)) as image:
+            with Image.open(
+                BytesIO(payload),
+                formats=tuple(PILLOW_IMAGE_FORMATS),
+            ) as image:
                 width, height = image.size
                 if (
                     width <= 0
