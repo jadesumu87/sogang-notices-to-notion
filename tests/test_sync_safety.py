@@ -4231,6 +4231,84 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(preflight.deferred_reason, "")
         self.assertEqual(preflight.body_media_content_state, [])
 
+    def test_preflight_defers_notices_left_unchecked_by_download_cap(self):
+        body_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/body.jpg"
+        )
+        media_item = {
+            "source_id": "2",
+            "notice_id": "200",
+            "title": "[학사] 한도 이후 이미지 공지",
+            "url": "https://www.sogang.ac.kr/ko/detail/200?bbsConfigFk=2",
+            "classification": "학사공지",
+            "top": False,
+            "body_status": "present",
+            "body_blocks": [
+                {
+                    "type": "image",
+                    "image": {
+                        "type": "external",
+                        "external": {"url": body_url},
+                    },
+                }
+            ],
+        }
+        text_item = {
+            "source_id": "2",
+            "notice_id": "201",
+            "title": "[학사] 한도 이후 글 공지",
+            "url": "https://www.sogang.ac.kr/ko/detail/201?bbsConfigFk=2",
+            "classification": "학사공지",
+            "top": False,
+            "body_status": "present",
+            "body_blocks": [
+                {
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [
+                            {"type": "text", "text": {"content": "본문"}}
+                        ]
+                    },
+                }
+            ],
+        }
+        context = sync_engine.DestinationContext(
+            "token",
+            "database",
+            has_attachments_property=False,
+        )
+
+        with (
+            patch.dict(
+                settings.os.environ,
+                {"EXTERNAL_DOWNLOAD_MAX_REQUESTS": "1"},
+            ),
+            notion_client.external_download_run_scope(
+                force_new=True
+            ) as policy,
+            patch.object(
+                sync_engine,
+                "find_existing_page",
+                return_value=None,
+            ),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ),
+        ):
+            self.assertTrue(policy.reserve_request(body_url))
+            preflight = sync_engine.resolve_destination_preflight(
+                context,
+                [media_item, text_item],
+                atomic_recheck=False,
+            )
+
+        self.assertEqual(
+            [entry.deferred_reason for entry in preflight],
+            ["external_download_budget_exhausted", ""],
+        )
+
     def test_preflight_defers_existing_attachment_when_source_is_unavailable(
         self,
     ):

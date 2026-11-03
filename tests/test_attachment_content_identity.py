@@ -1011,10 +1011,15 @@ class BodyMediaContentIdentityTests(unittest.TestCase):
             ],
         )
 
-    def test_download_circuit_still_stops_unavailable_body_preflight(
+    def test_stopped_download_run_marks_body_media_without_raising(
         self,
     ) -> None:
+        unavailable: list[tuple[str, str]] = []
         with (
+            patch.dict(
+                os.environ,
+                {"EXTERNAL_DOWNLOAD_MAX_REQUESTS": "1"},
+            ),
             notion_client.external_download_run_scope(
                 force_new=True
             ) as policy,
@@ -1023,14 +1028,32 @@ class BodyMediaContentIdentityTests(unittest.TestCase):
                 "download_file_bytes",
                 return_value=(None, None),
             ),
+            patch.object(
+                notion_client,
+                "cache_external_preflight_download",
+            ) as cache_download,
         ):
-            policy.open_circuit(429, "60")
-            with self.assertRaises(
-                notion_client.ExternalDownloadRunStoppedError
-            ):
-                notion_client.collect_body_media_content_state(
-                    [self.block]
+            self.assertTrue(policy.reserve_request(self.new_url))
+            state = notion_client.collect_body_media_content_state(
+                [self.block],
+                unavailable_media=unavailable,
+            )
+            snapshot = policy.snapshot()
+
+        self.assertEqual(state, [])
+        self.assertEqual(
+            unavailable,
+            [
+                (
+                    "image",
+                    utils.normalize_attachment_identity_url(
+                        self.new_url
+                    ),
                 )
+            ],
+        )
+        self.assertEqual(snapshot["stopped_reason"], "request_cap")
+        cache_download.assert_not_called()
 
     def test_host_circuit_defers_body_media_without_stopping_preflight(
         self,

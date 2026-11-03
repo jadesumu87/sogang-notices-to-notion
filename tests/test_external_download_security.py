@@ -1126,8 +1126,9 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
                             other_host_url
                         )
                         snapshot = policy.snapshot()
-                        notion_client.raise_if_external_download_stopped()
+                        stopped = notion_client.external_download_run_stopped()
 
+                self.assertFalse(stopped)
                 self.assertEqual(first, (None, None))
                 self.assertEqual(second, (None, None))
                 self.assertEqual(other, (payload, "image/png"))
@@ -1372,14 +1373,11 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
                 result = notion_client.download_file_bytes(
                     "https://www.sogang.ac.kr/file-fe-prd/board/file.png"
                 )
-                with self.assertRaisesRegex(
-                    notion_client.ExternalDownloadRunStoppedError,
-                    "time_cap",
-                ):
-                    notion_client.raise_if_external_download_stopped()
+                stopped = notion_client.external_download_run_stopped()
                 snapshot = policy.snapshot()
 
         joined = "\n".join(captured.output)
+        self.assertTrue(stopped)
         self.assertEqual(result, (None, None))
         self.assertEqual(snapshot["stopped_reason"], "time_cap")
         self.assertIn("활성 시간 차단", joined)

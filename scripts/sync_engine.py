@@ -29,6 +29,7 @@ from notion_client import (
     create_page,
     ensure_destination_schema,
     external_download_run_scope,
+    external_download_run_stopped,
     fetch_database,
     list_block_children,
     prepare_attachments_for_sync,
@@ -1830,6 +1831,10 @@ def resolve_destination_preflight(
             else []
         )
         deferred_reasons: list[str] = []
+        if (
+            unavailable_attachment_urls or unavailable_body_media
+        ) and external_download_run_stopped():
+            deferred_reasons.append("external_download_budget_exhausted")
         if unavailable_attachment_urls and existing_attachment_state:
             deferred_reasons.append("attachment_content_unavailable")
         if unavailable_body_media and existing_body_media_state:
@@ -2854,6 +2859,19 @@ def _apply_report(
     return counters
 
 
+def log_external_download_stop(snapshot: dict[str, Any]) -> None:
+    reason = str(snapshot.get("stopped_reason") or "")
+    if not reason:
+        return
+    LOGGER.warning(
+        "외부 파일 다운로드 실행 한도 도달: 사유=%s, 요청=%s, "
+        "활성 시간=%.1f초. 확인하지 못한 공지는 다음 실행에서 다시 확인합니다",
+        reason,
+        snapshot.get("requests"),
+        float(snapshot.get("elapsed_seconds") or 0.0),
+    )
+
+
 def apply_report(
     token: str,
     database_id: str,
@@ -2876,6 +2894,7 @@ def apply_report(
             on_item_completed=on_item_completed,
         )
         snapshot = download_run.snapshot()
+    log_external_download_stop(snapshot)
     counters.external_download_requests = int(snapshot["requests"])
     counters.external_download_stopped_reason = str(
         snapshot["stopped_reason"]
@@ -2955,7 +2974,7 @@ def build_dry_run_plan(
         pending_page_sources=pending_sources,
         pending_page_notices=pending_notices,
     )
-    with external_download_run_scope(force_new=True):
+    with external_download_run_scope(force_new=True) as download_run:
         preflight_entries = resolve_destination_preflight(
             context,
             [
@@ -2964,6 +2983,7 @@ def build_dry_run_plan(
                 for item in source_items
             ],
         )
+        log_external_download_stop(download_run.snapshot())
     preflight_by_key = {
         entry.shrink_key: entry for entry in preflight_entries
     }

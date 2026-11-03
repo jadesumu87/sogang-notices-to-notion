@@ -1268,13 +1268,9 @@ def external_download_stopped_error(
     )
 
 
-def raise_if_external_download_stopped() -> None:
+def external_download_run_stopped() -> bool:
     policy = current_external_download_run_policy()
-    if policy is None:
-        return
-    snapshot = policy.snapshot()
-    if snapshot["stopped_reason"]:
-        raise external_download_stopped_error(policy)
+    return policy is not None and bool(policy.snapshot()["stopped_reason"])
 
 
 def transient_external_transport_reason(exc: BaseException) -> str:
@@ -3075,16 +3071,17 @@ def collect_attachment_content_state(
             require_file_hint=False,
         )
         if not payload:
-            raise_if_external_download_stopped()
+            if unavailable_source_urls is not None:
+                unavailable_source_urls.append(
+                    normalize_attachment_identity_url(url)
+                )
+            if external_download_run_stopped():
+                continue
             cache_external_preflight_download(
                 url,
                 False,
                 (b"", content_type),
             )
-            if unavailable_source_urls is not None:
-                unavailable_source_urls.append(
-                    normalize_attachment_identity_url(url)
-                )
             LOGGER.warning(
                 "첨부 콘텐츠 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
                 summarize_external_request_target(url),
@@ -3137,12 +3134,6 @@ def collect_body_media_content_state(
                 require_file_hint=False,
             )
             if not payload:
-                raise_if_external_download_stopped()
-                cache_external_preflight_download(
-                    url,
-                    False,
-                    (b"", content_type),
-                )
                 if unavailable_media is not None:
                     unavailable_media.append(
                         (
@@ -3150,6 +3141,13 @@ def collect_body_media_content_state(
                             normalize_attachment_identity_url(url),
                         )
                     )
+                if external_download_run_stopped():
+                    continue
+                cache_external_preflight_download(
+                    url,
+                    False,
+                    (b"", content_type),
+                )
                 LOGGER.warning(
                     "본문 이미지 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
                     summarize_external_request_target(url),
@@ -3196,12 +3194,6 @@ def collect_body_media_content_state(
             require_file_hint=True,
         )
         if not payload:
-            raise_if_external_download_stopped()
-            cache_external_preflight_download(
-                url,
-                True,
-                (b"", content_type),
-            )
             if unavailable_media is not None:
                 unavailable_media.append(
                     (
@@ -3215,6 +3207,13 @@ def collect_body_media_content_state(
                         normalize_attachment_identity_url(url),
                     )
                 )
+            if external_download_run_stopped():
+                continue
+            cache_external_preflight_download(
+                url,
+                True,
+                (b"", content_type),
+            )
             LOGGER.warning(
                 "본문 파일 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
                 summarize_external_request_target(url),
