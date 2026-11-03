@@ -122,6 +122,105 @@ class AttachmentContentIdentityTests(unittest.TestCase):
             utils.normalize_attachment_identity_url(self.new_url),
         )
 
+    def test_unavailable_attachment_reuses_previous_upload(self) -> None:
+        unavailable: list[str] = []
+        attachment = self.attachment(self.new_url)
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ) as download,
+            patch.object(
+                notion_client,
+                "upload_external_file_to_notion",
+            ) as upload,
+        ):
+            preflight_state = (
+                notion_client.collect_attachment_content_state(
+                    [attachment],
+                    unavailable_source_urls=unavailable,
+                    reusable_uploaded_attachments=(
+                        self.reusable_attachments(self.old_hash)
+                    ),
+                )
+            )
+            attachments, applied_state = (
+                notion_client.prepare_attachments_for_sync(
+                    "token",
+                    [attachment],
+                    reusable_uploaded_attachments=(
+                        self.reusable_attachments(self.old_hash)
+                    ),
+                )
+            )
+
+        download.assert_called_once()
+        upload.assert_not_called()
+        self.assertEqual(unavailable, [])
+        self.assertEqual(
+            preflight_state,
+            [
+                {
+                    "source_url": utils.normalize_attachment_identity_url(
+                        self.new_url
+                    ),
+                    "name": "image.jpg",
+                    "content_sha256": self.old_hash,
+                }
+            ],
+        )
+        self.assertEqual(
+            attachments,
+            [
+                {
+                    "name": "image.jpg",
+                    "type": "file_upload",
+                    "file_upload": {"id": "old-upload"},
+                }
+            ],
+        )
+        self.assertEqual(applied_state[0]["content_sha256"], self.old_hash)
+
+    def test_unavailable_attachment_without_previous_upload_keeps_link(
+        self,
+    ) -> None:
+        unavailable: list[str] = []
+        attachment = self.attachment(self.new_url)
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ),
+        ):
+            preflight_state = (
+                notion_client.collect_attachment_content_state(
+                    [attachment],
+                    unavailable_source_urls=unavailable,
+                    reusable_uploaded_attachments={},
+                )
+            )
+            attachments, applied_state = (
+                notion_client.prepare_attachments_for_sync(
+                    "token",
+                    [attachment],
+                    reusable_uploaded_attachments={},
+                )
+            )
+
+        self.assertEqual(preflight_state, [])
+        self.assertEqual(
+            unavailable,
+            [utils.normalize_attachment_identity_url(self.new_url)],
+        )
+        self.assertEqual(attachments, [attachment])
+        self.assertEqual(applied_state, [])
+
     def test_same_normalized_url_with_changed_bytes_uploads_replacement(self) -> None:
         reusable = self.reusable_attachments(self.old_hash)
 
@@ -962,6 +1061,139 @@ class BodyMediaContentIdentityTests(unittest.TestCase):
             self.old_hash,
         )
         self.assertEqual(state[0]["content_sha256"], self.old_hash)
+
+    def test_unavailable_body_image_reuses_previous_upload(self) -> None:
+        unavailable: list[tuple[str, str]] = []
+        item = {
+            "source_id": "2",
+            "notice_id": "200",
+            "title": "공지 200",
+            "url": "https://www.sogang.ac.kr/ko/detail/200",
+            "body_blocks": [self.block],
+        }
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ) as download,
+            patch.object(
+                notion_client,
+                "upload_external_file_to_notion",
+            ) as upload,
+        ):
+            preflight_state = (
+                notion_client.collect_body_media_content_state(
+                    [self.block],
+                    unavailable_media=unavailable,
+                    reusable_uploaded_media=self.reusable_media(),
+                )
+            )
+            blocks, hash_blocks, applied_state = (
+                notion_client.prepare_body_blocks_for_sync(
+                    "token",
+                    [self.block],
+                    reusable_uploaded_media=self.reusable_media(),
+                )
+            )
+
+        download.assert_called_once()
+        upload.assert_not_called()
+        self.assertEqual(unavailable, [])
+        self.assertEqual(
+            preflight_state,
+            [
+                {
+                    "type": "image",
+                    "source_url": utils.normalize_attachment_identity_url(
+                        self.new_url
+                    ),
+                    "content_sha256": self.old_hash,
+                }
+            ],
+        )
+        self.assertEqual(
+            blocks[0]["image"]["file_upload"]["id"],
+            "old-body-upload",
+        )
+        self.assertEqual(
+            hash_blocks[0]["image"]["content_sha256"],
+            self.old_hash,
+        )
+        self.assertEqual(applied_state[0]["content_sha256"], self.old_hash)
+        self.assertEqual(
+            sync_engine.operation_id_for_item(
+                item,
+                body_media_state=preflight_state,
+            ),
+            sync_engine.operation_id_for_item(
+                item,
+                body_media_state=applied_state,
+            ),
+        )
+
+    def test_unavailable_body_pdf_reuses_previous_upload(self) -> None:
+        pdf_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/guide.pdf"
+            "?fileId=99&signature=new"
+        )
+        block = {
+            "object": "block",
+            "type": "embed",
+            "embed": {"url": pdf_url},
+        }
+        uploaded_pdf = {
+            "object": "block",
+            "type": "pdf",
+            "pdf": {
+                "type": "file_upload",
+                "file_upload": {"id": "old-pdf-upload"},
+            },
+        }
+
+        def reusable() -> dict[tuple[str, str], list[dict[str, Any]]]:
+            return {
+                ("pdf", utils.normalize_attachment_identity_url(pdf_url)): [
+                    {"block": uploaded_pdf, "content_sha256": self.old_hash}
+                ]
+            }
+
+        with (
+            notion_client.external_download_run_scope(force_new=True),
+            patch.object(
+                notion_client,
+                "download_file_bytes",
+                return_value=(None, None),
+            ),
+            patch.object(
+                notion_client,
+                "upload_external_file_to_notion",
+            ) as upload,
+        ):
+            preflight_state = (
+                notion_client.collect_body_media_content_state(
+                    [block],
+                    reusable_uploaded_media=reusable(),
+                )
+            )
+            blocks, _hash_blocks, applied_state = (
+                notion_client.prepare_body_blocks_for_sync(
+                    "token",
+                    [block],
+                    reusable_uploaded_media=reusable(),
+                )
+            )
+
+        upload.assert_not_called()
+        self.assertEqual(
+            [entry["type"] for entry in preflight_state],
+            ["pdf"],
+        )
+        self.assertEqual(preflight_state[0]["content_sha256"], self.old_hash)
+        self.assertEqual(blocks, [uploaded_pdf])
+        self.assertEqual(applied_state[0]["content_sha256"], self.old_hash)
 
     def test_unavailable_body_image_is_preserved_without_second_download(
         self,

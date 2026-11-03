@@ -4090,9 +4090,7 @@ class SyncSafetyTests(unittest.TestCase):
         update.assert_not_called()
         replace.assert_not_called()
 
-    def test_preflight_defers_existing_upload_when_source_media_is_unavailable(
-        self,
-    ):
+    def resolve_unavailable_existing_media(self, reusable):
         body_url = (
             "https://www.sogang.ac.kr/file-fe-prd/board/body.jpg"
         )
@@ -4157,16 +4155,10 @@ class SyncSafetyTests(unittest.TestCase):
             patch.object(
                 sync_engine,
                 "inspect_existing_uploaded_media_blocks",
-                return_value=({}, "valid"),
+                return_value=(reusable, "valid"),
             ),
-            patch.object(
-                sync_engine,
-                "destination_quote_fingerprint",
-            ) as quote_fingerprint,
-            patch.object(
-                sync_engine,
-                "shrink_candidate_for_item",
-            ) as shrink_candidate,
+            patch.object(sync_engine, "destination_quote_fingerprint"),
+            patch.object(sync_engine, "shrink_candidate_for_item"),
         ):
             preflight = sync_engine.resolve_destination_preflight(
                 context,
@@ -4174,12 +4166,53 @@ class SyncSafetyTests(unittest.TestCase):
                 atomic_recheck=False,
             )[0]
 
-        self.assertEqual(
-            preflight.deferred_reason,
-            "body_media_content_unavailable",
+        return preflight, body_url
+
+    def test_preflight_reuses_previous_upload_when_source_media_is_unavailable(
+        self,
+    ):
+        body_url = (
+            "https://www.sogang.ac.kr/file-fe-prd/board/body.jpg"
         )
-        quote_fingerprint.assert_not_called()
-        shrink_candidate.assert_not_called()
+        content_sha256 = utils.compute_content_sha256(b"image")
+        reusable = {
+            ("image", utils.normalize_attachment_identity_url(body_url)): [
+                {
+                    "block": {
+                        "type": "image",
+                        "image": {
+                            "type": "file_upload",
+                            "file_upload": {"id": "old-upload"},
+                        },
+                    },
+                    "content_sha256": content_sha256,
+                }
+            ]
+        }
+
+        preflight, body_url = self.resolve_unavailable_existing_media(
+            reusable
+        )
+
+        self.assertEqual(preflight.deferred_reason, "")
+        self.assertEqual(
+            preflight.body_media_content_state,
+            [
+                {
+                    "type": "image",
+                    "source_url": utils.normalize_attachment_identity_url(
+                        body_url
+                    ),
+                    "content_sha256": content_sha256,
+                }
+            ],
+        )
+
+    def test_preflight_keeps_link_for_unavailable_media_without_upload(self):
+        preflight, _body_url = self.resolve_unavailable_existing_media({})
+
+        self.assertEqual(preflight.deferred_reason, "")
+        self.assertEqual(preflight.body_media_content_state, [])
 
     def test_preflight_preserves_unavailable_media_for_new_notice(self):
         body_url = (
@@ -4309,12 +4342,13 @@ class SyncSafetyTests(unittest.TestCase):
             ["external_download_budget_exhausted", ""],
         )
 
-    def test_preflight_defers_existing_attachment_when_source_is_unavailable(
+    def test_preflight_reuses_previous_attachment_when_source_is_unavailable(
         self,
     ):
         attachment_url = (
             "https://www.sogang.ac.kr/file-fe-prd/board/image.jpg"
         )
+        content_sha256 = utils.compute_content_sha256(b"image")
         item = {
             "source_id": "2",
             "notice_id": "200",
@@ -4373,12 +4407,20 @@ class SyncSafetyTests(unittest.TestCase):
             ),
             patch.object(
                 sync_engine,
-                "destination_quote_fingerprint",
-            ) as quote_fingerprint,
-            patch.object(
-                sync_engine,
-                "shrink_candidate_for_item",
-            ) as shrink_candidate,
+                "extract_existing_uploaded_attachment_ids",
+                return_value={
+                    utils.normalize_attachment_identity_url(
+                        attachment_url
+                    ): [
+                        {
+                            "upload_id": "old-upload",
+                            "content_sha256": content_sha256,
+                        }
+                    ]
+                },
+            ),
+            patch.object(sync_engine, "destination_quote_fingerprint"),
+            patch.object(sync_engine, "shrink_candidate_for_item"),
         ):
             preflight = sync_engine.resolve_destination_preflight(
                 context,
@@ -4386,12 +4428,19 @@ class SyncSafetyTests(unittest.TestCase):
                 atomic_recheck=False,
             )[0]
 
+        self.assertEqual(preflight.deferred_reason, "")
         self.assertEqual(
-            preflight.deferred_reason,
-            "attachment_content_unavailable",
+            preflight.attachment_content_state,
+            [
+                {
+                    "source_url": utils.normalize_attachment_identity_url(
+                        attachment_url
+                    ),
+                    "name": "image.jpg",
+                    "content_sha256": content_sha256,
+                }
+            ],
         )
-        quote_fingerprint.assert_not_called()
-        shrink_candidate.assert_not_called()
 
     def test_media_deferred_item_does_not_block_other_notice(self):
         deferred_item = {

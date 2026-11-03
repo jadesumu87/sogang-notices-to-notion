@@ -3043,10 +3043,64 @@ def pop_reusable_uploaded_attachment_id(
     return upload_id or None
 
 
+def pop_reusable_attachment_for_unavailable_source(
+    reusable_uploaded_attachments: Optional[
+        dict[str, list[JsonObject]]
+    ],
+    source_url: str,
+) -> Optional[tuple[str, str]]:
+    if not reusable_uploaded_attachments:
+        return None
+    key = normalize_attachment_identity_url(source_url)
+    candidates = reusable_uploaded_attachments.get(key) or []
+    for index, candidate in enumerate(candidates):
+        upload_id = str(candidate.get("upload_id") or "").strip()
+        content_sha256 = normalize_content_sha256(
+            candidate.get("content_sha256")
+        )
+        if upload_id and content_sha256:
+            candidates.pop(index)
+            if not candidates:
+                reusable_uploaded_attachments.pop(key, None)
+            return upload_id, content_sha256
+    return None
+
+
+def pop_reusable_media_block_for_unavailable_source(
+    reusable_uploaded_media: Optional[
+        dict[tuple[str, str], list[JsonObject]]
+    ],
+    media_type: str,
+    source_url: str,
+) -> Optional[tuple[JsonObject, str]]:
+    if not reusable_uploaded_media:
+        return None
+    key = (media_type, normalize_attachment_identity_url(source_url))
+    candidates = reusable_uploaded_media.get(key) or []
+    for index, candidate in enumerate(candidates):
+        block = candidate.get("block")
+        content_sha256 = normalize_content_sha256(
+            candidate.get("content_sha256")
+        )
+        if (
+            isinstance(block, dict)
+            and content_sha256
+            and is_valid_reusable_uploaded_media_block(block, media_type)
+        ):
+            candidates.pop(index)
+            if not candidates:
+                reusable_uploaded_media.pop(key, None)
+            return block, content_sha256
+    return None
+
+
 def collect_attachment_content_state(
     attachments: list[JsonObject],
     *,
     unavailable_source_urls: Optional[list[str]] = None,
+    reusable_uploaded_attachments: Optional[
+        dict[str, list[JsonObject]]
+    ] = None,
 ) -> list[JsonObject]:
     if not attachments or not should_upload_files_to_notion():
         return []
@@ -3071,17 +3125,40 @@ def collect_attachment_content_state(
             require_file_hint=False,
         )
         if not payload:
-            if unavailable_source_urls is not None:
-                unavailable_source_urls.append(
-                    normalize_attachment_identity_url(url)
-                )
             if external_download_run_stopped():
+                if unavailable_source_urls is not None:
+                    unavailable_source_urls.append(
+                        normalize_attachment_identity_url(url)
+                    )
                 continue
             cache_external_preflight_download(
                 url,
                 False,
                 (b"", content_type),
             )
+            reused_attachment = (
+                pop_reusable_attachment_for_unavailable_source(
+                    reusable_uploaded_attachments,
+                    url,
+                )
+            )
+            if reused_attachment is not None:
+                LOGGER.info(
+                    "첨부 원문을 받을 수 없어 기존 업로드를 유지합니다 (%s)",
+                    summarize_external_request_target(url),
+                )
+                state.append(
+                    {
+                        "source_url": normalize_attachment_identity_url(url),
+                        "name": name,
+                        "content_sha256": reused_attachment[1],
+                    }
+                )
+                continue
+            if unavailable_source_urls is not None:
+                unavailable_source_urls.append(
+                    normalize_attachment_identity_url(url)
+                )
             LOGGER.warning(
                 "첨부 콘텐츠 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
                 summarize_external_request_target(url),
@@ -3091,6 +3168,12 @@ def collect_attachment_content_state(
             url,
             False,
             (payload, content_type),
+        )
+        content_sha256 = compute_content_sha256(payload)
+        pop_reusable_uploaded_attachment_id(
+            reusable_uploaded_attachments,
+            url,
+            content_sha256,
         )
         if validated_external_upload_metadata(
             payload,
@@ -3104,7 +3187,7 @@ def collect_attachment_content_state(
             {
                 "source_url": normalize_attachment_identity_url(url),
                 "name": name,
-                "content_sha256": compute_content_sha256(payload),
+                "content_sha256": content_sha256,
             }
         )
     return state
@@ -3114,6 +3197,9 @@ def collect_body_media_content_state(
     blocks: list[JsonObject],
     *,
     unavailable_media: Optional[list[tuple[str, str]]] = None,
+    reusable_uploaded_media: Optional[
+        dict[tuple[str, str], list[JsonObject]]
+    ] = None,
 ) -> list[JsonObject]:
     if not blocks or not should_upload_files_to_notion():
         return []
@@ -3129,119 +3215,92 @@ def collect_body_media_content_state(
             ).strip()
             if not url or not is_allowed_external_download_url(url):
                 continue
-            payload, content_type = download_file_bytes(
-                url,
-                require_file_hint=False,
-            )
-            if not payload:
-                if unavailable_media is not None:
-                    unavailable_media.append(
-                        (
-                            "image",
-                            normalize_attachment_identity_url(url),
-                        )
-                    )
-                if external_download_run_stopped():
-                    continue
-                cache_external_preflight_download(
+            media_type = "image"
+            require_file_hint = False
+            filename = derive_filename_from_url(url, fallback="image")
+        elif block_type == "embed":
+            url = str(block.get("embed", {}).get("url") or "").strip()
+            if (
+                not url
+                or not is_embed_file_candidate(url)
+                or not is_allowed_external_download_url(
                     url,
-                    False,
-                    (b"", content_type),
+                    require_file_hint=True,
                 )
-                LOGGER.warning(
-                    "본문 이미지 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
-                    summarize_external_request_target(url),
-                )
+            ):
                 continue
-            cache_external_preflight_download(
-                url,
-                False,
-                (payload, content_type),
-            )
-            if validated_external_upload_metadata(
-                payload,
-                derive_filename_from_url(url, fallback="image"),
-                content_type,
-                url,
-                True,
-            ) is None:
-                continue
-            state.append(
-                {
-                    "type": "image",
-                    "source_url": normalize_attachment_identity_url(
-                        url
-                    ),
-                    "content_sha256": compute_content_sha256(payload),
-                }
-            )
+            require_file_hint = True
+            filename = derive_filename_from_url(url, fallback="file")
+            media_type = "pdf" if is_pdf_name_or_url(filename, url) else "file"
+        else:
             continue
-        if block_type != "embed":
-            continue
-        embed = block.get("embed", {})
-        url = str(embed.get("url") or "").strip()
-        if (
-            not url
-            or not is_embed_file_candidate(url)
-            or not is_allowed_external_download_url(
-                url,
-                require_file_hint=True,
-            )
-        ):
-            continue
+        identity_url = normalize_attachment_identity_url(url)
         payload, content_type = download_file_bytes(
             url,
-            require_file_hint=True,
+            require_file_hint=require_file_hint,
         )
         if not payload:
-            if unavailable_media is not None:
-                unavailable_media.append(
-                    (
-                        "pdf" if is_pdf_name_or_url(
-                            derive_filename_from_url(
-                                url,
-                                fallback="file",
-                            ),
-                            url,
-                        ) else "file",
-                        normalize_attachment_identity_url(url),
-                    )
-                )
             if external_download_run_stopped():
+                if unavailable_media is not None:
+                    unavailable_media.append((media_type, identity_url))
                 continue
             cache_external_preflight_download(
                 url,
-                True,
+                require_file_hint,
                 (b"", content_type),
             )
+            reused_media = pop_reusable_media_block_for_unavailable_source(
+                reusable_uploaded_media,
+                media_type,
+                url,
+            )
+            if reused_media is not None:
+                LOGGER.info(
+                    "본문 %s 원문을 받을 수 없어 기존 업로드를 유지합니다 (%s)",
+                    "이미지" if media_type == "image" else "파일",
+                    summarize_external_request_target(url),
+                )
+                state.append(
+                    {
+                        "type": media_type,
+                        "source_url": identity_url,
+                        "content_sha256": reused_media[1],
+                    }
+                )
+                continue
+            if unavailable_media is not None:
+                unavailable_media.append((media_type, identity_url))
             LOGGER.warning(
-                "본문 파일 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
+                "본문 %s 원문 보존: 다운로드할 수 없는 외부 파일 (%s)",
+                "이미지" if media_type == "image" else "파일",
                 summarize_external_request_target(url),
             )
             continue
         cache_external_preflight_download(
             url,
-            True,
+            require_file_hint,
             (payload, content_type),
         )
-        filename = derive_filename_from_url(url, fallback="file")
+        content_sha256 = compute_content_sha256(payload)
+        pop_reusable_uploaded_media_block(
+            reusable_uploaded_media,
+            media_type,
+            url,
+            content_sha256,
+        )
         if validated_external_upload_metadata(
             payload,
             filename,
             content_type,
             url,
-            False,
+            media_type == "image",
         ) is None:
             continue
         state.append(
             {
-                "type": (
-                    "pdf"
-                    if is_pdf_name_or_url(filename, url)
-                    else "file"
-                ),
-                "source_url": normalize_attachment_identity_url(url),
-                "content_sha256": compute_content_sha256(payload),
+                "type": media_type,
+                "source_url": identity_url,
+                "content_sha256": content_sha256,
             }
         )
     return state
@@ -3267,12 +3326,6 @@ def prepare_attachments_for_sync(
         if not is_image_name_or_url(name, url):
             updated.append(attachment)
             continue
-        identity_url = normalize_attachment_identity_url(url)
-        existing_candidates = (
-            reusable_uploaded_attachments.get(identity_url) or []
-            if reusable_uploaded_attachments and identity_url
-            else []
-        )
         cached_download = pop_external_preflight_download(
             url,
             False,
@@ -3284,19 +3337,25 @@ def prepare_attachments_for_sync(
             )
         else:
             payload, content_type = cached_download
+        reused_upload_id: Optional[str]
         if not payload:
-            if existing_candidates:
-                raise RuntimeError(
-                    "기존 첨부 콘텐츠를 검증할 수 없습니다"
+            reused_attachment = (
+                pop_reusable_attachment_for_unavailable_source(
+                    reusable_uploaded_attachments,
+                    url,
                 )
-            updated.append(attachment)
-            continue
-        content_sha256 = compute_content_sha256(payload)
-        reused_upload_id = pop_reusable_uploaded_attachment_id(
-            reusable_uploaded_attachments,
-            url,
-            content_sha256,
-        )
+            )
+            if reused_attachment is None:
+                updated.append(attachment)
+                continue
+            reused_upload_id, content_sha256 = reused_attachment
+        else:
+            content_sha256 = compute_content_sha256(payload)
+            reused_upload_id = pop_reusable_uploaded_attachment_id(
+                reusable_uploaded_attachments,
+                url,
+                content_sha256,
+            )
         if reused_upload_id:
             updated.append(
                 {
@@ -3314,6 +3373,8 @@ def prepare_attachments_for_sync(
             if state_entry:
                 state.append(state_entry)
             continue
+        if not payload:
+            raise RuntimeError("받지 못한 첨부를 새로 업로드할 수 없습니다")
         upload_id = upload_external_file_to_notion(
             token,
             url,
@@ -3429,13 +3490,6 @@ def prepare_body_blocks_for_sync(
                 updated.append(block)
                 hash_blocks.append(block)
                 continue
-            identity_url = normalize_attachment_identity_url(url)
-            reuse_key = ("image", identity_url)
-            existing_candidates = (
-                reusable_uploaded_media.get(reuse_key) or []
-                if reusable_uploaded_media and identity_url
-                else []
-            )
             cached_download = pop_external_preflight_download(
                 url,
                 False,
@@ -3447,23 +3501,32 @@ def prepare_body_blocks_for_sync(
                 )
             else:
                 payload, content_type = cached_download
+            reused_block: Optional[JsonObject]
             if not payload:
-                if existing_candidates:
-                    raise RuntimeError(
-                        "기존 본문 이미지 콘텐츠를 검증할 수 없습니다"
+                reused_media = (
+                    pop_reusable_media_block_for_unavailable_source(
+                        reusable_uploaded_media,
+                        "image",
+                        url,
                     )
-                updated.append(block)
-                hash_blocks.append(block)
-                continue
-            content_sha256 = compute_content_sha256(payload)
-            reused_block = pop_reusable_uploaded_media_block(
-                reusable_uploaded_media,
-                "image",
-                url,
-                content_sha256,
-            )
-            if reused_block:
-                if not is_valid_reusable_uploaded_media_block(reused_block, "image"):
+                )
+                if reused_media is None:
+                    updated.append(block)
+                    hash_blocks.append(block)
+                    continue
+                reused_block, content_sha256 = reused_media
+            else:
+                content_sha256 = compute_content_sha256(payload)
+                reused_block = pop_reusable_uploaded_media_block(
+                    reusable_uploaded_media,
+                    "image",
+                    url,
+                    content_sha256,
+                )
+                if reused_block and not is_valid_reusable_uploaded_media_block(
+                    reused_block,
+                    "image",
+                ):
                     LOGGER.info(
                         "본문 이미지 재사용 생략: 재사용 블록 타입 불일치 (%s)",
                         reused_block.get("type"),
@@ -3493,6 +3556,8 @@ def prepare_body_blocks_for_sync(
                 if state_entry:
                     media_state.append(state_entry)
                 continue
+            if not payload:
+                raise RuntimeError("받지 못한 본문 이미지를 새로 업로드할 수 없습니다")
             filename = derive_filename_from_url(url, fallback="image")
             upload_id = upload_external_file_to_notion(
                 token,
@@ -3547,13 +3612,6 @@ def prepare_body_blocks_for_sync(
                 continue
             filename = derive_filename_from_url(url, fallback="file")
             media_type = "pdf" if is_pdf_name_or_url(filename, url) else "file"
-            identity_url = normalize_attachment_identity_url(url)
-            reuse_key = (media_type, identity_url)
-            existing_candidates = (
-                reusable_uploaded_media.get(reuse_key) or []
-                if reusable_uploaded_media and identity_url
-                else []
-            )
             cached_download = pop_external_preflight_download(
                 url,
                 True,
@@ -3566,22 +3624,30 @@ def prepare_body_blocks_for_sync(
             else:
                 payload, content_type = cached_download
             if not payload:
-                if existing_candidates:
-                    raise RuntimeError(
-                        "기존 본문 파일 콘텐츠를 검증할 수 없습니다"
+                reused_media = (
+                    pop_reusable_media_block_for_unavailable_source(
+                        reusable_uploaded_media,
+                        media_type,
+                        url,
                     )
-                updated.append(block)
-                hash_blocks.append(block)
-                continue
-            content_sha256 = compute_content_sha256(payload)
-            reused_block = pop_reusable_uploaded_media_block(
-                reusable_uploaded_media,
-                media_type,
-                url,
-                content_sha256,
-            )
-            if reused_block:
-                if not is_valid_reusable_uploaded_media_block(reused_block, media_type):
+                )
+                if reused_media is None:
+                    updated.append(block)
+                    hash_blocks.append(block)
+                    continue
+                reused_block, content_sha256 = reused_media
+            else:
+                content_sha256 = compute_content_sha256(payload)
+                reused_block = pop_reusable_uploaded_media_block(
+                    reusable_uploaded_media,
+                    media_type,
+                    url,
+                    content_sha256,
+                )
+                if reused_block and not is_valid_reusable_uploaded_media_block(
+                    reused_block,
+                    media_type,
+                ):
                     LOGGER.info(
                         "본문 임베드 재사용 생략: 재사용 블록 타입 불일치 (%s -> %s)",
                         media_type,
@@ -3606,6 +3672,8 @@ def prepare_body_blocks_for_sync(
                 if state_entry:
                     media_state.append(state_entry)
                 continue
+            if not payload:
+                raise RuntimeError("받지 못한 본문 파일을 새로 업로드할 수 없습니다")
             upload_id = upload_external_file_to_notion(
                 token,
                 url,

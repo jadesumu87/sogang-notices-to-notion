@@ -1797,24 +1797,6 @@ def resolve_destination_preflight(
             if existing_page
             else ""
         )
-        unavailable_attachment_urls: list[str] = []
-        attachment_content_state = (
-            collect_attachment_content_state(
-                item.get("attachments") or [],
-                unavailable_source_urls=(
-                    unavailable_attachment_urls
-                ),
-            )
-            if context.has_attachments_property
-            else []
-        )
-        body_blocks = item.get("body_blocks") or []
-        unavailable_body_media: list[tuple[str, str]] = []
-        body_media_content_state = collect_body_media_content_state(
-            body_blocks,
-            unavailable_media=unavailable_body_media,
-        )
-        body_media_reuse_status = "valid"
         existing_properties = (
             existing_page.get("properties", {})
             if existing_page
@@ -1831,20 +1813,37 @@ def resolve_destination_preflight(
             else []
         )
         deferred_reasons: list[str] = []
-        if (
-            unavailable_attachment_urls or unavailable_body_media
-        ) and external_download_run_stopped():
-            deferred_reasons.append("external_download_budget_exhausted")
-        if unavailable_attachment_urls and existing_attachment_state:
-            deferred_reasons.append("attachment_content_unavailable")
-        if unavailable_body_media and existing_body_media_state:
-            deferred_reasons.append("body_media_content_unavailable")
+        unavailable_attachment_urls: list[str] = []
+        attachment_content_state = (
+            collect_attachment_content_state(
+                item.get("attachments") or [],
+                unavailable_source_urls=(
+                    unavailable_attachment_urls
+                ),
+                reusable_uploaded_attachments=(
+                    extract_existing_uploaded_attachment_ids(
+                        existing_properties,
+                        existing_attachment_state,
+                    )
+                    if existing_page
+                    else None
+                ),
+            )
+            if context.has_attachments_property
+            else []
+        )
+        body_blocks = item.get("body_blocks") or []
+        body_media_reuse_status = "valid"
+        reusable_body_media: dict[
+            tuple[str, str],
+            list[dict[str, Any]],
+        ] = {}
         if (
             existing_page
             and should_upload_files_to_notion()
             and body_blocks
         ):
-            _, body_media_reuse_status = (
+            reusable_body_media, body_media_reuse_status = (
                 inspect_existing_uploaded_media_blocks(
                     context.token,
                     page_id,
@@ -1853,6 +1852,16 @@ def resolve_destination_preflight(
             )
             if body_media_reuse_status == "unavailable":
                 deferred_reasons.append("body_media_state_unavailable")
+        unavailable_body_media: list[tuple[str, str]] = []
+        body_media_content_state = collect_body_media_content_state(
+            body_blocks,
+            unavailable_media=unavailable_body_media,
+            reusable_uploaded_media=reusable_body_media,
+        )
+        if (
+            unavailable_attachment_urls or unavailable_body_media
+        ) and external_download_run_stopped():
+            deferred_reasons.append("external_download_budget_exhausted")
         deferred_reason = ",".join(sorted(set(deferred_reasons)))
         operation_id = operation_id_for_item(
             item,
