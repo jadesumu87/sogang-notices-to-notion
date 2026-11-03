@@ -1075,13 +1075,15 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
                 self.assertEqual(snapshot["stopped_reason"], "")
                 self.assertEqual(snapshot["host_circuits"], {})
 
-    def test_first_403_or_429_opens_circuit_without_another_request(self):
+    def test_first_403_or_429_opens_host_circuit_without_stopping_run(self):
         first_url = (
             "https://www.sogang.ac.kr/file-fe-prd/board/blocked.png"
         )
         second_url = (
             "https://www.sogang.ac.kr/file-fe-prd/board/skipped.png"
         )
+        other_host_url = "https://scc.sogang.ac.kr/file/other.png"
+        payload = make_png_payload()
         for status_code in (403, 429):
             with self.subTest(status_code=status_code):
                 opener = QueueOpener(
@@ -1090,7 +1092,11 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
                             first_url,
                             status_code,
                             retry_after="30",
-                        )
+                        ),
+                        TrackingResponse(
+                            payload,
+                            {"Content-Type": "image/png"},
+                        ),
                     ]
                 )
                 with (
@@ -1116,18 +1122,91 @@ class ExternalDownloadSecurityTests(unittest.TestCase):
                     with notion_client.external_download_run_scope() as policy:
                         first = notion_client.download_file_bytes(first_url)
                         second = notion_client.download_file_bytes(second_url)
+                        other = notion_client.download_file_bytes(
+                            other_host_url
+                        )
                         snapshot = policy.snapshot()
+                        notion_client.raise_if_external_download_stopped()
 
                 self.assertEqual(first, (None, None))
                 self.assertEqual(second, (None, None))
-                self.assertEqual(len(opener.open_calls), 1)
-                self.assertEqual(snapshot["status_code"], status_code)
-                self.assertEqual(snapshot["retry_after"], "30")
-                self.assertEqual(snapshot["retry_after_seconds"], 30.0)
+                self.assertEqual(other, (payload, "image/png"))
                 self.assertEqual(
-                    snapshot["stopped_reason"],
-                    f"http_{status_code}",
+                    [url for url, _timeout in opener.open_calls],
+                    [first_url, other_host_url],
                 )
+                self.assertIsNone(snapshot["status_code"])
+                self.assertEqual(snapshot["stopped_reason"], "")
+                self.assertEqual(
+                    snapshot["host_circuits"],
+                    {"www.sogang.ac.kr": f"http_{status_code}"},
+                )
+
+    def test_forbidden_body_file_is_unavailable_without_stopping_run(self):
+        blocked_url = (
+            "https://scc.sogang.ac.kr/Download3?pathStr=MTAx"
+            "&gubun=cmsfile&fileName=guide.pdf"
+        )
+        image_url = "https://www.sogang.ac.kr/file-fe-prd/board/ok.png"
+        payload = make_png_payload()
+        blocks = [
+            {"type": "embed", "embed": {"url": blocked_url}},
+            {
+                "type": "image",
+                "image": {
+                    "type": "external",
+                    "external": {"url": image_url},
+                },
+            },
+        ]
+        opener = QueueOpener(
+            [
+                self.http_error(blocked_url, 403),
+                TrackingResponse(payload, {"Content-Type": "image/png"}),
+            ]
+        )
+        unavailable = []
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "NOTION_UPLOAD_FILES": "1",
+                    "EXTERNAL_DOWNLOAD_MIN_REQUEST_INTERVAL_SECONDS": "0.1",
+                },
+            ),
+            patch.object(
+                utils.socket,
+                "getaddrinfo",
+                side_effect=public_dns,
+            ),
+            patch.object(
+                notion_client,
+                "build_external_download_opener",
+                return_value=opener,
+            ),
+        ):
+            with notion_client.external_download_run_scope(
+                force_new=True
+            ) as policy:
+                state = notion_client.collect_body_media_content_state(
+                    blocks,
+                    unavailable_media=unavailable,
+                )
+                snapshot = policy.snapshot()
+
+        self.assertEqual(
+            [source_url for _kind, source_url in unavailable],
+            [utils.normalize_attachment_identity_url(blocked_url)],
+        )
+        self.assertEqual(
+            [entry["source_url"] for entry in state],
+            [utils.normalize_attachment_identity_url(image_url)],
+        )
+        self.assertEqual(snapshot["stopped_reason"], "")
+        self.assertEqual(
+            snapshot["host_circuits"],
+            {"scc.sogang.ac.kr": "http_403"},
+        )
 
     def test_request_and_time_caps_stop_remaining_downloads(self):
         url = "https://www.sogang.ac.kr/file-fe-prd/board/file.png"

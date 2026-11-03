@@ -1488,12 +1488,10 @@ def _download_file_bytes_with_policy(
             )
             exc.close()
             if exc.code in {403, 429}:
-                policy.open_circuit(exc.code, retry_after)
-                LOGGER.warning(
-                    "외부 파일 다운로드 회로 차단: %s (HTTP %s, Retry-After=%s)",
-                    request_target,
-                    exc.code,
-                    policy.retry_after or "-",
+                open_external_host_circuit(
+                    policy,
+                    external_failure_circuit_url(url, exc.geturl()),
+                    f"http_{exc.code}",
                 )
                 return None, None
             if is_retryable_http_status(exc.code):
