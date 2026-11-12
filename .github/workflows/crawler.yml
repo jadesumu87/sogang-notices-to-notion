@@ -65,6 +65,40 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
+        id: setup-python
+        continue-on-error: true
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-constraints.txt
+            requirements.lock
+
+      - name: Wait before retrying Python setup
+        if: ${{ steps.setup-python.outcome == 'failure' }}
+        run: sleep 60
+
+      - name: Retry Python setup
+        id: setup-python-retry
+        if: ${{ steps.setup-python.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.13.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-constraints.txt
+            requirements.lock
+
+      - name: Wait before final Python setup
+        if: ${{ steps.setup-python-retry.outcome == 'failure' }}
+        run: sleep 180
+
+      - name: Final Python setup
+        if: ${{ steps.setup-python-retry.outcome == 'failure' }}
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.13.14"
@@ -127,7 +161,7 @@ jobs:
 
       - name: Install Playwright browser
         if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.schema_migration && !inputs.existing_pages_migration) }}
-        run: python -m playwright install --with-deps chromium
+        run: python .github/scripts/install_playwright_browser.py --optional
 
       - name: Run crawler
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.existing_pages_migration }}

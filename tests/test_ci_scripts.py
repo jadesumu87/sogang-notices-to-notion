@@ -1,8 +1,12 @@
+import io
+import os
 import re
 import sys
 import tempfile
 import unittest
 import urllib.error
+from collections.abc import Sequence
+from contextlib import redirect_stdout
 from email.message import Message
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -13,8 +17,46 @@ sys.path.insert(0, str(SCRIPTS))
 
 import audit_lock_vulnerabilities
 import cache_state
+import install_playwright_browser
 import verify_actions
 import verify_lock
+
+
+def browser_tests_required() -> bool:
+    return os.environ.get("REQUIRE_BROWSER_TESTS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+class RecordingRunner:
+    def __init__(self, failures: dict[str, int] | None = None) -> None:
+        self.failures = dict(failures or {})
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command: Sequence[str]) -> int:
+        self.commands.append(list(command[1:]))
+        action = command[3]
+        remaining = self.failures.get(action, 0)
+        if remaining:
+            self.failures[action] = remaining - 1
+            return 1
+        return 0
+
+
+def workflow_text(name: str) -> str:
+    return (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+
+
+def setup_python_blocks(workflow: str) -> list[str]:
+    blocks: list[str] = []
+    for block in workflow.split("\n\n"):
+        marker = block.find("uses: actions/setup-python@")
+        if marker >= 0:
+            blocks.append(block[marker:])
+    return blocks
 
 
 class CiScriptTests(unittest.TestCase):
@@ -238,6 +280,144 @@ class CiScriptTests(unittest.TestCase):
             'CRAWLER_ACTIONS_ANNOTATIONS: "0"',
             ci_workflow,
         )
+
+    def test_browser_install_skips_system_packages_when_browser_runs(
+        self,
+    ) -> None:
+        runner = RecordingRunner()
+        sleep = MagicMock()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = install_playwright_browser.install_browser(
+                optional=False,
+                runner=runner,
+                sleep=sleep,
+                launch_check=lambda: True,
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            runner.commands,
+            [["-m", "playwright", "install", "chromium"]],
+        )
+        sleep.assert_not_called()
+        self.assertNotIn("::", output.getvalue())
+
+    def test_browser_install_adds_system_packages_only_after_launch_fails(
+        self,
+    ) -> None:
+        runner = RecordingRunner()
+        launch_results = iter([False, True])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = install_playwright_browser.install_browser(
+                optional=False,
+                runner=runner,
+                sleep=MagicMock(),
+                launch_check=lambda: next(launch_results),
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            runner.commands,
+            [
+                ["-m", "playwright", "install", "chromium"],
+                ["-m", "playwright", "install-deps", "chromium"],
+            ],
+        )
+        self.assertNotIn("::", output.getvalue())
+
+    def test_browser_install_retries_transient_failures(self) -> None:
+        runner = RecordingRunner({"install": 2, "install-deps": 1})
+        launch_results = iter([False, True])
+        sleep = MagicMock()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = install_playwright_browser.install_browser(
+                optional=False,
+                runner=runner,
+                sleep=sleep,
+                launch_check=lambda: next(launch_results),
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [command[2] for command in runner.commands],
+            ["install", "install", "install", "install-deps", "install-deps"],
+        )
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [
+                *install_playwright_browser.DOWNLOAD_RETRY_DELAYS_SECONDS,
+                *install_playwright_browser.SYSTEM_DEPENDENCY_RETRY_DELAYS_SECONDS,
+            ],
+        )
+
+    def test_browser_install_failure_is_fatal_only_when_required(
+        self,
+    ) -> None:
+        scenarios = (
+            ({"install": 99}, [True], ["install"] * 3),
+            ({"install-deps": 99}, [False], ["install", "install-deps", "install-deps"]),
+            ({}, [False, False], ["install", "install-deps"]),
+        )
+        for failures, launches, expected_actions in scenarios:
+            for optional, expected_result, annotation in (
+                (False, 1, "::error::"),
+                (True, 0, "::warning::"),
+            ):
+                with self.subTest(failures=failures, optional=optional):
+                    runner = RecordingRunner(failures)
+                    launch_results = iter(launches)
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        result = install_playwright_browser.install_browser(
+                            optional=optional,
+                            runner=runner,
+                            sleep=MagicMock(),
+                            launch_check=lambda results=launch_results: next(
+                                results
+                            ),
+                        )
+                    self.assertEqual(result, expected_result)
+                    self.assertEqual(
+                        [command[2] for command in runner.commands],
+                        expected_actions,
+                    )
+                    self.assertIn(annotation, output.getvalue())
+                    if optional:
+                        self.assertIn("API와 HTTP 수집", output.getvalue())
+
+    @unittest.skipUnless(
+        browser_tests_required(),
+        "Playwright 브라우저 검증이 선택되지 않았습니다",
+    )
+    def test_browser_launch_check_renders_probe(self) -> None:
+        self.assertTrue(install_playwright_browser.browser_launches())
+
+    def test_workflows_survive_transient_setup_failures(self) -> None:
+        crawler = workflow_text("crawler.yml")
+        ci = workflow_text("ci.yml")
+        for workflow in (crawler, ci):
+            self.assertNotIn("--with-deps", workflow)
+            blocks = setup_python_blocks(workflow)
+            self.assertEqual(len(blocks), 3)
+            self.assertEqual(len(set(blocks)), 1)
+            self.assertIn(
+                "if: ${{ steps.setup-python.outcome == 'failure' }}",
+                workflow,
+            )
+            self.assertIn(
+                "if: ${{ steps.setup-python-retry.outcome == 'failure' }}",
+                workflow,
+            )
+            self.assertEqual(workflow.count("continue-on-error: true"), 2)
+        self.assertIn(
+            "run: python .github/scripts/install_playwright_browser.py --optional\n",
+            crawler,
+        )
+        self.assertIn(
+            "run: python .github/scripts/install_playwright_browser.py\n",
+            ci,
+        )
+        self.assertIn("--retry-all-errors", ci)
 
     def test_cache_projection_removes_private_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
