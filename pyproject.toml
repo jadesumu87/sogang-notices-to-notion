@@ -14,6 +14,12 @@ show_error_codes = true
 pretty = true
 cache_dir = ".runtime/mypy_cache"
 
+[tool.pyright]
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+extraPaths = ["scripts", ".github/scripts"]
+
 [tool.coverage.run]
 branch = true
 source = ["scripts"]

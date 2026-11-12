@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+from email.message import Message
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -123,7 +124,7 @@ class CiScriptTests(unittest.TestCase):
             "https://pypi.org/pypi/example-package/1.2.3/json",
             404,
             "Not Found",
-            None,
+            Message(),
             None,
         )
         with (
